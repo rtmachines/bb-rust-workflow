@@ -140,7 +140,9 @@ def _rustc(message: object, root: Path, target: dict | None) -> dict | None:
     spans = message.get("spans")
     if not isinstance(spans, list) or any(not isinstance(x, dict) for x in spans):
         raise ValueError("invalid rustc spans")
-    code = message.get("code")
+    if "code" not in message:
+        raise ValueError("missing rustc code field")
+    code = message["code"]
     if code is not None and (not isinstance(code, dict) or not isinstance(code.get("code"), str)):
         raise ValueError("invalid rustc code")
     if message["level"] not in {
@@ -160,6 +162,26 @@ def _rustc(message: object, root: Path, target: dict | None) -> dict | None:
             raise ValueError("invalid rustc primary flag")
         if span.get("label") is not None and not isinstance(span["label"], str):
             raise ValueError("invalid rustc span label")
+        for coordinate in (
+            "byte_start",
+            "byte_end",
+            "line_start",
+            "line_end",
+            "column_start",
+            "column_end",
+        ):
+            value = span.get(coordinate)
+            minimum = 0 if coordinate.startswith("byte_") else 1
+            if type(value) is not int or value < minimum:
+                raise ValueError("invalid rustc span coordinate")
+        if (
+            span["byte_end"] < span["byte_start"]
+            or span["line_end"] < span["line_start"]
+            or (
+                span["line_end"] == span["line_start"] and span["column_end"] < span["column_start"]
+            )
+        ):
+            raise ValueError("reversed rustc span coordinates")
         if not span.get("is_primary"):
             continue
         text = span.get("text", [])
@@ -345,7 +367,7 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
             if source and pending["locations"]:
                 existing = pending["locations"][-1]["source"]
                 pending["locations"][-1]["source"] = (
-                    existing + ("\n" if existing else "") + source[1]
+                    existing + ("\n" if existing else "") + _local_text(source[1], root)
                 )
                 continue
             code = re.search(r"#\[(?:warn|deny|forbid)\(([^)]+)\)\]", line)
@@ -397,6 +419,9 @@ def parse_diagnostics(
     column:int|null, source:str, label:str|null, optional end_line/end_column}],
     target:dict|null, suite:str|null, test_name:str|null, occurrences:int.
     Locations retain each occurrence; identity ignores line/column offsets.
+    Structured rustc spans require integer byte offsets >=0 and line/column
+    coordinates >=1, with ordered start/end bounds; booleans are rejected.
+    A required code field may explicitly be null, but omission is malformed.
     Compiler targets use normalized manifest/source paths, name and kind, never
     local package_id URLs. External absolute paths retain their full identity.
 
@@ -435,6 +460,8 @@ def parse_diagnostics(
         uncertainty.append(f"malformed_records:{state['malformed']}")
     if state["unknown"]:
         uncertainty.append(f"unrecognized_lines:{state['unknown']}")
+    if False in state["build_results"]:
+        uncertainty.append("unsuccessful_build_observed")
     suites = stdout_suites + stderr_suites
     identities = [s["identity"] for s in suites]
     all_headers = stdout_headers + stderr_headers
@@ -633,7 +660,9 @@ def summarize_diagnostics(report: dict, *, max_items: int = 20) -> dict:
     when present, otherwise its parsed findings as unclassified. Finding projection
     keeps classification/fingerprint/domain/severity/code/message/occurrences, one
     location, suite/test_name and reason. Strings are capped at 240 characters;
-    uncertainty is capped at 20 entries. Full report/log references belong to caller.
+    uncertainty is capped at 20 entries. Projection permits only documented
+    scalar fields; numeric locations/occurrences must fit unsigned 64-bit values.
+    Full report/log references belong to caller.
     """
     if max_items < 0:
         raise ValueError("max_items must be non-negative")
@@ -660,18 +689,22 @@ def summarize_diagnostics(report: dict, *, max_items: int = 20) -> dict:
         "reason",
     )
     for finding in findings[: min(max_items, 100)]:
-        item = {
-            k: v[:240] if isinstance(v, str) else v
-            for k in keys
-            if (v := finding.get(k)) is not None
-        }
+        item = {}
+        for key in keys:
+            value = finding.get(key)
+            if isinstance(value, str):
+                item[key] = value[:240]
+            elif key == "occurrences" and type(value) is int and 0 <= value < 2**64:
+                item[key] = value
         if finding.get("locations"):
             location = finding["locations"][0]
-            item["location"] = {
-                k: v[:240] if isinstance(v, str) else v
-                for k in ("path", "line", "column")
-                if (v := location.get(k)) is not None
-            }
+            item["location"] = {}
+            if isinstance(location.get("path"), str):
+                item["location"]["path"] = location["path"][:240]
+            for key in ("line", "column"):
+                value = location.get(key)
+                if type(value) is int and 1 <= value < 2**64:
+                    item["location"][key] = value
         bounded.append(item)
     uncertainty = list(report.get("uncertainty", []))
     for domain in report.get("domains", {}).values():

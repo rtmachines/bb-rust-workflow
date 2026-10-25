@@ -183,6 +183,67 @@ class ParserTests(unittest.TestCase):
                     compare_diagnostics(current, parse(cargo()))["counts"]["resolved"], 0
                 )
 
+    def test_malformed_rustc_coordinates_cannot_authorize_resolution(self):
+        invalid = [
+            ("line_start", {"x": "x" * 100000}),
+            ("line_start", True),
+            ("line_start", 0),
+            ("line_start", None),
+            ("line_start", "4"),
+            ("column_start", 0),
+            ("column_end", -1),
+            ("line_end", 3),
+            ("column_end", 4),
+            ("byte_start", -1),
+            ("byte_end", 9),
+            ("byte_end", 11.5),
+            ("byte_start", False),
+        ]
+        for key, value in invalid:
+            with self.subTest(key=key, value_type=type(value).__name__):
+                record = diagnostic()
+                record["spans"][0][key] = value
+                current = parse(json.dumps(record) + "\n" + FINISHED)
+                self.assertTrue(current["uncertainty"])
+                self.assertFalse(current["domains"]["compiler"]["complete"])
+                self.assertLess(len(json.dumps(summarize_diagnostics(current))), 12000)
+                compared = compare_diagnostics(current, parse(cargo()))
+                self.assertEqual(compared["counts"]["resolved"], 0)
+                self.assertEqual(compared["counts"]["unobserved_previous"], 1)
+        record = diagnostic()
+        del record["spans"][0]["line_start"]
+        self.assertTrue(parse(json.dumps(record))["uncertainty"])
+
+    def test_missing_rustc_code_is_uncertain_but_explicit_null_is_supported(self):
+        missing = diagnostic()
+        del missing["code"]
+        current = parse(json.dumps(missing) + "\n" + FINISHED)
+        self.assertTrue(current["uncertainty"])
+        self.assertFalse(current["domains"]["compiler"]["complete"])
+        result = compare_diagnostics(current, parse(cargo()))
+        self.assertEqual(result["counts"]["resolved"], 0)
+        self.assertEqual(result["counts"]["unobserved_previous"], 1)
+        explicit = diagnostic()
+        explicit["code"] = None
+        current = parse(json.dumps(explicit) + "\n" + FINISHED)
+        self.assertFalse(current["uncertainty"])
+        self.assertIsNone(current["findings"][0]["code"])
+        self.assertTrue(current["domains"]["compiler"]["complete"])
+
+    def test_text_source_anchor_roots_match_between_snapshots(self):
+        def text(root):
+            return (
+                f'warning: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = "{root}/data";\n'
+            )
+
+        other_root = Path("/scratch/candidate")
+        result = compare_diagnostics(
+            parse("", text(other_root), root=other_root), parse("", text(ROOT))
+        )
+        self.assertEqual(result["counts"]["persistent"], 1)
+        self.assertEqual(result["counts"]["new"], 0)
+        self.assertEqual(result["counts"]["resolved"], 0)
+
     def test_unknown_commands_do_not_create_complete_observations(self):
         report = parse("", "", context=replace(CONTEXT, argv=("custom-check",)))
         self.assertFalse(report["domains"]["compiler"]["complete"])
@@ -356,6 +417,16 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result["counts"]["resolved"], 0)
         self.assertEqual(result["counts"]["unobserved_previous"], 1)
 
+    def test_negative_build_evidence_invalidates_even_an_explicit_test_pass(self):
+        current = test_report(
+            "ok", stdout=harness("ok") + json.dumps({"reason": "build-finished", "success": False})
+        )
+        self.assertFalse(current["domains"]["test"]["complete"])
+        self.assertTrue(current["domains"]["test"]["uncertainty"])
+        result = compare_diagnostics(current, test_report())
+        self.assertEqual(result["counts"]["resolved"], 0)
+        self.assertEqual(result["counts"]["unobserved_previous"], 1)
+
     def test_corresponding_explicit_pass_resolves_test_failure(self):
         result = compare_diagnostics(test_report("ok"), test_report())
         self.assertEqual(result["counts"]["resolved"], 1)
@@ -491,6 +562,21 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary["counts"]["unclassified"], 30)
         self.assertLess(len(json.dumps(summary)), 12000)
         self.assertEqual(report, before)
+
+    def test_summary_drops_non_scalar_and_oversized_numeric_location_fields(self):
+        report = parse(cargo())
+        location = report["findings"][0]["locations"][0]
+        location["line"] = {"x": "x" * 100000}
+        location["column"] = True
+        report["findings"][0]["message"] = {"x": "x" * 100000}
+        summary = summarize_diagnostics(report)
+        self.assertLess(len(json.dumps(summary)), 12000)
+        self.assertNotIn("line", summary["findings"][0]["location"])
+        self.assertNotIn("column", summary["findings"][0]["location"])
+        self.assertNotIn("message", summary["findings"][0])
+        location["line"] = 10**1000
+        summary = summarize_diagnostics(report)
+        self.assertNotIn("line", summary["findings"][0]["location"])
 
     def test_summary_rejects_negative_limit_and_retains_uncertainty(self):
         report = parse("{broken")
