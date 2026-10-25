@@ -120,8 +120,6 @@ class Workflow:
     def _save(self, phase: str | None = None) -> None:
         if phase:
             self.state["phase"] = phase
-            self.progress(phase)
-            self._activity()
         self.state["elapsed_seconds"] = round(time.monotonic() - self.started, 3)
         self.state["known_cost_usd"] = sum(
             (item["cost_usd"] for item in self.state["agents"] if item.get("cost_usd") is not None),
@@ -132,18 +130,31 @@ class Workflow:
         )
         self.state["token_usage"] = summarize_usage(self.state["agents"])
         write_json(self.run_dir / "state.json", self.state)
+        if phase:
+            self._progress(phase)
+            self._activity()
+
+    def _progress(self, message: str) -> None:
+        try:
+            self.progress(message)
+        except Exception:
+            # An observer can disappear; authoritative writes and interrupts still matter.
+            pass
 
     def _emit(self, event: str, **metadata) -> None:
         if self.event is not None:
-            self.event(
-                {
-                    "version": 1,
-                    "run_dir": str(self.run_dir),
-                    "event": event,
-                    "phase": self.state["phase"],
-                    **metadata,
-                }
-            )
+            try:
+                self.event(
+                    {
+                        "version": 1,
+                        "run_dir": str(self.run_dir),
+                        "event": event,
+                        "phase": self.state["phase"],
+                        **metadata,
+                    }
+                )
+            except Exception:
+                pass
 
     def _activity(self, operation: dict | None = None) -> None:
         if self._tracker is not None:
@@ -168,7 +179,7 @@ class Workflow:
             self.run_dir.mkdir(parents=True)
             self._save()
             try:
-                self.progress(f"Run directory: {self.run_dir}")
+                self._progress(f"Run directory: {self.run_dir}")
                 self._emit("start")
                 with ProgressTracker(self.run_dir) as tracker:
                     self._tracker = tracker

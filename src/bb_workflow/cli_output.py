@@ -39,11 +39,16 @@ def known_artifacts(directory: Path | None) -> list[str]:
     """Link only known files that actually exist, including partial-run evidence."""
     if directory is None:
         return []
-    return [
-        str(path.resolve())
-        for name in ("state.json", "report.md", "report.json", "apply.json", "acceptance.json")
-        if (path := directory / name).is_file()
-    ]
+    artifacts = []
+    for name in ("state.json", "report.md", "report.json", "apply.json", "acceptance.json"):
+        path = directory / name
+        try:
+            if path.is_file():
+                artifacts.append(str(path.resolve()))
+        except (OSError, ValueError, RuntimeError):
+            # Evidence discovery must not replace the command's original error.
+            continue
+    return artifacts
 
 
 def emit_result(
@@ -77,6 +82,7 @@ def emit_result(
                 },
                 indent=2,
                 ensure_ascii=False,
+                allow_nan=False,
             )
         )
     elif result.text is not None:

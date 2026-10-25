@@ -106,6 +106,57 @@ class EngineTests(unittest.TestCase):
                 self.assertEqual(state["error_code"], expected)
                 self.assertNotEqual(state["status"], "succeeded")
 
+    def test_broken_observers_cannot_prevent_terminal_state_or_lock_release(self):
+        # Advisory callbacks must not strand durable state at running after reports exist.
+        for observer in ("event", "progress"):
+            with self.subTest(observer=observer):
+                flow = self.workflow(config=replace(self.config, config_version=3))
+
+                def fail_after_start(value):
+                    if observer == "progress" or value["event"] != "start":
+                        raise BrokenPipeError("observer closed")
+
+                setattr(flow, observer, fail_after_start)
+                directory = flow.run()
+                state = json.loads((directory / "state.json").read_text())
+                self.assertEqual(state["status"], "blocked")
+                self.assertEqual(state["error_code"], "requirements_required")
+                self.assertEqual(state["phase"], "finished")
+                self.assertTrue((directory / "report.md").is_file())
+                self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+                self.assertEqual(self.calls, [])
+
+    def test_terminal_state_write_failure_is_not_hidden_as_observer_failure(self):
+        from bb_workflow.workspace import write_json
+
+        flow = self.workflow(config=replace(self.config, config_version=3))
+
+        def fail_terminal_write(path, value):
+            if path.name == "state.json" and value["phase"] == "finished":
+                raise OSError("terminal state disk full")
+            write_json(path, value)
+
+        with patch("bb_workflow.engine.write_json", side_effect=fail_terminal_write):
+            with self.assertRaisesRegex(OSError, "terminal state disk full"):
+                flow.run()
+        self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+
+    def test_observer_interrupt_still_persists_interrupted_state(self):
+        for observer in ("event", "progress"):
+            with self.subTest(observer=observer):
+                flow = self.workflow(config=replace(self.config, config_version=3))
+
+                def interrupt_once(value):
+                    setattr(flow, observer, lambda value: None)
+                    raise KeyboardInterrupt()
+
+                setattr(flow, observer, interrupt_once)
+                directory = flow.run()
+                state = json.loads((directory / "state.json").read_text())
+                self.assertEqual(state["status"], "interrupted")
+                self.assertEqual(state["error_code"], "interrupted")
+                self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+
     def invoke(self, **kwargs):
         self.events.append(kwargs["role"])
         self.calls.append({**kwargs, "snapshot": manifest(kwargs["cwd"])})

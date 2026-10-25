@@ -859,6 +859,173 @@ class JsonContractTests(unittest.TestCase):
                     self.assertEqual(output, "")
                     self.assertIn("Error:", errors)
 
+    def test_nonfinite_nested_state_is_invalid_in_full_and_summary_modes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for number in ("NaN", "Infinity", "-Infinity", "1e400"):
+                with self.subTest(number=number):
+                    (Path(temp) / "state.json").write_text(
+                        '{"status":"running","extra":{"values":[' + number + "]}}"
+                    )
+                    for summary in ([], ["--summary"]):
+                        payload, _ = self.envelope(
+                            ["status", temp, "--json", *summary], "status", 2, "invalid_state"
+                        )
+                        self.assertIsNone(payload["data"])
+
+    def test_nonfinite_nested_progress_is_omitted_from_strict_json_status(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            (directory / "state.json").write_text('{"status":"running"}')
+            progress = {
+                "version": 1,
+                "run_dir": str(directory.resolve()),
+                "pid": 123,
+                "phase": "implementation",
+                "active_operation": {"role": "implementation"},
+                "updated_at": "2026-10-25T10:00:00+00:00",
+                "elapsed_seconds": 5.0,
+                "heartbeat_interval_seconds": 5.0,
+            }
+            for field in ("active_operation", "extra"):
+                for number in ("NaN", "Infinity", "-Infinity", "1e400"):
+                    with self.subTest(field=field, number=number):
+                        content = json.dumps({**progress, field: {"values": ["NUMBER"]}})
+                        (directory / "progress.json").write_text(
+                            content.replace('"NUMBER"', number)
+                        )
+                        payload, _ = self.envelope(
+                            ["status", temp, "--summary", "--json"], "status"
+                        )
+                        self.assertNotIn("progress", payload["data"])
+                        json.dumps(payload, allow_nan=False)
+
+    def test_machine_serialization_falls_back_to_strict_error_for_nonfinite_payload(self):
+        from bb_workflow.cli_output import CommandResult
+
+        with patch(
+            "bb_workflow.cli._dispatch", return_value=CommandResult({"extra": [float("nan")]})
+        ):
+            payload, _ = self.envelope(
+                ["status", "unused", "--json"], "status", 2, "internal_error"
+            )
+        self.assertIsNone(payload["data"])
+
+    def test_artifact_probe_failures_preserve_original_error_and_other_artifacts(self):
+        from bb_workflow.cli import _InvalidState
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("state.json", "report.md", "report.json"):
+                (root / name).write_text("evidence")
+            is_file, resolve = Path.is_file, Path.resolve
+
+            def denied_probe(path):
+                if path == root / "state.json":
+                    raise PermissionError("probe denied")
+                return is_file(path)
+
+            def denied_resolve(path, *args, **kwargs):
+                if path == root / "report.md":
+                    raise OSError("resolve denied")
+                return resolve(path, *args, **kwargs)
+
+            with (
+                patch("bb_workflow.cli._read_state", side_effect=_InvalidState("original problem")),
+                patch.object(Path, "is_file", denied_probe),
+                patch.object(Path, "resolve", denied_resolve),
+            ):
+                payload, _ = self.envelope(["status", temp, "--json"], "status", 2, "invalid_state")
+            self.assertEqual(payload["error"]["message"], "original problem")
+            self.assertEqual(payload["error"]["artifacts"], [str(root / "report.json")])
+
+    @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "POSIX file permissions")
+    def test_unreadable_run_directory_returns_original_io_error_envelope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp) / "inaccessible"
+            directory.mkdir()
+            directory.chmod(0)
+            try:
+                payload, _ = self.envelope(
+                    ["status", str(directory), "--json"], "status", 2, "io_error"
+                )
+                self.assertIn("state.json", payload["error"]["message"])
+                self.assertEqual(payload["error"]["artifacts"], [])
+            finally:
+                directory.chmod(0o700)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX pipes")
+    def test_real_closed_stderr_pipe_keeps_cli_stdout_and_exit_code(self):
+        for flags in ([], ["--events-jsonl"], ["--json", "--events-jsonl"]):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as temp:
+                reader, writer = os.pipe()
+                os.close(reader)
+                try:
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "bb_workflow.cli",
+                            "run",
+                            "task",
+                            "--repo",
+                            temp,
+                            *flags,
+                        ],
+                        stdout=subprocess.PIPE,
+                        stderr=writer,
+                        text=True,
+                        timeout=10,
+                    )
+                finally:
+                    os.close(writer)
+                self.assertEqual(result.returncode, 1)
+                payload = json.loads(result.stdout)
+                data = payload["data"] if "--json" in flags else payload
+                self.assertEqual(data["status"], "blocked")
+                directory = Path(data["run_dir"])
+                self.assertEqual(
+                    json.loads((directory / "state.json").read_text())["status"], "blocked"
+                )
+                self.assertFalse((Path(temp) / ".bb-workflow/lock").exists())
+
+    def test_closed_stderr_keeps_run_stdout_and_terminal_evidence_usable(self):
+        class ClosedConsumer(io.StringIO):
+            def write(self, text):
+                if self.getvalue():
+                    raise BrokenPipeError("consumer closed after start")
+                return super().write(text)
+
+        for flags in ([], ["--json"], ["--events-jsonl"], ["--json", "--events-jsonl"]):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as temp:
+                output = io.StringIO()
+                with (
+                    contextlib.redirect_stdout(output),
+                    contextlib.redirect_stderr(ClosedConsumer()),
+                ):
+                    code = main(["run", "task", "--repo", temp, *flags])
+                self.assertEqual(code, 1)
+                payload = json.loads(output.getvalue())
+                data = payload["data"] if "--json" in flags else payload
+                self.assertEqual(data["status"], "blocked")
+                directory = Path(data["run_dir"])
+                self.assertEqual(
+                    json.loads((directory / "state.json").read_text())["status"], "blocked"
+                )
+                self.assertTrue((directory / "report.md").is_file())
+                self.assertFalse((Path(temp) / ".bb-workflow/lock").exists())
+
+    def test_closed_stderr_does_not_rethrow_while_reporting_original_io_failure(self):
+        class ClosedConsumer(io.StringIO):
+            def write(self, text):
+                raise BrokenPipeError("closed diagnostic stream")
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(ClosedConsumer()):
+                code = main(["status", temp])
+            self.assertEqual(code, 2)
+            self.assertEqual(output.getvalue(), "")
+
     def test_missing_run_requirements_retains_blocked_exit_and_progress_stderr(self):
         with tempfile.TemporaryDirectory() as temp:
             payload, stderr = self.envelope(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -95,6 +96,8 @@ class _InvalidArguments(ValueError):
 def _read_state(directory: Path) -> dict:
     try:
         state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        # Validate every nested value, including valid number syntax that overflows float.
+        json.dumps(state, allow_nan=False)
     except (ValueError, UnicodeError) as exc:
         raise _InvalidState(f"Invalid state metadata: {directory / 'state.json'}") from exc
     if not isinstance(state, dict):
@@ -408,12 +411,8 @@ def _dispatch(args: argparse.Namespace) -> CommandResult:
         config,
         args.complexity,
         requirements=requirements,
-        progress=(lambda text: None)
-        if args.events_jsonl
-        else lambda text: print(text, file=sys.stderr, flush=True),
-        event=(
-            lambda event: print(json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True)
-        )
+        progress=(lambda text: None) if args.events_jsonl else _stderr,
+        event=(lambda event: _stderr(json.dumps(event, ensure_ascii=False, allow_nan=False)))
         if args.events_jsonl
         else None,
     )
@@ -463,6 +462,22 @@ def _emit_command_result(result, args, command, machine) -> int:
     return emit_result(result, command, machine=machine, artifacts=artifacts)
 
 
+def _stderr(message: str) -> None:
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except BrokenPipeError:
+        # A failed flush can leave buffered bytes that otherwise change process exit to 120.
+        try:
+            descriptor = sys.stderr.fileno()
+            with open(os.devnull, "w") as sink:
+                os.dup2(sink.fileno(), descriptor)
+        except (OSError, ValueError, AttributeError):
+            pass
+    except (OSError, ValueError):
+        # A closed diagnostic consumer must not prevent the command result on stdout.
+        pass
+
+
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     options = argv[: argv.index("--")] if "--" in argv else argv
@@ -484,7 +499,7 @@ def _main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         result = CommandResult(exit_code=130, code="interrupted", message="Interrupted by user")
         if not machine:
-            print(result.message, file=sys.stderr)
+            _stderr(result.message)
     except Exception as exc:
         if not machine and not isinstance(
             exc, (ConfigError, RequirementsError, WorkspaceError, OSError, ValueError)
@@ -492,7 +507,7 @@ def _main(argv: list[str] | None = None) -> int:
             raise
         result = _exception_result(exc)
         if not machine:
-            print(f"Error: {exc}", file=sys.stderr)
+            _stderr(f"Error: {exc}")
     return _emit_command_result(result, args, parser.selected_command, machine)
 
 

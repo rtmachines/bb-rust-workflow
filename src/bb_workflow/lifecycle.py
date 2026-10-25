@@ -84,6 +84,8 @@ def read_progress(run_dir: Path) -> dict | None:
     """Read untrusted advisory metadata; malformed or foreign sidecars are ignored."""
     try:
         value = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+        # Reject non-finite values in operations and future/unknown metadata too.
+        json.dumps(value, allow_nan=False)
         if not isinstance(value, dict):
             return None
         if type(value.get("version")) is not int or value["version"] != 1:
