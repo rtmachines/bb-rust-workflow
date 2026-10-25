@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .acceptance import REPORT_CONTRACT, build_acceptance, canonical_digest, validate_acceptance
-from .backends import BackendError, invoke
+from .backends import BackendError, BackendInterrupted, invoke
 from .config import Config, Selection, route
 from .diagnostics import summarize_diagnostics
 from .process import run_process
@@ -540,10 +540,12 @@ class Workflow:
                     executable=self.config.executables[selection.backend],
                     max_output_bytes=self.config.max_output_bytes,
                 )
-            except BackendError as exc:
+            except (BackendError, BackendInterrupted) as exc:
                 record.update(
-                    status="failed",
-                    error=str(exc),
+                    status="interrupted" if isinstance(exc, BackendInterrupted) else "failed",
+                    error="Interrupted by user"
+                    if isinstance(exc, BackendInterrupted)
+                    else str(exc),
                     observed_model=exc.observed_model,
                     retryable=exc.retryable,
                     cost_usd=exc.cost_usd,
@@ -551,6 +553,8 @@ class Workflow:
                     token_usage=normalize_usage(selection.backend, exc.usage),
                 )
                 self._save()
+                if isinstance(exc, BackendInterrupted):
+                    raise
                 if frozen is not None and manifest(directory, self.config.exclude) != frozen:
                     raise WorkflowStop(
                         "failed", f"Read-only agent {role} changed its snapshot"

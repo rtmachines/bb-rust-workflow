@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from bb_workflow.config import load_config
+from bb_workflow.engine import Workflow
 from bb_workflow.workspace import (
     WorkspaceError,
     _file_hash,
@@ -69,6 +71,80 @@ class WorkspaceTests(unittest.TestCase):
                 "candidate_id": snapshot_id(candidate),
             },
         )
+
+    @unittest.skipUnless(os.name == "posix", "portable filename regression is POSIX-specific")
+    def test_capture_rejects_unsupported_file_and_directory_components(self):
+        for relative in (
+            "notes:old.txt",
+            "back\\slash.txt",
+            "notes:old/child.txt",
+            "back\\slash/child.txt",
+        ):
+            with self.subTest(relative=relative):
+                path = self.repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("source", encoding="utf-8")
+                with self.assertRaisesRegex(WorkspaceError, "unsupported.*path|path.*unsupported"):
+                    manifest(self.repo)
+                with self.assertRaisesRegex(WorkspaceError, "unsupported.*path|path.*unsupported"):
+                    copy_snapshot(self.repo, Path(self.temporary.name) / "snapshot")
+                path.unlink()
+                if path.parent != self.repo:
+                    path.parent.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "portable filename regression is POSIX-specific")
+    def test_capture_allows_explicitly_excluded_unsupported_paths(self):
+        for index, relative in enumerate(
+            ("notes:old.txt", "back\\slash.txt", "notes:old/child.txt")
+        ):
+            with self.subTest(relative=relative):
+                path = self.repo / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("excluded", encoding="utf-8")
+                destination = Path(self.temporary.name) / f"snapshot-{index}"
+                exclusions = (relative.split("/")[0], relative)
+                self.assertNotIn(relative, copy_snapshot(self.repo, destination, exclusions))
+                self.assertFalse((destination / relative).exists())
+                path.unlink()
+                if path.parent != self.repo:
+                    path.parent.rmdir()
+
+    @unittest.skipUnless(os.name == "posix", "portable filename regression is POSIX-specific")
+    def test_reinclusion_cannot_capture_descendant_of_unsupported_directory(self):
+        path = self.repo / "notes:old" / "child.txt"
+        path.parent.mkdir()
+        path.write_text("source", encoding="utf-8")
+        with self.assertRaisesRegex(WorkspaceError, "unsupported.*path|path.*unsupported"):
+            manifest(self.repo, ("/notes:old", "!/notes:old/child.txt"))
+
+    @unittest.skipUnless(os.name == "posix", "portable filename regression is POSIX-specific")
+    def test_workflow_rejects_unsupported_source_before_provider_invocation(self):
+        (self.repo / "notes:old.txt").write_text("source", encoding="utf-8")
+        calls = []
+
+        def invoke(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("provider invoked")
+
+        config = load_config()
+        config.config_version = 2
+        config.prepare = []
+        config.checks = [["fixture", "check"]]
+        flow = Workflow(
+            self.repo,
+            "implement a value function",
+            config,
+            invoke_fn=invoke,
+            process_fn=lambda *args, **kwargs: None,
+            progress=lambda message: None,
+        )
+        run_dir = flow.run()
+        state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("unsupported or excluded relative path", state["reason"])
+        self.assertIn("notes:old.txt", state["reason"])
+        self.assertEqual(calls, [])
+        self.assertFalse((self.repo / ".bb-workflow" / "lock").exists())
 
     def test_unknown_or_contradictory_report_contract_rejects_before_backup(self):
         self.make_run()

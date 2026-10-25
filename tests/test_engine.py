@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -856,6 +857,147 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(state["agents"][-1]["status"], "interrupted")
         self.assertEqual(state["unknown_cost_calls"], 1)
         self.assertEqual(state["token_usage"]["by_backend"]["claude"]["unknown_calls"], 1)
+
+    def test_interrupted_checks_and_preparation_retain_logs_and_failed_records(self):
+        from bb_workflow.process import _OutputCapture
+
+        original_drain = _OutputCapture.drain
+        command = [
+            sys.executable,
+            "-c",
+            "import os,time; os.write(1,b'check output'); os.write(2,b'check diagnostic'); time.sleep(30)",
+        ]
+        for preparing in (False, True):
+            interrupted = False
+
+            def drain(capture):
+                nonlocal interrupted
+                active = original_drain(capture)
+                if (
+                    not interrupted
+                    and capture.stdout == b"check output"
+                    and capture.stderr == b"check diagnostic"
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt
+                return active
+
+            config = replace(self.config, prepare=[command] if preparing else [], checks=[command])
+            flow = self.workflow(config=config)
+            flow.process = run_process
+            with self.subTest(preparing=preparing), patch.object(_OutputCapture, "drain", drain):
+                directory = flow.run()
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(state["status"], "interrupted")
+            self.assertEqual(len(state["checks"]), 1)
+            check = state["checks"][0]
+            self.assertTrue(check["interrupted"])
+            self.assertFalse(check["passed"])
+            self.assertEqual(check["kind"], "preparation" if preparing else "validation")
+            logs = directory / check["artifacts"]
+            self.assertEqual((logs / "stdout.txt").read_text(), "check output")
+            self.assertEqual((logs / "stderr.txt").read_text(), "check diagnostic")
+            self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+            self.assertFalse(self.calls)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permits colon in filenames")
+    def test_interrupted_prepare_or_validation_keeps_audit_when_partial_tree_is_invalid(self):
+        from bb_workflow.process import ProcessInterrupted
+
+        def interrupt(kwargs):
+            (kwargs["cwd"] / "notes:partial.txt").write_text("unfinished generator output")
+            raise ProcessInterrupted(
+                ProcessResult(-9, "retained output", "retained diagnostic", 0.01)
+            )
+
+        for preparing in (False, True):
+            with self.subTest(preparing=preparing):
+                self.check_script = [interrupt]
+                command = ["fixture-check", "--strict"]
+                config = replace(
+                    self.config, prepare=[command] if preparing else [], checks=[command]
+                )
+                flow, state = self.run_workflow(config=config)
+                self.assertEqual(state["status"], "interrupted")
+                self.assertEqual(len(state["checks"]), 1)
+                check = state["checks"][0]
+                self.assertTrue(check["interrupted"])
+                self.assertFalse(check["passed"])
+                self.assertEqual(check["kind"], "preparation" if preparing else "validation")
+                self.assertIsNone(check["result_snapshot_id"])
+                self.assertIsNone(check["source_unchanged"])
+                logs = flow.run_dir / check["artifacts"]
+                self.assertEqual((logs / "stdout.txt").read_text(), "retained output")
+                self.assertEqual((logs / "stderr.txt").read_text(), "retained diagnostic")
+                self.assertFalse(self.calls)
+                with self.assertRaises(WorkspaceError):
+                    manifest(flow.work, self.config.exclude)
+
+    def test_interrupted_zero_exit_check_cannot_pass(self):
+        from bb_workflow.process import ProcessInterrupted
+
+        def interrupt(kwargs):
+            raise ProcessInterrupted(ProcessResult(0, "finished output", "", 0.01))
+
+        self.check_script = [interrupt]
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["checks"][0]["returncode"], 0)
+        self.assertFalse(state["checks"][0]["passed"])
+        self.assertFalse(self.calls)
+        logs = flow.run_dir / state["checks"][0]["artifacts"]
+        self.assertEqual((logs / "stdout.txt").read_text(), "finished output")
+
+    def test_interrupted_reviewer_keeps_measured_or_unknown_usage_without_retry(self):
+        from bb_workflow.backends import invoke
+        from bb_workflow.process import _OutputCapture
+
+        original_drain = _OutputCapture.drain
+        for measured in (False, True):
+            self.calls.clear()
+            interrupted = False
+            stdout = (
+                '{"usage":{"input_tokens":7,"output_tokens":3},"total_cost_usd":0.02}'
+                if measured
+                else '{"partial":'
+            )
+
+            def drain(capture):
+                nonlocal interrupted
+                active = original_drain(capture)
+                if not interrupted and capture.stdout == stdout.encode():
+                    interrupted = True
+                    raise KeyboardInterrupt
+                return active
+
+            def provider(argv, **kwargs):
+                code = f"import os,time; os.write(1,{stdout.encode()!r}); time.sleep(30)"
+                return run_process([sys.executable, "-c", code], **kwargs)
+
+            self.scripts["reviewer_a"] = [lambda kwargs: invoke(**kwargs)]
+            with (
+                self.subTest(measured=measured),
+                patch("bb_workflow.backends.run_process", side_effect=provider),
+                patch.object(_OutputCapture, "drain", drain),
+            ):
+                flow, state = self.run_workflow(config=replace(self.config, max_retries=4))
+            self.assertEqual(state["status"], "interrupted")
+            self.assertEqual(
+                [call["role"] for call in self.calls], ["implementation", "reviewer_a"]
+            )
+            record = state["agents"][-1]
+            self.assertEqual(record["status"], "interrupted")
+            self.assertEqual(record.get("retryable"), False)
+            self.assertEqual(
+                record["usage"], {"input_tokens": 7, "output_tokens": 3} if measured else {}
+            )
+            self.assertEqual(record["cost_usd"], 0.02 if measured else None)
+            self.assertEqual(state["unknown_cost_calls"], 0 if measured else 1)
+            group = state["token_usage"]["by_backend"]["claude"]
+            self.assertEqual(group["unknown_calls"], 1 if measured else 2)
+            self.assertEqual(group["partial_calls"], 1 if measured else 0)
+            logs = flow.run_dir / record["artifacts"]
+            self.assertEqual((logs / "stdout.txt").read_text(), stdout)
 
     def test_high_severity_duplicate_of_low_confirmed_finding_still_blocks(self):
         self.scripts["reviewer_a"] = [response(findings=[finding("a", severity="high")])]

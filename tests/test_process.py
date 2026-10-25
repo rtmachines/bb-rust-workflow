@@ -280,6 +280,105 @@ class ProcessTests(unittest.TestCase):
         self.assertTrue(launched[0].stdout.closed)
         self.assertTrue(launched[0].stderr.closed)
 
+    def test_interrupt_retains_captured_output_after_process_and_pipe_cleanup(self):
+        from bb_workflow.process import _OutputCapture
+
+        original_drain = _OutputCapture.drain
+        launched = []
+        original_spawn = subprocess.Popen
+        interrupted = False
+
+        def spawn(*args, **kwargs):
+            child = original_spawn(*args, **kwargs)
+            launched.append(child)
+            return child
+
+        def drain(capture):
+            nonlocal interrupted
+            active = original_drain(capture)
+            if (
+                not interrupted
+                and capture.stdout == b"retained-out"
+                and capture.stderr == b"retained-err"
+            ):
+                interrupted = True
+                raise KeyboardInterrupt("cancel fixture")
+            return active
+
+        with (
+            patch("bb_workflow.process.subprocess.Popen", side_effect=spawn),
+            patch.object(_OutputCapture, "drain", drain),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            run_process(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,time; os.write(1,b'retained-out'); os.write(2,b'retained-err'); time.sleep(30)",
+                ],
+                self.cwd,
+                5,
+            )
+        self.assertIsNotNone(launched[0].returncode)
+        self.assertTrue(launched[0].stdout.closed)
+        self.assertTrue(launched[0].stderr.closed)
+        self.assertIsInstance(getattr(raised.exception, "result", None), ProcessResult)
+        result = raised.exception.result
+        self.assertEqual((result.stdout, result.stderr), ("retained-out", "retained-err"))
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.output_limit_exceeded)
+        self.assertGreaterEqual(result.duration, 0)
+        self.assertEqual(raised.exception.args, ("cancel fixture",))
+
+    def test_interrupt_retains_bounded_prefix_when_output_overflows(self):
+        from bb_workflow.process import _OutputCapture, _OutputLimitExceeded
+
+        original_drain = _OutputCapture.drain
+
+        def drain(capture):
+            try:
+                return original_drain(capture)
+            except _OutputLimitExceeded:
+                raise KeyboardInterrupt("cancel at cap")
+
+        with (
+            patch.object(_OutputCapture, "drain", drain),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            run_process(
+                [sys.executable, "-c", "import os,time; os.write(1,b'x'*2048); time.sleep(30)"],
+                self.cwd,
+                5,
+                max_output_bytes=1024,
+            )
+        self.assertEqual(raised.exception.result.stdout, "x" * 1024)
+        self.assertEqual(raised.exception.result.stderr, "")
+        self.assertTrue(raised.exception.result.output_limit_exceeded)
+        self.assertFalse(raised.exception.result.timed_out)
+
+    def test_windows_interrupt_with_empty_output_does_not_require_supervisor_status(self):
+        launched = []
+
+        def spawn(argv, **kwargs):
+            launched.append(argv)
+            return Mock(returncode=0, stdout=None, stderr=None)
+
+        with (
+            patch("bb_workflow.process._is_windows", return_value=True),
+            patch("bb_workflow.process.subprocess.CREATE_NEW_PROCESS_GROUP", 512, create=True),
+            patch("bb_workflow.process.subprocess.Popen", side_effect=spawn),
+            patch("bb_workflow.process._wait_for_exit", side_effect=KeyboardInterrupt),
+            patch("bb_workflow.process._stop_tree"),
+            self.assertRaises(KeyboardInterrupt) as raised,
+        ):
+            run_process(["fixture-cli"], self.cwd, 1)
+        result = raised.exception.result
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+        self.assertFalse(result.timed_out)
+        self.assertFalse(result.output_limit_exceeded)
+        self.assertFalse(Path(launched[0][2]).parent.exists())
+
     def test_capture_setup_error_still_stops_process_and_closes_both_pipes(self):
         with (
             patch("bb_workflow.process.subprocess.Popen") as popen,

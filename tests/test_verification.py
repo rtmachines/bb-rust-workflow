@@ -18,7 +18,7 @@ from bb_workflow.config import (
     default_text,
     load_config,
 )
-from bb_workflow.process import ProcessResult
+from bb_workflow.process import ProcessInterrupted, ProcessResult
 from bb_workflow.workspace import WorkspaceError, apply_run, manifest
 
 
@@ -275,6 +275,50 @@ class ExecutionTests(unittest.TestCase):
             (directory / report["results"][0]["artifacts"] / "stdout.txt").read_text(), "first log"
         )
 
+    def test_standalone_cancellation_retains_output_and_skips_final_source_scan(self):
+        for overflow in (False, True):
+            with self.subTest(overflow=overflow):
+                interrupted = False
+                rescans = []
+
+                def scan(*args, **kwargs):
+                    if interrupted:
+                        rescans.append(args[0])
+                    return manifest(*args, **kwargs)
+
+                def process(*args, **kwargs):
+                    nonlocal interrupted
+                    interrupted = True
+                    raise ProcessInterrupted(
+                        ProcessResult(
+                            0,
+                            "partial\r\noutput",
+                            "partial diagnostic",
+                            0.25,
+                            output_limit_exceeded=overflow,
+                        )
+                    )
+
+                with patch.object(verification, "manifest", side_effect=scan):
+                    directory, report = verification.verify_repository(
+                        self.repo, self.config, "gate", process_fn=process
+                    )
+                self.assertEqual(report["status"], "interrupted")
+                item = report["results"][0]
+                self.assertEqual(item["returncode"], 0)
+                self.assertTrue(item["interrupted"])
+                self.assertFalse(item["passed"])
+                self.assertEqual(item["duration"], 0.25)
+                self.assertIsNone(item["result_snapshot_id"])
+                self.assertIsNone(item["source_unchanged"])
+                self.assertIsNone(report["result_snapshot_id"])
+                self.assertIsNone(report["source_unchanged"])
+                logs = directory / item["artifacts"]
+                self.assertEqual((logs / "stdout.txt").read_bytes(), b"partial\r\noutput")
+                self.assertEqual((logs / "stderr.txt").read_text(), "partial diagnostic")
+                self.assertEqual(rescans, [])
+                self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+
     def test_preparation_can_mutate_sources(self):
         def mutate(argv, **kwargs):
             (self.repo / "source.txt").write_text("generated")
@@ -470,6 +514,53 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
 
     def report(self, record):
         return json.loads((self.artifacts / record["diagnostics_file"]).read_text())
+
+    def test_cargo_cancellation_keeps_probe_and_check_output_separate_without_rescanning(self):
+        from bb_workflow import verification_metadata
+
+        for during_probe in (True, False):
+            with self.subTest(during_probe=during_probe):
+                process, calls = self.cargo()
+                interrupted = False
+                rescans = []
+                self.records.clear()
+
+                def scan(*args, **kwargs):
+                    if interrupted:
+                        rescans.append(args[0])
+                    return manifest(*args, **kwargs)
+
+                def cancel(argv, **kwargs):
+                    nonlocal interrupted
+                    if (argv[-1] == "--version") == during_probe:
+                        interrupted = True
+                        raise ProcessInterrupted(ProcessResult(0, "partial stdout", "stderr", 0.1))
+                    return process(argv, **kwargs)
+
+                with (
+                    patch.object(verification, "manifest", side_effect=scan),
+                    patch.object(verification_metadata, "manifest", side_effect=scan),
+                    self.assertRaises(ProcessInterrupted),
+                ):
+                    self.execute(process_fn=cancel)
+                item = self.records[0]
+                logs = self.artifacts / item["artifacts"]
+                if during_probe:
+                    probe = self.artifacts / "checks/metadata/0"
+                    self.assertEqual((probe / "stdout.txt").read_text(), "partial stdout")
+                    self.assertEqual((probe / "stderr.txt").read_text(), "stderr")
+                    self.assertEqual((logs / "stdout.txt").read_text(), "")
+                    self.assertFalse(calls)
+                    metadata = json.loads((logs / "metadata.json").read_text())
+                    self.assertIsNone(metadata["probes"][0]["version"])
+                else:
+                    self.assertEqual((logs / "stdout.txt").read_text(), "partial stdout")
+                self.assertTrue(item["interrupted"])
+                self.assertFalse(item["passed"])
+                self.assertIsNone(item["source_unchanged"])
+                self.assertEqual(rescans, [])
+                diagnostics = self.report(item)
+                self.assertFalse(diagnostics["execution"]["successful"])
 
     def test_full_stream_diagnostic_is_saved_beyond_check_tail(self):
         process, calls = self.cargo(

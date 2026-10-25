@@ -28,6 +28,14 @@ class ProcessResult:
     output_limit_exceeded: bool = False
 
 
+class ProcessInterrupted(KeyboardInterrupt):
+    """Cancellation with the bounded output retained after process cleanup."""
+
+    def __init__(self, result: ProcessResult, *args: object) -> None:
+        super().__init__(*args)
+        self.result = result
+
+
 class _OutputLimitExceeded(Exception):
     """Internal signal to stop the process before retaining excess output."""
 
@@ -239,10 +247,13 @@ def run_process(
             **options,
         )
         timed_out = False
+        interrupted = None
         capture = None
         try:
             capture = _OutputCapture(process, max_output_bytes)
             _wait_for_exit(process, timeout, capture)
+        except KeyboardInterrupt as exc:
+            interrupted = exc
         except subprocess.TimeoutExpired:
             timed_out = True
         except _OutputLimitExceeded:
@@ -261,16 +272,20 @@ def run_process(
                 for stream in (process.stdout, process.stderr):
                     if stream is not None:
                         stream.close()
-        captured_out = capture.stdout.decode("utf-8", errors="replace")
-        captured_err = capture.stderr.decode("utf-8", errors="replace")
+        captured_out = capture.stdout.decode("utf-8", errors="replace") if capture else ""
+        captured_err = capture.stderr.decode("utf-8", errors="replace") if capture else ""
         duration = time.monotonic() - started
-        if _is_windows() and not timed_out and not capture.exceeded:
+        exceeded = capture.exceeded if capture else False
+        if _is_windows() and not timed_out and not exceeded and interrupted is None:
             return _windows_result(result_path, captured_out, captured_err, duration)
-        return ProcessResult(
+        result = ProcessResult(
             returncode=process.returncode,
             stdout=captured_out,
             stderr=captured_err,
             duration=duration,
             timed_out=timed_out,
-            output_limit_exceeded=capture.exceeded,
+            output_limit_exceeded=exceeded,
         )
+        if interrupted is not None:
+            raise ProcessInterrupted(result, *interrupted.args) from interrupted
+        return result

@@ -17,7 +17,7 @@ from .diagnostics import (
     parse_diagnostics,
     summarize_diagnostics,
 )
-from .process import ProcessResult, run_process
+from .process import ProcessInterrupted, ProcessResult, run_process
 from .verification_metadata import MetadataCapture, MetadataError
 from .workspace import (
     WorkspaceError,
@@ -210,11 +210,14 @@ def execute_checks(
         write_json(directory / "command.json", argv)
         started = time.monotonic()
         fatal: BaseException | None = None
+        result = None
+        command_started = False
         metadata = {"tool_versions": {}, "digest": None}
         environment = snapshot_environment()
         try:
             if not preparing:
                 metadata = capture.capture(check.argv, environment, directory)
+            command_started = True
             result = process_fn(
                 argv,
                 cwd=cwd,
@@ -230,20 +233,26 @@ def execute_checks(
             fatal = VerificationStop("blocked", f"Validation executable unavailable: {argv[0]}")
         except OSError as exc:
             fatal = VerificationStop("failed", f"Cannot execute validation command: {exc}")
+        except ProcessInterrupted as exc:
+            fatal = exc
+            # Probe output belongs to its metadata artifacts, not an unstarted check.
+            if command_started:
+                result = exc.result
         except KeyboardInterrupt as exc:
             fatal = exc
-        if fatal is not None:
+        if result is None:
             result = ProcessResult(-1, "", "", time.monotonic() - started)
         (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8", newline="")
         (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8", newline="")
-        try:
-            after = manifest(cwd, config.exclude)
-        except (OSError, WorkspaceError) as exc:
-            after = None
-            if not isinstance(fatal, KeyboardInterrupt):
+        interrupted = isinstance(fatal, KeyboardInterrupt)
+        after = None
+        if not interrupted:
+            try:
+                after = manifest(cwd, config.exclude)
+            except (OSError, WorkspaceError) as exc:
                 fatal = VerificationStop("failed", f"Cannot inspect source after validation: {exc}")
-        unchanged = before == after
-        if result.output_limit_exceeded:
+        unchanged = None if interrupted else before == after
+        if result.output_limit_exceeded and not interrupted:
             fatal = VerificationStop(
                 "failed",
                 f"Command output limit exceeded ({config.max_output_bytes} bytes): "
@@ -271,6 +280,7 @@ def execute_checks(
             "timed_out": result.timed_out,
             "output_limit_exceeded": result.output_limit_exceeded,
             "duration": result.duration,
+            "interrupted": interrupted,
             "passed": fatal is None
             and result.returncode == 0
             and not result.timed_out
@@ -291,7 +301,7 @@ def execute_checks(
         elif result.returncode:
             item["error"] = f"Command exited with status {result.returncode}"
         if not preparing:
-            if "reasons" in metadata:
+            if "reasons" in metadata and not interrupted:
                 capture.recheck(metadata, environment, directory)
             context = DiagnosticContext(
                 check.profile,
@@ -457,12 +467,15 @@ def verify_repository(
         except (OSError, WorkspaceError) as exc:
             report.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
         finally:
-            try:
-                current = manifest(repo, config.exclude)
-                report["result_snapshot_id"] = snapshot_id(current)
-                report["source_unchanged"] = frozen is not None and current == frozen
-            except (OSError, WorkspaceError) as exc:
-                report.update(source_unchanged=False, source_error=str(exc))
+            if report["status"] == "interrupted":
+                report.update(result_snapshot_id=None, source_unchanged=None)
+            else:
+                try:
+                    current = manifest(repo, config.exclude)
+                    report["result_snapshot_id"] = snapshot_id(current)
+                    report["source_unchanged"] = frozen is not None and current == frozen
+                except (OSError, WorkspaceError) as exc:
+                    report.update(source_unchanged=False, source_error=str(exc))
             if not report["source_unchanged"] and report["status"] == "passed":
                 report.update(status="failed", reason="Source changed after verification")
             if report["status"] == "passed":

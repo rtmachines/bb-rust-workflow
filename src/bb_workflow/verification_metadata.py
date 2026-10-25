@@ -11,7 +11,7 @@ from pathlib import Path, PurePath
 from typing import Callable
 
 from .config import Config
-from .process import ProcessResult
+from .process import ProcessInterrupted, ProcessResult
 from .workspace import WorkspaceError, manifest, write_json
 
 
@@ -350,6 +350,8 @@ class MetadataCapture:
                         )
                     except BaseException as exc:
                         error = exc
+                        if isinstance(exc, ProcessInterrupted):
+                            result = exc.result
                     (probe_dir / "stdout.txt").write_text(
                         result.stdout, encoding="utf-8", newline=""
                     )
@@ -364,6 +366,7 @@ class MetadataCapture:
                         "duration": time.monotonic() - started,
                         "artifacts": str(probe_dir.relative_to(self.artifact_root)),
                         "error": type(error).__name__ if error else None,
+                        "interrupted": isinstance(error, KeyboardInterrupt),
                     }
                     write_json(probe_dir / "result.json", evidence)
                     text = result.stdout.strip() or result.stderr.strip()
@@ -381,13 +384,13 @@ class MetadataCapture:
                     evidence["version"] = version
                     self.cache[key] = evidence
                     metadata["probes"].append(evidence)
+                    if isinstance(error, KeyboardInterrupt):
+                        raise error
                     try:
                         unchanged = manifest(self.cwd, self.config.exclude) == self.frozen
                     except (OSError, WorkspaceError):
                         unchanged = False
                     if not unchanged:
-                        if isinstance(error, KeyboardInterrupt):
-                            raise error
                         raise MetadataError(
                             "Metadata probe changed source files; results invalidated"
                         )
