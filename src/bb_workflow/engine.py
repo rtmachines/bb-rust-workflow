@@ -21,6 +21,7 @@ from .protocol import merge_findings, resolve_triage, response_schema, validate_
 from .reporting import render_report
 from .requirements import (
     Requirements,
+    RequirementsError,
     bind_requirements,
     evaluate_mechanical,
     verification_plan_id,
@@ -177,6 +178,12 @@ class Workflow:
             except KeyboardInterrupt:
                 self.state.update(
                     status="interrupted", reason="Interrupted by user", error_code="interrupted"
+                )
+            except RequirementsError as exc:
+                self.state.update(
+                    status="failed",
+                    reason=f"{type(exc).__name__}: {exc}",
+                    error_code="invalid_requirements",
                 )
             except Exception as exc:
                 self.state.update(

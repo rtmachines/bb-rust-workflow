@@ -562,6 +562,81 @@ class JsonContractTests(unittest.TestCase):
             )
             self.envelope(["status", temp, "--json"], "status", 2, "io_error")
 
+    def test_invalid_requirement_binding_retains_category_inside_failed_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            requirements = root / "requirements.toml"
+            requirements.write_text(
+                "requirements_version = 1\n[[criteria]]\n"
+                'id = "regression"\ndescription = "Verify the change"\n'
+                'kind = "mechanical"\nverification = "Run the required check"\n'
+                'check_id = "missing-check"\n'
+            )
+            for command, code in (("plan", 2), ("run", 1)):
+                with self.subTest(command=command):
+                    payload, _ = self.envelope(
+                        [
+                            command,
+                            "task",
+                            "--repo",
+                            temp,
+                            "--requirements",
+                            str(requirements),
+                            "--json",
+                        ],
+                        command,
+                        code,
+                        "invalid_requirements",
+                    )
+                    self.assertEqual(payload["error"]["next_action"], "correct_requirements")
+                    if command == "run":
+                        self.assertEqual(payload["data"]["status"], "failed")
+                        state = json.loads(
+                            (Path(payload["data"]["run_dir"]) / "state.json").read_text()
+                        )
+                        self.assertEqual(state["error_code"], "invalid_requirements")
+                        self.assertEqual(state["agent_calls"], 0)
+            self.assertFalse((root / ".bb-workflow/lock").exists())
+
+    def test_verification_source_read_failures_preserve_typed_category(self):
+        from bb_workflow import workspace
+
+        for failure, error, action in (
+            (PermissionError("fixture source is unreadable"), "io_error", "inspect_filesystem"),
+            (
+                workspace.WorkspaceError("fixture source cannot be captured"),
+                "workspace_error",
+                "inspect_workspace",
+            ),
+            (
+                workspace.WorkspaceError("fixture source changed", code="source_conflict"),
+                "source_conflict",
+                "inspect_source_conflict",
+            ),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                source = root / "source.txt"
+                source.write_text("source")
+                original = workspace._file_hash
+
+                def unreadable(path):
+                    if path == source:
+                        raise failure
+                    return original(path)
+
+                with patch("bb_workflow.workspace._file_hash", side_effect=unreadable):
+                    payload, _ = self.envelope(
+                        ["verify", "gate", "--repo", temp, "--json"], "verify", 1, error
+                    )
+                self.assertEqual(payload["data"]["status"], "failed")
+                self.assertEqual(payload["error"]["next_action"], action)
+                report = json.loads((Path(payload["data"]["run_dir"]) / "report.json").read_text())
+                self.assertEqual(report["error_code"], error)
+                self.assertEqual(report["results"], [])
+                self.assertFalse(report["apply_eligible"])
+                self.assertFalse((root / ".bb-workflow/lock").exists())
+
     def test_status_failed_read_is_success_and_preserves_legacy_payload(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

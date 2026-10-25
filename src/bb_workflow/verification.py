@@ -480,7 +480,11 @@ def verify_repository(
                 status="interrupted", reason="Interrupted by user", error_code="interrupted"
             )
         except (OSError, WorkspaceError) as exc:
-            report.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+            report.update(
+                status="failed",
+                reason=f"{type(exc).__name__}: {exc}",
+                error_code=exc.code if isinstance(exc, WorkspaceError) else "io_error",
+            )
         finally:
             if report["status"] == "interrupted":
                 report.update(result_snapshot_id=None, source_unchanged=None)
