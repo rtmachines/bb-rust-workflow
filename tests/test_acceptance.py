@@ -1,10 +1,12 @@
 """Candidate-bound acceptance through the real workflow with offline provider fixtures."""
 
 import contextlib
+import hashlib
 import io
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,7 +17,7 @@ from bb_workflow.config import load_config
 from bb_workflow.engine import Workflow
 from bb_workflow.process import ProcessResult
 from bb_workflow.requirements import Criterion, Requirements, load_requirements
-from bb_workflow.workspace import manifest, snapshot_id
+from bb_workflow.workspace import WorkspaceError, apply_run, manifest, snapshot_id, write_json
 
 
 class AcceptanceTests(unittest.TestCase):
@@ -125,6 +127,168 @@ class AcceptanceTests(unittest.TestCase):
             json.loads(json.dumps(flow.state)),
         )
         return flow
+
+    def test_final_contract_authorizes_only_complete_current_local_evidence(self):
+        flow = self.run_flow()
+        path = flow.run_dir / "acceptance.json"
+        self.assertTrue(path.is_file(), "Successful criteria run needs a final acceptance artifact")
+        report = json.loads(path.read_text())
+        self.assertEqual(flow.state["version"], 2)
+        self.assertEqual(report["version"], 1)
+        self.assertEqual(report["cycle"], 0)
+        self.assertEqual(report["binding"]["candidate_id"], flow.state["candidate_id"])
+        self.assertEqual([c["criterion_id"] for c in report["criteria"]], ["gate", "scope"])
+        self.assertEqual(report["gate"]["planned_checks"][0]["argv"], ["fixture-check"])
+        self.assertEqual(report["gate"]["results"][0]["passed"], True)
+        original = (self.repo / "lib.rs").read_text()
+        saved = {
+            name: (flow.run_dir / name).read_bytes()
+            for name in (
+                "state.json",
+                "acceptance.json",
+                "requirements.json",
+                "verification_plan.json",
+            )
+        }
+
+        def mutate_report(change):
+            data = deepcopy(report)
+            change(data)
+            write_json(path, data)
+            state = deepcopy(flow.state)
+            canonical = json.dumps(data, sort_keys=True, separators=(",", ":"))
+            state["acceptance_report"]["digest"] = hashlib.sha256(canonical.encode()).hexdigest()
+            write_json(flow.run_dir / "state.json", state)
+
+        changes = {
+            "missing artifact": lambda: path.unlink(),
+            "malformed JSON": lambda: path.write_text("{"),
+            "nonobject JSON": lambda: write_json(path, []),
+            "wrong digest": lambda: write_json(path, {**report, "cycle": 17}),
+            "stale candidate": lambda: mutate_report(
+                lambda d: d["binding"].update(candidate_id="stale")
+            ),
+            "stale cycle": lambda: mutate_report(lambda d: d.update(cycle=17)),
+            "missing criterion": lambda: mutate_report(lambda d: d["criteria"].pop()),
+            "unknown criterion": lambda: mutate_report(
+                lambda d: d["criteria"][0].update(criterion_id="unknown")
+            ),
+            "stale criterion": lambda: mutate_report(
+                lambda d: d["criteria"][0]["binding"].update(candidate_id="old")
+            ),
+            "incomplete gate": lambda: mutate_report(lambda d: d["gate"].update(results=[])),
+            "forged reviewer": lambda: mutate_report(
+                lambda d: d["review"]["reviews"][0].update(criterion_assessments=[])
+            ),
+            "altered requirements": lambda: write_json(flow.run_dir / "requirements.json", {}),
+            "altered plan": lambda: write_json(flow.run_dir / "verification_plan.json", {}),
+        }
+        for name, change in changes.items():
+            with self.subTest(name=name):
+                for filename, content in saved.items():
+                    (flow.run_dir / filename).write_bytes(content)
+                change()
+                with self.assertRaises(WorkspaceError):
+                    apply_run(flow.run_dir)
+                self.assertEqual((self.repo / "lib.rs").read_text(), original)
+                self.assertFalse((flow.run_dir / "apply-backup").exists())
+        for filename, content in saved.items():
+            (flow.run_dir / filename).write_bytes(content)
+        self.assertEqual(apply_run(flow.run_dir), ["lib.rs"])
+        self.assertEqual(len(self.calls), 3, "Apply must use local evidence only")
+
+    def test_final_artifact_write_failure_cannot_leave_apply_eligible_success(self):
+        from bb_workflow import engine
+
+        original = engine.write_json
+
+        def fail_acceptance(path, value):
+            if path.name == "acceptance.json":
+                raise OSError("acceptance disk failure")
+            return original(path, value)
+
+        with patch("bb_workflow.engine.write_json", side_effect=fail_acceptance):
+            flow = self.run_flow()
+        self.assertEqual(flow.state["status"], "failed")
+        self.assertIn("acceptance disk failure", flow.state["reason"])
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+        self.assertIn("No final approval", (flow.run_dir / "report.md").read_text())
+
+    def test_final_contract_rederives_criteria_and_gate_from_audit_state(self):
+        flow = self.run_flow()
+        self.assertTrue((flow.run_dir / "acceptance.json").is_file())
+        original = deepcopy(flow.state)
+        mutations = (
+            lambda s: s["checks"].pop(),
+            lambda s: s["checks"][-1].update(returncode=True),
+            lambda s: s["checks"][-1].update(source_unchanged=False),
+            lambda s: s["acceptance"]["rounds"][-1]["mechanical"].clear(),
+            lambda s: s["reviews"][-1]["reviews"][0]["criterion_assessments"][0].update(
+                verdict="unmet"
+            ),
+            lambda s: s["agents"][-1].update(status="failed"),
+            lambda s: s["agents"][-1]["binding"].update(candidate_id="stale"),
+            lambda s: s["reviews"][-1].update(cycle=False),
+            lambda s: s["agents"][-1].update(cycle=False),
+        )
+        for mutation in mutations:
+            state = deepcopy(original)
+            mutation(state)
+            write_json(flow.run_dir / "state.json", state)
+            with self.subTest(mutation=mutation), self.assertRaises(WorkspaceError):
+                apply_run(flow.run_dir)
+        self.assertFalse((flow.run_dir / "apply-backup").exists())
+
+    def test_markdown_report_write_failure_revokes_success(self):
+        original = Path.write_text
+
+        def fail_report(path, text, *args, **kwargs):
+            if path.name == "report.md":
+                raise OSError("human report disk failure")
+            return original(path, text, *args, **kwargs)
+
+        with patch.object(Path, "write_text", autospec=True, side_effect=fail_report):
+            flow = self.run_flow()
+        self.assertEqual(flow.state["status"], "failed")
+        self.assertIn("human report disk failure", flow.state["reason"])
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+
+    def test_partial_reviewer_evidence_survives_second_review_budget_exhaustion(self):
+        self.config.max_agent_calls = 2
+        flow = self.run_flow()
+        self.assertEqual(flow.state["status"], "budget_exhausted")
+        self.assertEqual(len(flow.state["reviews"]), 0)
+        report = (flow.run_dir / "report.md").read_text()
+        self.assertIn("No final approval", report)
+        self.assertIn("API inspected", report)
+        self.assertFalse((flow.run_dir / "acceptance.json").exists())
+
+    def test_triage_approval_requires_durable_current_provenance(self):
+        def dispute(response, call):
+            response["criterion_assessments"][0]["verdict"] = "unmet"
+
+        self.scripts["reviewer_a"] = [dispute]
+        flow = self.run_flow()
+        self.assertEqual(flow.state["status"], "succeeded", flow.state["reason"])
+        artifact = json.loads((flow.run_dir / "acceptance.json").read_text())
+        self.assertEqual(artifact["criteria"][1]["rationale"], "Source inspected")
+        triage = next(p for p in artifact["provenance"] if p["role"] == "triage")
+        (flow.run_dir / triage["artifacts"] / "validated_response.json").unlink()
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+        self.assertFalse((flow.run_dir / "apply-backup").exists())
+
+    def test_historical_stage4_criteria_state_keeps_original_apply_contract(self):
+        flow = self.run_flow()
+        state = deepcopy(flow.state)
+        state["version"] = 1
+        state.pop("report_contract", None)
+        state.pop("acceptance_report", None)
+        (flow.run_dir / "acceptance.json").unlink(missing_ok=True)
+        write_json(flow.run_dir / "state.json", state)
+        self.assertEqual(apply_run(flow.run_dir), ["lib.rs"])
 
     def test_v3_requires_criteria_before_any_check_or_provider(self):
         flow = Workflow(

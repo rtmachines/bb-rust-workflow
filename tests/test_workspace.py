@@ -70,6 +70,37 @@ class WorkspaceTests(unittest.TestCase):
             },
         )
 
+    def test_unknown_or_contradictory_report_contract_rejects_before_backup(self):
+        self.make_run()
+        path = self.run / "state.json"
+        original = json.loads(path.read_text())
+        for changes in (
+            {"version": 7},
+            {"version": True},
+            {"version": "1"},
+            {"version": None},
+            {"version": 2},
+            {"report_contract": 1},
+            {"version": 1, "acceptance_report": None},
+        ):
+            with self.subTest(changes=changes):
+                write_json(path, {**original, **changes})
+                with self.assertRaises(WorkspaceError):
+                    apply_run(self.run)
+                self.assertFalse((self.run / "apply-backup").exists())
+                self.assertEqual((self.repo / "old.txt").read_text(), "remove me")
+        write_json(path, original)
+        write_json(self.run / "acceptance.json", {})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+
+    def test_explicit_historical_version1_still_applies_without_new_indicators(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1})
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
+
     def test_copy_manifest_preserves_initial_dirty_contents_and_permissions(self):
         (self.repo / "dirty.txt").chmod(0o755)
         destination = Path(self.temporary.name) / "snapshot"
