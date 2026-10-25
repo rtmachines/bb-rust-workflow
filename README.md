@@ -106,6 +106,40 @@ Po `prepare` program zapamiętuje identyfikator źródeł. Dla v2 brak `checks` 
 
 Aby przejść na pełny zakres v2, ustaw `config_version = 2` i świadomie zastąp albo usuń własne `checks`. Samo podbicie wersji zachowuje jawne polecenia. Nie włączaj automatycznie `--all-features`; wybierz konfiguracje features zgodnie ze wspieranymi wariantami projektu. Wyniki oraz recenzje odnoszą się do tej samej wersji plików. **Zmiana źródeł podczas kontroli unieważnia wyniki i zatrzymuje przebieg przed recenzjami**; generatory i formatowanie zapisujące pliki należy przenieść do `prepare`. Wykluczone artefakty budowania mogą się zmieniać. Polecenia w `prepare` i `checks` to listy argumentów, bez składni powłoki. Kontrole bazowe pokazują zastane problemy; **przejście kandydata przez kontrole jest obowiązkowe**. Zaufaj tylko komendom z własnego `workflow.toml`: są uruchamiane z uprawnieniami użytkownika.
 
+### Weryfikacja bez agentów
+
+Polecenie `verify` uruchamia kontrole bez `prepare`, wyboru modeli ani wywołań dostawców. Działa w podanym repozytorium źródłowym, pod blokadą projektu, i sprawdza manifest źródeł przed oraz po kontrolach. Zmianę źródeł wykrywa i raportuje, ale jej nie wycofuje. Weryfikacja nie tworzy migawek kandydata i nigdy nie uprawnia do `apply`.
+
+```sh
+bb-workflow verify fast --repo .
+bb-workflow verify focused --repo . --package recipe-core --test-filter upper_boundary
+bb-workflow verify lint --repo . --config workflow.toml --package recipe-core
+bb-workflow verify gate --repo .
+```
+
+Każdy profil przyjmuje `--repo` i opcjonalne `--config`. Szybkie profile `fast`, `focused` i `lint` przyjmują opcjonalne `--package`; tylko `focused` obsługuje `--test-filter`. `gate` odrzuca oba zawężenia i wykonuje wszystkie skonfigurowane warianty, zachowując kolejność poleceń z głównego `checks`. Nie ma nadpisania `checks` wewnątrz profilu `gate`.
+
+Profile weryfikacji znajdują się w `[verification.profiles.*]`, niezależnie od `[profiles.low|medium|high]`, które nadal wybierają modele. Bez dodatkowej konfiguracji `fast` wykonuje formatowanie i `cargo check`, `focused` — `cargo check` i testy, `lint` — Clippy, a `gate` — główny zestaw `checks`. Można skonfigurować warianty macierzy gate:
+
+```toml
+checks = [["cargo", "check", "--workspace", "--locked"]]
+
+[verification.profiles.gate]
+variants = ["default", "no-defaults-linux"]
+
+[verification.variants.default]
+
+[verification.variants.no-defaults-linux]
+features = ["serde"]
+no_default_features = true
+target = "x86_64-unknown-linux-gnu" # Opcjonalnie.
+toolchain = "stable" # Opcjonalnie.
+```
+
+`checks` na poziomie głównym pozostaje jedynym źródłem poleceń gate; każdy wariant stosuje się do wszystkich tych poleceń. Wariant domyślny nie zmienia argumentów. `features`, `all_features`, `no_default_features`, `target` i `toolchain` są jawne; program nie włącza automatycznie wszystkich features. Jeśli zawężenie lub wariant wymagałby niejednoznacznej transformacji własnego `argv` — na przykład polecenia powłoki albo sprzecznych flag Cargo — konfiguracja jest odrzucana z błędem zamiast po cichu zmieniać zakres.
+
+`verify` używa istniejącego `Cargo.lock`; nie tworzy go ani nie przygotowuje źródeł. Przy `--locked` przygotuj wcześniej pliki źródłowe i lockfile, np. przez `prepare` w zwykłym przebiegu albo ręcznie. Wyniki są zapisywane w `.bb-workflow/verifications/<id>/report.json` i `report.md`, razem z logami poleceń. Poprawny wynik ma status `passed` oraz `apply_eligible = false`. Kody wyjścia: `0` — wszystkie kontrole zaliczone, `1` — kontrola nieudana, zablokowana lub wyczerpany budżet, `130` — przerwanie, `2` — błędna konfiguracja lub użycie. Zwykłe `run` nadal przeprowadza pełny gate przed recenzjami każdego kandydata.
+
 Domyślne limity to `max_cycles = 3` (dokładnie maksymalna liczba wywołań Fixera), `max_agent_calls = 20`, `timeout_seconds = 900` na proces i `max_seconds = 3600` jako budżet uruchamiania etapów. Pozostały czas ogranicza timeout kolejnego procesu. Kopiowanie i hashowanie plików oraz sprzątanie procesów nie są przerywane w środku operacji, więc czas zakończenia może przekroczyć ten budżet. `max_retries` dotyczy tylko odczytowych ról recenzentów/triage; zapisy implementera i Fixera nie są automatycznie ponawiane. Nierozstrzygnięte ustalenie blokuje sukces. Koszt raportowany przez Claude jest sumowany, lecz Codex może nie zwracać kwoty USD; łączny koszt może być **nieznany**. Limity czasu i wywołań nie są limitem pieniężnym.
 
 Ponowienia pomijają błędy wymagające zmiany lokalnej konfiguracji lub środowiska: nieprawidłowe wywołanie, brak programu, zmianę modelu oraz przekroczenie limitu wyjścia. Każda faktycznie podjęta próba pozostaje osobnym wpisem w audycie i zużywa limit wywołań. Błędy dostawcy i parsowania jego odpowiedzi mogą być ponowione w ramach `max_retries`, wyłącznie dla ról odczytowych i po sprawdzeniu niezmienności ich kopii. Osobna walidacja protokołu workflow nadal zatrzymuje przebieg przy niepoprawnej odpowiedzi.

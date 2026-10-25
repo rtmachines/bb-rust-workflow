@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etap 1 zakończony i zweryfikowany; etapy 2–5 do realizacji
+Status: etap 1 zakończony i zweryfikowany; etap 2 zaimplementowany, weryfikacja końcowa oczekuje; etapy 3–5 do realizacji
 
 ## Cel i zachowane gwarancje
 
@@ -33,7 +33,9 @@ Migracja do pełnego zakresu v2 wymaga ustawienia `config_version = 2` oraz świ
 
 ## 2. Wspólne wykonywanie kontroli, szybkie profile i warianty
 
-Wydzielamy wykonywanie kontroli z `engine.py` do niewielkiego modułu `verification.py`. Korzystają z niego zarówno orkiestrator, jak i nowe polecenie `verify`. Obecny `process.py` pozostaje odpowiedzialny za procesy, timeouty i sprzątanie.
+**Status: implementacja etapu 2 zakończona; weryfikacja końcowa oczekuje na raport z implementacji i przegląd.** Nie przypisujemy jeszcze testom ani linterom liczników zaliczeń. Data weryfikacji zostanie uzupełniona po potwierdzeniu wyników.
+
+Wykonanie kontroli jest wydzielone z `engine.py` do niewielkiego modułu `verification.py`. Korzystają z niego zarówno orkiestrator, jak i polecenie `verify`. `process.py` nadal odpowiada za procesy, timeouty i sprzątanie.
 
 Profile kontroli umieszczamy w **`[verification.profiles.*]`**. Obecne `[profiles.low|medium|high]` nadal oznaczają dobór modeli.
 
@@ -44,9 +46,9 @@ Profile kontroli umieszczamy w **`[verification.profiles.*]`**. Obecne `[profile
 | `lint` | Clippy | Celowana analiza kodu |
 | `gate` | Pełny zestaw z etapu 1 | Obowiązkowa weryfikacja końcowa |
 
-Dodajemy jawne warianty features, targetu i toolchainu w `[verification.variants.*]`. Gate wykonuje wszystkie przypisane mu warianty. Nie włączamy automatycznie `--all-features`; macierz ma odzwierciedlać wspierane konfiguracje projektu.
+Dodaliśmy jawne warianty features, targetu i toolchainu w `[verification.variants.*]`. Gate wykonuje wszystkie przypisane mu warianty, w kolejności konfiguracji, dla poleceń z głównego `checks`. Główne `checks` pozostaje jedynym źródłem komend gate; profil `gate` nie może definiować własnych komend. Szybkie profile mogą mieć własne listy poleceń. Profile weryfikacji są odrębne od modelowych `[profiles.low|medium|high]`. Nie włączamy automatycznie `--all-features`; macierz ma odzwierciedlać wspierane konfiguracje projektu.
 
-Proponowany przyszły interfejs:
+Interfejs polecenia:
 
 ```text
 bb-workflow verify fast --repo . --package recipe-core
@@ -54,9 +56,13 @@ bb-workflow verify focused --repo . --package recipe-core --test-filter upper_bo
 bb-workflow verify gate --repo .
 ```
 
-`verify` działa bez modeli, w bieżącym katalogu projektu, z kontrolą niezmienności źródeł. Nie uruchamia automatycznie operacji przygotowawczych zapisujących źródła. Raporty trafiają do `.bb-workflow/verifications/`.
+Profile `fast`, `focused` i `lint` przyjmują opcjonalne `--package`; `--test-filter` jest dostępne wyłącznie dla `focused`. `gate` odrzuca zawężanie i uruchamia wszystkie skonfigurowane warianty. `verify` działa w rzeczywistym repozytorium źródłowym, pod blokadą, bez agentów i bez `prepare`; używa istniejących źródeł i lockfile. Raporty `report.json` i `report.md` wraz z pełnymi logami trafiają do `.bb-workflow/verifications/<id>/`. Sukces ma status `passed` i `apply_eligible = false`. Manifest źródeł jest sprawdzany przed oraz po kontrolach; zmiany zostają zgłoszone, ale nie są cofane. Przy `--locked` źródła oraz `Cargo.lock` muszą być już przygotowane.
+
+Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` — `cargo check` oraz testy; `lint` — Clippy; `gate` — główne `checks`. Własne komendy zachowują argv bez zmian, gdy nie zażądano transformacji. Niejednoznaczne zawężanie lub flagi wariantu powodują czytelny błąd konfiguracji. Kody wyjścia `verify`: `0` dla zaliczenia, `1` dla niepowodzenia/zablokowania/wyczerpania budżetu, `130` dla przerwania i `2` dla błędu konfiguracji lub użycia.
 
 **Odbiór etapu:** szybki profil nie może nadać wynikowi statusu uprawniającego do `apply`. Gate odrzuca zawężanie pakietu lub filtra testów. W `run` pełny gate nadal poprzedza recenzje każdego kandydata.
+
+**Weryfikacja etapu:** oczekuje na zakończenie przeglądu i aktualizację przez koordynatora. Szczegółowe wyniki testów, Ruff, formatowania i reviewdog zostaną dopisane po ich potwierdzeniu; na tym etapie nie podajemy niezweryfikowanych liczb.
 
 ## 3. Klasyfikacja diagnostyki względem baseline
 
