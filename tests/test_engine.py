@@ -1000,6 +1000,22 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(state["agents"][-1]["retryable"])
         self.assertNotIn("reviewer_b", self.events)
 
+    def test_candidate_change_during_finding_triage_fails_before_repair(self):
+        def mutate_candidate(call):
+            (flow.work / "src/lib.rs").write_text("External change during triage\n")
+            return response(decisions=[decision("F1", "confirmed")])
+
+        self.scripts["reviewer_a"] = [response(findings=[finding()])]
+        self.scripts["triage"] = [mutate_candidate]
+        flow = self.workflow()
+        flow.run()
+        self.assertEqual(flow.state["status"], "failed", flow.state["reason"])
+        self.assertIn("changed during triage", flow.state["reason"])
+        self.assertEqual(flow.state["cycles"], 0)
+        self.assertEqual(
+            self.events, ["check", "implementation", "check", "reviewer_a", "reviewer_b", "triage"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

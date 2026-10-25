@@ -274,6 +274,8 @@ class Workflow:
                         ],
                     )
                 triage = self._agent("triage", directory, triage_context, frozen)
+                if manifest(self.work, self.config.exclude) != candidate:
+                    raise WorkflowStop("failed", "Candidate changed during triage")
                 confirmed, unresolved = resolve_triage(findings, triage)
                 record["triage"] = triage
                 if round_record is not None:

@@ -487,3 +487,23 @@ class AcceptanceTests(unittest.TestCase):
             [item["verdict"] for item in flow.state["acceptance"]["rounds"][0]["mechanical"]],
             ["unmet", "unresolved"],
         )
+
+    def test_candidate_change_during_semantic_triage_fails_before_repair(self):
+        def unmet(response, call):
+            response["criterion_assessments"][0]["verdict"] = "unmet"
+
+        def mutate_candidate(response, call):
+            (flow.work / "lib.rs").write_text("External change during triage\n")
+            response["criterion_decisions"][0]["verdict"] = "unmet"
+
+        self.scripts["reviewer_a"] = [unmet]
+        self.scripts["triage"] = [mutate_candidate]
+        flow = self.workflow()
+        flow.run()
+        self.assertEqual(flow.state["status"], "failed", flow.state["reason"])
+        self.assertIn("changed during triage", flow.state["reason"])
+        self.assertEqual(flow.state["cycles"], 0)
+        self.assertEqual(len(flow.state["acceptance"]["rounds"]), 1)
+        self.assertEqual(
+            self.events, ["check", "implementation", "check", "reviewer_a", "reviewer_b", "triage"]
+        )
