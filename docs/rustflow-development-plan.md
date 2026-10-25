@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etap 1 zakończony i zweryfikowany; etap 2 zaimplementowany, weryfikacja końcowa oczekuje; etapy 3–5 do realizacji
+Status: etap 1 zakończony i zweryfikowany; etap 2 zaimplementowany i zweryfikowany testami, niezależny przegląd oczekuje; etapy 3–5 do realizacji
 
 ## Cel i zachowane gwarancje
 
@@ -33,7 +33,7 @@ Migracja do pełnego zakresu v2 wymaga ustawienia `config_version = 2` oraz świ
 
 ## 2. Wspólne wykonywanie kontroli, szybkie profile i warianty
 
-**Status: implementacja etapu 2 zakończona; weryfikacja końcowa oczekuje na raport z implementacji i przegląd.** Nie przypisujemy jeszcze testom ani linterom liczników zaliczeń. Data weryfikacji zostanie uzupełniona po potwierdzeniu wyników.
+**Status: implementacja i automatyczna weryfikacja zakończone 2026-10-25; niezależny przegląd oczekuje na potwierdzenie koordynatora.**
 
 Wykonanie kontroli jest wydzielone z `engine.py` do niewielkiego modułu `verification.py`. Korzystają z niego zarówno orkiestrator, jak i polecenie `verify`. `process.py` nadal odpowiada za procesy, timeouty i sprzątanie.
 
@@ -62,7 +62,7 @@ Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` 
 
 **Odbiór etapu:** szybki profil nie może nadać wynikowi statusu uprawniającego do `apply`. Gate odrzuca zawężanie pakietu lub filtra testów. W `run` pełny gate nadal poprzedza recenzje każdego kandydata.
 
-**Weryfikacja etapu:** oczekuje na zakończenie przeglądu i aktualizację przez koordynatora. Szczegółowe wyniki testów, Ruff, formatowania i reviewdog zostaną dopisane po ich potwierdzeniu; na tym etapie nie podajemy niezweryfikowanych liczb.
+**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd kodu pozostaje oczekujący.
 
 ## 3. Klasyfikacja diagnostyki względem baseline
 
