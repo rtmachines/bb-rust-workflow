@@ -379,8 +379,8 @@ def invoke(
             )
         except OSError as exc:
             raise BackendError(f"Cannot start {selection.backend}: {exc}", retryable=False) from exc
-        (artifact_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8")
-        (artifact_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+        (artifact_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8", newline="")
+        (artifact_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8", newline="")
         audit.update(_invocation_evidence(result.stdout, selection.backend))
         if result.output_limit_exceeded:
             raise BackendError(

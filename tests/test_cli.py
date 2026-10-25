@@ -17,7 +17,7 @@ from bb_workflow.verification import verify_repository
 class CliTests(unittest.TestCase):
     def test_verify_uses_discovered_config_and_reports_without_provider_calls(self):
         with tempfile.TemporaryDirectory() as temp:
-            repo = Path(temp)
+            repo = Path(temp).resolve()
             command = [sys.executable, "-c", "from pathlib import Path; print(Path.cwd())"]
             (repo / "workflow.toml").write_text(
                 default_text()
