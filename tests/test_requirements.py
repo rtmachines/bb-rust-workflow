@@ -364,3 +364,71 @@ class RequirementsBoundaryTests(unittest.TestCase):
             req.verification_plan_id(plan),
             req.verification_plan_id(replace(plan, variants=("other", "default"))),
         )
+
+
+class CargoInvocationProofTests(unittest.TestCase):
+    setUp = RequirementsTests.setUp
+    criterion = RequirementsTests.criterion
+    bound = RequirementsTests.bound
+    binding = RequirementsTests.binding
+    record = RequirementsTests.record
+    verdict = RequirementsTests.verdict
+
+    COMMANDS = (
+        ("/usr/bin/cargo", "test", "missing_filter"),
+        ("cargo.exe", "test", "missing_filter"),
+        (r"C:\Rust\bin\cargo.exe", "test", "missing_filter"),
+        ("/opt/rust/bin/cargo", "+stable", "test", "missing_filter"),
+        ("cargo", "--color", "never", "test", "missing_filter"),
+        ("cargo", "--color=never", "test", "missing_filter"),
+        ("cargo", "--config", "net.offline=true", "test", "missing_filter"),
+        ("cargo", "--config=net.offline=true", "-Zunstable-options", "-Cproject", "test"),
+        ("cargo", "+nightly", "-Z", "unstable-options", "-C", "project", "test"),
+        ("cargo", "--offline", "--locked", "--frozen", "-vv", "-q", "test"),
+        ("cargo", "t", "missing_filter"),
+    )
+
+    def test_every_direct_cargo_form_requires_nonzero_test_execution(self):
+        zero = (
+            "running 0 tests\n"
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        for argv in self.COMMANDS:
+            with self.subTest(argv=argv):
+                plan = replace(self.plan, checks=(replace(self.plan.checks[0], argv=argv),))
+                bound = self.bound(replace(self.criterion(), test_name=None), plan)
+                record = dict(self.record(zero), command=list(argv))
+                self.assertEqual(self.verdict([record], bound), "unmet")
+                self.assertEqual(bound.gate_plan.checks[0].argv, argv)
+
+    def test_named_positive_proof_uses_same_direct_cargo_classification(self):
+        positive = (
+            "running 1 test\ntest validation::upper ... ok\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        for argv in self.COMMANDS:
+            with self.subTest(argv=argv):
+                plan = replace(self.plan, checks=(replace(self.plan.checks[0], argv=argv),))
+                bound = self.bound(plan=plan)
+                record = dict(self.record(positive), command=list(argv))
+                self.assertEqual(self.verdict([record], bound), "satisfied")
+                for suffix in (("--no-run",), ("--", "--list")):
+                    nonexecuting = (*argv, *suffix)
+                    plan = replace(
+                        self.plan, checks=(replace(self.plan.checks[0], argv=nonexecuting),)
+                    )
+                    bound = self.bound(plan=plan)
+                    self.assertEqual(
+                        self.verdict([dict(record, command=list(nonexecuting))], bound), "unmet"
+                    )
+
+    def test_unknown_or_incomplete_cargo_global_grammar_fails_closed(self):
+        for argv in (
+            ("cargo", "--unknown", "test"),
+            ("cargo", "--color"),
+            ("cargo", "--config=", "test"),
+            ("cargo", "+", "test"),
+        ):
+            with self.subTest(argv=argv), self.assertRaises(req.RequirementsError):
+                plan = replace(self.plan, checks=(replace(self.plan.checks[0], argv=argv),))
+                self.bound(replace(self.criterion(), test_name=None), plan)

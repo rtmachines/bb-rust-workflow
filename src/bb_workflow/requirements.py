@@ -113,8 +113,43 @@ def verification_plan_id(plan: VerificationPlan) -> str:
 
 
 def _cargo_test(argv: tuple[str, ...]) -> bool:
-    position = 2 if len(argv) > 1 and argv[1].startswith("+") else 1
-    return len(argv) > position and argv[0] == "cargo" and argv[position] == "test"
+    """Classify direct Cargo tests; unknown Cargo prefix grammar cannot become custom proof."""
+    executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if executable not in {"cargo", "cargo.exe"}:
+        return False
+    position = 1
+    if len(argv) > position and argv[position].startswith("+"):
+        if len(argv[position]) == 1:
+            raise RequirementsError("Cargo toolchain must not be empty")
+        position += 1
+    flags = {"--verbose", "--quiet", "--locked", "--offline", "--frozen"}
+    valued = {"--color", "--config", "-C", "-Z"}
+    while position < len(argv):
+        arg = argv[position]
+        if not arg.startswith(("-", "+")):
+            return arg in {"test", "t"}
+        if arg in flags or re.fullmatch(r"-[vq]+", arg):
+            position += 1
+            continue
+        option, separator, value = arg.partition("=")
+        if option in {"--color", "--config"} and separator:
+            pass
+        elif arg in valued:
+            position += 1
+            value = argv[position] if position < len(argv) else ""
+            option = arg
+        elif arg.startswith(("-C", "-Z")) and len(arg) > 2:
+            option, value = arg[:2], arg[2:]
+        else:
+            raise RequirementsError(f"Unsupported Cargo global argument: {arg}")
+        if (
+            not value
+            or value.startswith("-")
+            or (option == "--color" and value not in {"auto", "always", "never"})
+        ):
+            raise RequirementsError(f"Invalid or missing Cargo global argument value: {option}")
+        position += 1
+    raise RequirementsError("Cargo acceptance check requires an unambiguous subcommand")
 
 
 def bind_requirements(requirements: Requirements, gate_plan: VerificationPlan) -> BoundRequirements:
@@ -155,7 +190,8 @@ def bind_requirements(requirements: Requirements, gate_plan: VerificationPlan) -
         check = checks.get(criterion.check_id)
         if check is None:
             raise RequirementsError(f"Unknown check_id: {criterion.check_id}")
-        if criterion.test_name is not None and not _cargo_test(check.argv):
+        is_test = _cargo_test(check.argv)
+        if criterion.test_name is not None and not is_test:
             raise RequirementsError("test_name requires a direct Cargo test command")
     return BoundRequirements(
         requirements, gate_plan, requirements_id(requirements), verification_plan_id(gate_plan)
