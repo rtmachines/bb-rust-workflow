@@ -4,10 +4,9 @@ import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest.mock import patch
 
 from bb_workflow import verification
@@ -409,18 +408,785 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertFalse(report["source_unchanged"])
 
+        now = 0.0
+
         def slow(*args, **kwargs):
-            time.sleep(0.02)
+            nonlocal now
+            now += 0.02
             return ProcessResult(0, "", "", 0.02)
 
         config = replace(self.config, max_seconds=0.01)
-        directory, report = verification.verify_repository(
-            self.repo, config, "gate", process_fn=slow
-        )
+        # Setup time must not decide whether the fixture command launches.
+        with patch("bb_workflow.verification.time.monotonic", side_effect=lambda: now):
+            directory, report = verification.verify_repository(
+                self.repo, config, "gate", process_fn=slow
+            )
         self.assertEqual(report["status"], "budget_exhausted")
         self.assertEqual(len(report["results"]), 1)
         self.assertTrue((directory / "report.json").exists())
 
+    def test_standalone_budget_exhausted_before_launch_has_no_command_results(self):
+        config = replace(self.config, max_seconds=0.01)
+        clock = iter((0.0, 0.02))
+
+        def must_not_launch(*args, **kwargs):
+            self.fail("A command launched after the global budget was exhausted")
+
+        with patch(
+            "bb_workflow.verification.time.monotonic", side_effect=lambda: next(clock, 0.02)
+        ):
+            directory, report = verification.verify_repository(
+                self.repo, config, "gate", process_fn=must_not_launch
+            )
+        self.assertEqual(report["status"], "budget_exhausted")
+        self.assertEqual(report["results"], [])
+        self.assertTrue(report["source_unchanged"])
+        self.assertEqual(
+            json.loads((directory / "report.json").read_text())["status"], "budget_exhausted"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticsIntegrationTests(unittest.TestCase):
+    setUp = ExecutionTests.setUp
+    execute = ExecutionTests.execute
+
+    def cargo(self, output="", *, stderr="", code=0, **flags):
+        self.config = replace(self.config, checks=[["cargo", "check", "--offline"]])
+        self.plan = verification.plan_verification(self.config)
+        calls = []
+
+        def process(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[-1] == "--version":
+                name = "rustfmt" if "fmt" in argv else "clippy" if "clippy" in argv else argv[0]
+                return ProcessResult(0, f"{name} 1.90.0 (fixture)\n", "", 0)
+            return ProcessResult(code, output, stderr, 0, **flags)
+
+        return process, calls
+
+    def report(self, record):
+        return json.loads((self.artifacts / record["diagnostics_file"]).read_text())
+
+    def test_full_stream_diagnostic_is_saved_beyond_check_tail(self):
+        process, calls = self.cargo(
+            stderr="warning[unused_variables]: unused variable: `x`\n"
+            " --> src/lib.rs:4:5\n4 | let x = 1;\n" + " " * 18000
+        )
+        record = self.execute(process_fn=process)[0]
+        report = self.report(record)
+        self.assertEqual(report["findings"][0]["code"], "unused_variables")
+        self.assertNotIn("unused_variables", record["stderr_tail"])
+        self.assertEqual(record["diagnostics"]["counts"]["unclassified"], 1)
+        self.assertEqual(
+            [c[0] for c in calls],
+            [["cargo", "--version"], ["rustc", "--version"], ["cargo", "check", "--offline"]],
+        )
+        metadata = json.loads((self.artifacts / record["metadata_file"]).read_text())
+        self.assertEqual(metadata["tool_versions"]["rustc"], "rustc 1.90.0 (fixture)")
+        self.assertTrue(
+            (self.artifacts / metadata["probes"][0]["artifacts"] / "stdout.txt").is_file()
+        )
+
+    def test_metadata_probe_audit_preserves_newlines_with_windows_text_translation(self):
+        process, _ = self.cargo()
+        original_write_text = Path.write_text
+
+        def windows_write_text(path, data, encoding=None, errors=None, newline=None):
+            # Keep real file writes; emulate only Windows' default newline translation.
+            return original_write_text(
+                path,
+                data,
+                encoding=encoding,
+                errors=errors,
+                newline="\r\n" if newline is None else newline,
+            )
+
+        def probe(argv, **kwargs):
+            if argv[-1] == "--version":
+                return ProcessResult(0, f"{argv[0]} 1.90.0\r\n", "first\r\nsecond\nprogress\r", 0)
+            return process(argv, **kwargs)
+
+        with patch.object(Path, "write_text", windows_write_text):
+            record = self.execute(process_fn=probe)[0]
+        metadata = json.loads((self.artifacts / record["metadata_file"]).read_text())
+        self.assertEqual(len(metadata["probes"]), 2)
+        for evidence, expected in zip(
+            metadata["probes"], (b"cargo 1.90.0\r\n", b"rustc 1.90.0\r\n"), strict=True
+        ):
+            with self.subTest(command=evidence["command"]):
+                directory = self.artifacts / evidence["artifacts"]
+                self.assertEqual((directory / "stdout.txt").read_bytes(), expected)
+                self.assertEqual(
+                    (directory / "stderr.txt").read_bytes(), b"first\r\nsecond\nprogress\r"
+                )
+
+    def test_fatal_output_retains_diagnostics_before_propagation(self):
+        process, _ = self.cargo(
+            stderr="error[E0001]: broken\n --> src/lib.rs:1:1\n1 | broken\n",
+            output_limit_exceeded=True,
+        )
+        with self.assertRaises(verification.VerificationStop):
+            self.execute(process_fn=process)
+        self.assertEqual(self.report(self.records[-1])["findings"][0]["code"], "E0001")
+        self.assertFalse(self.records[-1]["passed"])
+
+    def test_baseline_comparison_tracks_config_tool_scope_and_unknown_probes(self):
+        diagnostic = (
+            "warning[unused_variables]: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = 1;\n"
+        )
+        process, _ = self.cargo(stderr=diagnostic)
+        baseline = self.execute(process_fn=process)
+        # The artifact root is stable for baseline lookup; use another command directory.
+        baseline_root = self.artifacts
+
+        def run(**kwargs):
+            return verification.execute_checks(
+                self.plan.checks,
+                cwd=self.repo,
+                artifact_root=baseline_root,
+                command_root=baseline_root / f"candidate-{len(self.records)}",
+                config=self.config,
+                timeout=lambda: 10,
+                record=self.records.append,
+                baseline_records=baseline,
+                process_fn=kwargs.pop("process_fn", process),
+                **kwargs,
+            )[0]
+
+        self.assertEqual(run()["diagnostics"]["counts"]["persistent"], 1)
+        (self.repo / "Cargo.toml").write_text('[package]\nname="changed"\n')
+        self.assertEqual(run()["diagnostics"]["counts"]["unclassified"], 1)
+        (self.repo / "Cargo.toml").unlink()
+        self.assertEqual(
+            run(scope={"package": "other", "test_filter": None})["diagnostics"]["counts"][
+                "unclassified"
+            ],
+            1,
+        )
+
+        def unknown(argv, **kwargs):
+            if argv[-1] == "--version":
+                return ProcessResult(0, "unknown version text", "", 0)
+            return process(argv, **kwargs)
+
+        self.assertEqual(run(process_fn=unknown)["diagnostics"]["counts"]["unclassified"], 1)
+
+        def newer(argv, **kwargs):
+            result = process(argv, **kwargs)
+            return replace(result, stdout=result.stdout.replace("1.90", "1.91"))
+
+        self.assertEqual(run(process_fn=newer)["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_probe_source_mutation_interrupt_and_budget_are_audited(self):
+        for mode in ("mutation", "interrupt", "budget"):
+            with self.subTest(mode=mode):
+                (self.repo / "source.txt").write_text("original")
+                process, calls = self.cargo()
+
+                def probe(argv, **kwargs):
+                    if argv[-1] == "--version":
+                        if mode == "mutation":
+                            (self.repo / "source.txt").write_text("mutated")
+                        elif mode == "interrupt":
+                            raise KeyboardInterrupt()
+                        else:
+                            raise verification.VerificationStop("budget_exhausted", "budget")
+                    return process(argv, **kwargs)
+
+                expected = (
+                    KeyboardInterrupt if mode == "interrupt" else verification.VerificationStop
+                )
+                with self.assertRaises(expected):
+                    self.execute(process_fn=probe)
+                self.assertFalse(self.records[-1]["passed"])
+                self.assertTrue((self.artifacts / self.records[-1]["metadata_file"]).exists())
+                self.assertFalse(any(c[0] == ["cargo", "check", "--offline"] for c in calls))
+
+    def test_metadata_hashes_inherited_config_and_environment_without_secret_values(self):
+        from unittest.mock import patch
+
+        process, _ = self.cargo()
+        cargo_home = self.repo.parent / (self.repo.name + "-cargo-home")
+        cargo_home.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(cargo_home))
+        (cargo_home / "config.toml").write_text("[build]\njobs=1\n")
+        with patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTFLAGS": "secret-marker"}):
+            first = self.execute(process_fn=process)[0]
+            metadata = (self.artifacts / first["metadata_file"]).read_text()
+            digest = self.report(first)["context"]["configuration_digest"]
+            self.assertNotIn("secret-marker", metadata)
+            (cargo_home / "config.toml").write_text("[build]\njobs=2\n")
+            second = self.execute(process_fn=process)[0]
+            self.assertNotEqual(digest, self.report(second)["context"]["configuration_digest"])
+
+    def test_selector_probes_are_bounded_and_cached_only_within_one_phase(self):
+        process, calls = self.cargo()
+        self.config = replace(
+            self.config, checks=[["cargo", "+stable", "clippy"], ["cargo", "+stable", "check"]]
+        )
+        self.plan = verification.plan_verification(self.config)
+        self.execute(process_fn=process)
+        commands = [call[0] for call in calls]
+        self.assertEqual(
+            commands,
+            [
+                ["cargo", "+stable", "--version"],
+                ["rustc", "+stable", "--version"],
+                ["cargo", "+stable", "clippy", "--version"],
+                ["cargo", "+stable", "clippy"],
+                ["cargo", "+stable", "check"],
+            ],
+        )
+        self.assertTrue(
+            all(call[1]["max_output_bytes"] == self.config.max_output_bytes for call in calls)
+        )
+        self.assertTrue(all(call[1]["timeout"] <= 10 for call in calls))
+        self.execute(process_fn=process)
+        self.assertEqual(
+            sum(command == ["cargo", "+stable", "--version"] for command, _ in calls), 2
+        )
+
+    def test_unknown_wrappers_never_trigger_guessed_tool_probes(self):
+        self.config = replace(self.config, checks=[["wrapper", "cargo", "check"]])
+        self.plan = verification.plan_verification(self.config)
+        calls = []
+
+        def custom(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(
+                0, "", "warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n", 0
+            )
+
+        records = self.execute(process_fn=custom)
+        self.assertEqual(calls, [["wrapper", "cargo", "check"]])
+        self.assertEqual(records[0]["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_probe_failures_unknown_override_and_cli_config_cannot_resolve(self):
+        from unittest.mock import patch
+
+        diagnostic = "warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+        process, _ = self.cargo(stderr=diagnostic)
+        baseline = self.execute(process_fn=process)
+        root = self.artifacts
+        for index, mode in enumerate(
+            ("failed", "empty", "timeout", "overflow", "wrapper", "cli-config")
+        ):
+            with self.subTest(mode=mode):
+
+                def probe(argv, **kwargs):
+                    if argv[-1] == "--version":
+                        if mode == "failed":
+                            raise FileNotFoundError("missing")
+                        if mode in {"empty", "timeout", "overflow"}:
+                            return ProcessResult(
+                                0,
+                                "",
+                                "",
+                                0,
+                                timed_out=mode == "timeout",
+                                output_limit_exceeded=mode == "overflow",
+                            )
+                    return process(argv, **kwargs)
+
+                command = ("cargo", "check", "--offline")
+                if mode == "cli-config":
+                    # Even the same CLI config argv cannot establish which effective tool it selects.
+                    command += ("--config", 'build.rustc="custom"')
+                check = replace(self.plan.checks[0], argv=command)
+                with patch.dict(
+                    os.environ, {"RUSTC_WRAPPER": "custom-wrapper"} if mode == "wrapper" else {}
+                ):
+                    records = verification.execute_checks(
+                        (check,),
+                        cwd=self.repo,
+                        artifact_root=root,
+                        command_root=root / f"probe-failure-{index}",
+                        config=self.config,
+                        timeout=lambda: 10,
+                        baseline_records=baseline,
+                        process_fn=probe,
+                    )
+                self.assertEqual(records[0]["diagnostics"]["counts"]["resolved"], 0)
+                self.assertEqual(records[0]["diagnostics"]["counts"]["unobserved_previous"], 1)
+                if mode in {"wrapper", "cli-config"}:
+                    full = json.loads((root / records[0]["metadata_file"]).read_text())
+                    self.assertIn(None, full["tool_versions"].values())
+
+    def test_empty_scope_remains_unknown_and_clippy_config_contents_change_identity(self):
+        from unittest.mock import patch
+
+        process, _ = self.cargo()
+        directory = self.repo.parent / (self.repo.name + "-lint-config")
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory))
+        directory.mkdir()
+        config_file = directory / "clippy.toml"
+        config_file.write_text('msrv="1.80"\n')
+        with patch.dict(os.environ, {"CLIPPY_CONF_DIR": str(directory)}):
+            first = self.execute(process_fn=process, scope={})[0]
+            first_report = self.report(first)
+            self.assertEqual(first_report["context"]["scope"], {})
+            config_file.write_text('msrv="1.81"\n')
+            second = self.execute(process_fn=process)[0]
+            self.assertNotEqual(
+                first_report["context"]["configuration_digest"],
+                self.report(second)["context"]["configuration_digest"],
+            )
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires Windows privileges")
+    def test_probe_invalid_source_manifest_still_retains_failed_check_evidence(self):
+        process, _ = self.cargo()
+
+        def invalid(argv, **kwargs):
+            if argv[-1] == "--version":
+                source = self.repo / "source.txt"
+                source.unlink()
+                source.symlink_to("missing")
+            return process(argv, **kwargs)
+
+        with self.assertRaises(verification.VerificationStop):
+            self.execute(process_fn=invalid)
+        self.assertEqual(len(self.records), 1)
+        self.assertFalse(self.records[0]["passed"])
+        self.assertTrue((self.artifacts / self.records[0]["diagnostics_file"]).exists())
+
+    def test_external_configuration_changed_during_probe_or_check_is_not_resolution(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_file = Path(temporary) / "config.toml"
+            process, _ = self.cargo(
+                stderr="warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+            )
+            with patch.dict(os.environ, {"CARGO_HOME": temporary}):
+                for mode in ("probe", "check"):
+                    with self.subTest(mode=mode):
+                        config_file.write_text("[build]\njobs=1\n")
+                        baseline = self.execute(process_fn=process)
+                        root = self.artifacts
+                        changed = False
+
+                        def mutate(argv, **kwargs):
+                            nonlocal changed
+                            if (
+                                (mode == "probe" and argv[-1] == "--version")
+                                or (mode == "check" and argv[-1] != "--version")
+                            ) and not changed:
+                                config_file.write_text("[build]\njobs=2\n")
+                                changed = True
+                            if argv[-1] == "--version":
+                                return process(argv, **kwargs)
+                            return ProcessResult(0, "", "", 0)
+
+                        result = verification.execute_checks(
+                            self.plan.checks,
+                            cwd=self.repo,
+                            artifact_root=root,
+                            command_root=root / "changed",
+                            config=self.config,
+                            timeout=lambda: 10,
+                            baseline_records=baseline,
+                            process_fn=mutate,
+                        )[0]
+                        self.assertTrue(result["passed"])
+                        self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+                        self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires Windows privileges")
+    def test_configured_excluded_symlink_does_not_break_metadata_or_custom_execution(self):
+        ignored = self.repo / "ignored-link"
+        ignored.symlink_to("missing-target")
+        process, _ = self.cargo()
+        self.config = replace(self.config, exclude=(*self.config.exclude, "ignored-link"))
+        for commands, runner in (
+            ([[sys.executable, "-c", "pass"]], None),
+            ([["cargo", "check", "--offline"]], process),
+        ):
+            with self.subTest(commands=commands):
+                config = replace(self.config, checks=commands)
+                kwargs = {"process_fn": runner} if runner is not None else {}
+                _, report = verification.verify_repository(self.repo, config, "gate", **kwargs)
+                self.assertEqual(report["status"], "passed", report["reason"])
+                self.assertTrue(report["source_unchanged"])
+
+    def test_environment_root_normalization_does_not_conflate_external_prefix_paths(self):
+        from bb_workflow.verification_metadata import configuration
+
+        other_root = self.repo / "other-root"
+        other_root.mkdir()
+        left = configuration(self.repo, self.config, {"RUSTFLAGS": f"-L {self.repo}{os.sep}lib"})
+        right = configuration(other_root, self.config, {"RUSTFLAGS": f"-L {other_root}{os.sep}lib"})
+        self.assertEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])
+        left = configuration(self.repo, self.config, {"RUSTFLAGS": str(self.repo) + "-external"})
+        right = configuration(other_root, self.config, {"RUSTFLAGS": str(other_root) + "-external"})
+        self.assertNotEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])
+
+    def test_environment_digest_normalizes_native_windows_roots_and_keeps_path_boundaries(self):
+        from bb_workflow.verification_metadata import _environment_digest
+
+        baseline = PureWindowsPath(r"C:\baseline")
+        candidate = PureWindowsPath(r"D:\candidate")
+        for left, right in (
+            (r"-L C:\baseline\lib", r"-L D:\candidate\lib"),
+            (r"-L C:/baseline\lib", r"-L D:/candidate\lib"),
+            (r'"C:\baseline\bin";C:\tools', r'"D:\candidate\bin";C:\tools'),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(
+                    _environment_digest(baseline, left), _environment_digest(candidate, right)
+                )
+        for left, right in (
+            (r"-L C:\baseline-external\lib", r"-L D:\candidate-external\lib"),
+            (r"-L Z:\other\C:\baseline\lib", r"-L Z:\other\D:\candidate\lib"),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertNotEqual(
+                    _environment_digest(baseline, left), _environment_digest(candidate, right)
+                )
+        # A backslash is a legal filename character on POSIX, not a separator.
+        self.assertNotEqual(
+            _environment_digest(PurePosixPath("/baseline"), r"-L /baseline\lib"),
+            _environment_digest(PurePosixPath("/candidate"), r"-L /candidate\lib"),
+        )
+
+    def test_external_and_excluded_selected_manifests_cannot_resolve(self):
+        process, _ = self.cargo(stderr="warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n")
+        with tempfile.TemporaryDirectory() as external:
+            for index, arguments in enumerate(
+                (
+                    ["--manifest-path", str(Path(external) / "Cargo.toml")],
+                    ["--manifest-path=" + str(Path(external) / "Cargo.toml")],
+                    ["--manifest-path", "target/selected/Cargo.toml"],
+                )
+            ):
+                with self.subTest(arguments=arguments):
+                    selected = (
+                        Path(external) / "Cargo.toml"
+                        if index < 2
+                        else self.repo / "target/selected/Cargo.toml"
+                    )
+                    selected.parent.mkdir(parents=True, exist_ok=True)
+                    selected.write_text('[package]\nname="first"\nversion="0.1.0"\n')
+                    self.plan = verification.plan_verification(
+                        replace(self.config, checks=[["cargo", "check", *arguments, "--offline"]])
+                    )
+                    baseline = self.execute(process_fn=process)
+                    root = self.artifacts
+                    selected.write_text('[package]\nname="second"\nversion="0.2.0"\n')
+
+                    def quiet(argv, **kwargs):
+                        return (
+                            process(argv, **kwargs)
+                            if argv[-1] == "--version"
+                            else ProcessResult(0, "", "", 0)
+                        )
+
+                    result = verification.execute_checks(
+                        self.plan.checks,
+                        cwd=self.repo,
+                        artifact_root=root,
+                        command_root=root / "candidate",
+                        config=self.config,
+                        timeout=lambda: 10,
+                        baseline_records=baseline,
+                        process_fn=quiet,
+                    )[0]
+                    self.assertTrue(result["passed"])
+                    self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+                    self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+                    metadata = json.loads((root / result["metadata_file"]).read_text())
+                    self.assertIsNone(metadata["digest"])
+                    self.assertTrue(metadata["reasons"])
+
+    def test_ancestor_workspace_lock_and_external_path_dependencies_are_uncaptured(self):
+        from bb_workflow.verification_metadata import configuration
+
+        member = self.repo / "member"
+        member.mkdir()
+        manifest_file = member / "Cargo.toml"
+        for case in ("ancestor-workspace", "path-dependency", "explicit-workspace"):
+            with self.subTest(case=case):
+                (self.repo / "Cargo.toml").write_text(
+                    '[workspace]\nmembers=["member"]\n[workspace.package]\nversion="0.1.0"\n'
+                )
+                (self.repo / "Cargo.lock").write_text("version = 4\n")
+                text = '[package]\nname="member"\nversion.workspace=true\n'
+                if case == "path-dependency":
+                    text = '[package]\nname="member"\nversion="0.1.0"\n[workspace]\n[dependencies]\nother={path="../../external"}\n'
+                if case == "explicit-workspace":
+                    text += 'workspace="../../external"\n'
+                manifest_file.write_text(text)
+                first = configuration(member, self.config, {})
+                (self.repo / "Cargo.toml").write_text(
+                    '[workspace]\nmembers=["member"]\n[workspace.package]\nversion="0.2.0"\n'
+                )
+                second = configuration(member, self.config, {})
+                self.assertIsNone(first["digest"])
+                self.assertIsNone(second["digest"])
+                self.assertTrue(first["reasons"])
+        # A complete in-tree workspace/dependency inventory remains comparable.
+        manifest_file.write_text('[package]\nname="member"\nversion.workspace=true\n')
+        captured = configuration(self.repo, self.config, {})
+        self.assertIsNotNone(captured["digest"])
+        self.assertIn("member/Cargo.toml", captured["files"])
+        self.assertIn("Cargo.lock", captured["files"])
+
+    def test_array_target_paths_outside_captured_source_make_scope_unknown(self):
+        from bb_workflow.verification_metadata import configuration
+
+        package = '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n'
+        manifest_file = self.repo / "Cargo.toml"
+        for reference in ("src/main.rs", "target/main.rs", "../shared/main.rs"):
+            if not reference.startswith(".."):
+                source = self.repo / reference
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("fn main() {}\n")
+            for kind in ("bin", "test", "example", "bench"):
+                with self.subTest(kind=kind, reference=reference):
+                    manifest_file.write_text(
+                        package + f'[[{kind}]]\nname="fixture"\npath="{reference}"\n'
+                    )
+                    metadata = configuration(self.repo, self.config, {})
+                    if reference == "src/main.rs":
+                        self.assertIsNotNone(metadata["digest"], metadata["reasons"])
+                    else:
+                        self.assertIsNone(metadata["digest"])
+                        self.assertTrue(metadata["reasons"])
+
+    def test_explicit_build_script_must_be_inside_captured_source(self):
+        from bb_workflow.verification_metadata import configuration
+
+        manifest_file = self.repo / "Cargo.toml"
+        for value in (
+            '"scripts/build.rs"',
+            '"target/build.rs"',
+            '"../shared/build.rs"',
+            "true",
+            "false",
+        ):
+            with self.subTest(build=value):
+                if value.startswith(('"scripts/', '"target/')):
+                    source = self.repo / value.strip('"')
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text("fn main() {}\n")
+                manifest_file.write_text(
+                    '[package]\nname="fixture"\nversion="0.1.0"\nbuild=' + value + "\n[workspace]\n"
+                )
+                metadata = configuration(self.repo, self.config, {})
+                if value in ('"scripts/build.rs"', "true", "false"):
+                    self.assertIsNotNone(metadata["digest"], metadata["reasons"])
+                else:
+                    self.assertIsNone(metadata["digest"])
+                    self.assertTrue(metadata["reasons"])
+
+    def test_cargo_configuration_path_overrides_leave_dependency_scope_unknown(self):
+        from bb_workflow.verification_metadata import configuration
+
+        (self.repo / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n'
+        )
+        directory = self.repo / ".cargo"
+        directory.mkdir()
+        config_file = directory / "config.toml"
+        with tempfile.TemporaryDirectory() as cargo_home:
+            for origin, path, env in (
+                ("local", config_file, {}),
+                ("ancestor", config_file, {}),
+                ("cargo-home", Path(cargo_home) / "config.toml", {"CARGO_HOME": cargo_home}),
+            ):
+                root = self.repo
+                if origin == "ancestor":
+                    root = self.repo / "member"
+                    root.mkdir()
+                    (root / "Cargo.toml").write_text(
+                        '[package]\nname="member"\nversion="0.1.0"\n[workspace]\n'
+                    )
+                for text in (
+                    'paths=["../shared"]\n',
+                    '[patch.crates-io]\nfoo={path="../../shared"}\n',
+                ):
+                    with self.subTest(origin=origin, configuration=text):
+                        path.write_text(text)
+                        metadata = configuration(root, self.config, env)
+                        self.assertTrue(metadata["files"])
+                        self.assertIsNone(metadata["digest"])
+                        self.assertIn("uncaptured_cargo_path_reference", metadata["reasons"])
+                path.write_text("paths=[]\n[build]\njobs=1\n")
+                self.assertIsNotNone(configuration(root, self.config, env)["digest"])
+
+    def test_plain_cargo_test_probes_actual_rustdoc_and_changed_version_is_incomparable(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = str(Path(temporary) / "custom-rustdoc")
+            version = "1.90.0"
+            emit_warning = True
+            calls = []
+            self.config = replace(self.config, checks=[["cargo", "test", "--offline", "--locked"]])
+            self.plan = verification.plan_verification(self.config)
+
+            def process(argv, **kwargs):
+                calls.append(argv)
+                if argv[-1] == "--version":
+                    tool = "rustdoc" if argv[0] == executable else argv[0]
+                    return ProcessResult(
+                        0, f"{tool} {version if tool == 'rustdoc' else '1.90.0'}\n", "", 0
+                    )
+                return ProcessResult(
+                    0,
+                    "",
+                    "warning[doc_fixture]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+                    if emit_warning
+                    else "",
+                    0,
+                )
+
+            with patch.dict(os.environ, {"RUSTDOC": executable}):
+                baseline = self.execute(process_fn=process)
+                root = self.artifacts
+                version, emit_warning = "1.91.0", False
+                result = verification.execute_checks(
+                    self.plan.checks,
+                    cwd=self.repo,
+                    artifact_root=root,
+                    command_root=root / "candidate",
+                    config=self.config,
+                    timeout=lambda: 10,
+                    baseline_records=baseline,
+                    process_fn=process,
+                )[0]
+            self.assertIn([executable, "--version"], calls)
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+            self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+            baseline_report = json.loads((root / baseline[0]["diagnostics_file"]).read_text())
+            current_report = json.loads((root / result["diagnostics_file"]).read_text())
+            self.assertEqual(
+                baseline_report["context"]["tool_versions"]["rustdoc"], "rustdoc 1.90.0"
+            )
+            self.assertEqual(
+                current_report["context"]["tool_versions"]["rustdoc"], "rustdoc 1.91.0"
+            )
+
+    def test_malformed_numeric_output_preserves_standalone_execution_and_audit(self):
+        self.config = replace(self.config, checks=[["fixture-check"]])
+        text = "running " + "9" * 5000 + " tests\n"
+        directory, report = verification.verify_repository(
+            self.repo,
+            self.config,
+            "gate",
+            process_fn=lambda *args, **kwargs: ProcessResult(0, text, "", 0),
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(len(report["results"]), 1)
+        self.assertTrue(report["results"][0]["passed"])
+        saved = json.loads((directory / "report.json").read_text())
+        self.assertEqual(saved["status"], "passed")
+        diagnostics = json.loads((directory / saved["results"][0]["diagnostics_file"]).read_text())
+        self.assertTrue(diagnostics["uncertainty"])
+        self.assertTrue(diagnostics["execution"]["successful"])
+
+    def test_unresolvable_manifest_scope_is_unknown_and_preserves_command_audit(self):
+        from bb_workflow.verification_metadata import configuration
+
+        manifest_file = self.repo / "Cargo.toml"
+        manifest_file.write_text(
+            '[package]\nname="fixture"\nversion="0.1.0"\n[dependencies]\nfoo={path="\\u0000"}\n'
+        )
+        metadata = configuration(self.repo, self.config, {}, ("cargo", "check"))
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+        process, _ = self.cargo()
+        directory, report = verification.verify_repository(
+            self.repo, self.config, "gate", process_fn=process
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(len(report["results"]), 1)
+        self.assertTrue(report["results"][0]["passed"])
+        self.assertTrue((directory / report["results"][0]["diagnostics_file"]).is_file())
+        # Resolve failures for selected argv use the same conservative boundary.
+        manifest_file.write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+        metadata = configuration(
+            self.repo, self.config, {}, ("cargo", "check", "--manifest-path=\0")
+        )
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+
+    def test_nul_manifest_scope_is_unknown_when_path_resolution_accepts_invalid_paths(self):
+        from bb_workflow.verification_metadata import configuration
+
+        original_resolve = Path.resolve
+
+        def permissive_resolve(path, *args, **kwargs):
+            # Some Windows/Python versions retain NUL under strict=False.
+            if "\0" in str(path):
+                return path
+            return original_resolve(path, *args, **kwargs)
+
+        manifest_file = self.repo / "Cargo.toml"
+        package = '[package]\nname="fixture"\nversion="0.1.0"\n'
+        cases = (
+            (package + '[dependencies]\nfoo={path="\\u0000"}\n', ("cargo", "check")),
+            (package + 'build="\\u0000"\n', ("cargo", "check")),
+            (package + '[[bin]]\nname="fixture"\npath="\\u0000"\n', ("cargo", "check")),
+            (package, ("cargo", "check", "--manifest-path=\0")),
+            (package, ("cargo", "check", "--manifest-path", "\0")),
+        )
+        for text, argv in cases:
+            with self.subTest(argv=argv, manifest=text):
+                manifest_file.write_text(text)
+                with patch.object(Path, "resolve", permissive_resolve):
+                    metadata = configuration(self.repo, self.config, {}, argv)
+                self.assertIsNone(metadata["digest"])
+                self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+
+    def test_uncaptured_dependency_directory_with_rs_suffix_cannot_resolve(self):
+        from bb_workflow.verification_metadata import configuration
+
+        source = self.repo / "src/custom.rs"
+        source.parent.mkdir()
+        source.write_text("pub fn value() {}\n")
+        root_manifest = self.repo / "Cargo.toml"
+        local = (
+            '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n[lib]\npath="src/custom.rs"\n'
+        )
+        root_manifest.write_text(local + '[dependencies]\nfoo={path="target/foo.rs"}\n')
+        dependency = self.repo / "target/foo.rs/Cargo.toml"
+        dependency.parent.mkdir(parents=True)
+        dependency.write_text('[package]\nname="foo"\nversion="0.1.0"\n')
+        process, _ = self.cargo(
+            stderr="warning[unused]: warning\n --> src/custom.rs:1:1\n1 | code\n"
+        )
+        baseline = self.execute(process_fn=process)
+        root = self.artifacts
+        dependency.write_text('[package]\nname="foo"\nversion="0.2.0"\n')
+
+        def quiet(argv, **kwargs):
+            return (
+                process(argv, **kwargs) if argv[-1] == "--version" else ProcessResult(0, "", "", 0)
+            )
+
+        result = verification.execute_checks(
+            self.plan.checks,
+            cwd=self.repo,
+            artifact_root=root,
+            command_root=root / "candidate",
+            config=self.config,
+            timeout=lambda: 10,
+            baseline_records=baseline,
+            process_fn=quiet,
+        )[0]
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+        self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+        metadata = json.loads((root / result["metadata_file"]).read_text())
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("uncaptured_manifest_reference", metadata["reasons"])
+        # Captured source files can still identify legitimate source-target paths.
+        root_manifest.write_text(local)
+        self.assertIsNotNone(
+            configuration(self.repo, self.config, {}, ("cargo", "check"))["digest"]
+        )
