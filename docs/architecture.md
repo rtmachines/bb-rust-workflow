@@ -16,14 +16,16 @@ flowchart TD
     E -->|błąd| F{Limit Fixera?}
     E -->|sukces i dowód mechaniczny| H[Reviewer A: osobna kopia i proces]
     E -->|sukces i dowód mechaniczny| I[Reviewer B: osobna kopia i proces]
+    E -->|niespełnione kryterium mechaniczne| F
+    E -->|nierozstrzygnięty dowód mechaniczny| M
     E -->|zmiana źródeł| R[Wyniki unieważnione: failed]
     H --> J[Scalenie dokładnych duplikatów]
     I --> J
     J -->|ustalenia lub sporne kryteria| K[Triage na osobnej kopii]
     J -->|brak ustaleń i spełnione kryteria| L[Wynik succeeded]
     K -->|nierozstrzygnięte| M[Wynik blocked]
-    K -->|potwierdzone blokujące| F
-    K -->|bez blokujących| L
+    K -->|blokujące ustalenia lub niespełnione kryteria| F
+    K -->|bez blokujących ustaleń i spełnione kryteria| L
     F -->|limit wyczerpany| N[Wynik limit_exhausted]
     F -->|dostępny| O[Fixer]
     O --> Q
