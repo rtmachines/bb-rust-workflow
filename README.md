@@ -94,7 +94,7 @@ Program nie przełącza modelu ani backendu po błędzie. Identyfikatory i effor
 
 ### Oszczędzanie kontekstu Claude Code i Codex
 
-Domyślnie prompt zawiera krótkie wyniki udanych kontroli, końcówki błędów i ograniczony fragment diffu. Pełne logi pozostają w `checks/`; agent dostaje ścieżkę do nich. Schemat odpowiedzi jest przekazywany natywnie przez CLI, bez ponownego wklejania do promptu. Dwa niezależne przeglądy i obowiązkowe kontrole pozostają częścią każdego przebiegu. Triage uruchamia się przy ustaleniach recenzentów lub gdy obaj recenzenci nie potwierdzą spełnienia każdego kryterium semantycznego.
+Domyślnie prompt zawiera krótkie wyniki udanych kontroli, końcówki błędów i ograniczony fragment diffu. Pełne logi pozostają w `checks/`; agent dostaje ścieżkę do nich. Schemat odpowiedzi jest przekazywany natywnie przez CLI, bez ponownego wklejania do promptu. Dwa niezależne przeglądy i obowiązkowe kontrole pozostają częścią każdego przebiegu. Triage uruchamia się przy ustaleniach recenzentów lub gdy którekolwiek kryterium semantyczne nie uzyska potwierdzenia obu recenzentów.
 
 Nowe i starsze konfiguracje bez sekcji `[context]` korzystają z tych ustawień:
 

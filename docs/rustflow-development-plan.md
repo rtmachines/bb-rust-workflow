@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etapy 1–2 zaimplementowane i zweryfikowane; etap 4 zaimplementowany na osobnej gałęzi; etapy 3 i 5 niezależnie do realizacji
+Status: etapy 1–2 oraz etap 4 zaimplementowane i zweryfikowane; etap 4 na osobnej gałęzi; etapy 3 i 5 poza zakresem tej zmiany
 
 ## Cel i zachowane gwarancje
 
@@ -86,7 +86,7 @@ Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego fo
 
 ## 4. Jawne kryteria odbioru powiązane z dowodami
 
-**Status: implementacja etapu 4 gotowa; weryfikacja opisana poniżej. Etap 3 nie jest zależnością.**
+**Status: implementacja, weryfikacja i niezależne przeglądy etapu 4 zakończone 2026-10-25. Etap 3 nie jest zależnością.**
 
 
 Dodajemy plik wymagań przekazywany do `run`, np.:
@@ -140,13 +140,16 @@ Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` pozostaj�
 Przykład: [`task-requirements.toml`](../examples/task-requirements.toml); demo offline używa
 rzeczywistych kontroli Cargo i jawnie oznaczonych atrap ocen semantycznych.
 
-**Weryfikacja lokalna etapu 4 (2026-10-25):** pełny zestaw na Python 3.14 wykonał
-303 testy: 301 zaliczonych, 2 testy natywnych junctions Windows pominięte na Linux.
-24 testy integracji odbioru oraz 19 konfiguracji i 13 CLI przeszły także na Python 3.11.
+**Weryfikacja lokalna etapu 4 (2026-10-25):** końcowy pełny zestaw na Python 3.11 wykonał
+307 testów: 305 zaliczonych, 2 testy natywnych junctions Windows pominięte na Linux.
+Wcześniejszy pełny zestaw na Python 3.14 oraz celowane zestawy po poprawkach również przeszły.
 Sześć regresji Cargo używa rzeczywistych poleceń offline; nowa porównuje poprawne zakończenie
-z zerem dopasowanych przypadków (kryterium `unmet`) i dokładny zaliczony test (`satisfied`).
+z zerem dopasowanych przypadków (kryterium `unmet`), dokładny zaliczony test (`satisfied`),
+standardowy test `#[should_panic]` oraz niedopasowaną nazwę mimo zaliczenia innego testu.
 Demo z plikiem kryteriów przeszło pełny gate offline. Ruff przez lokalny reviewdog, formatowanie
-i kontrola diffu są poprawne. Niezależny przegląd etapu i całej gałęzi pozostaje do wykonania.
+i kontrola diffu są poprawne. Niezależne przeglądy obu części i całej gałęzi zakończono;
+wszystkie zgłoszone usterki poprawiono i zatwierdzono w ponownych przeglądach. Regresje obejmują
+różne sposoby wywołania Cargo oraz odrzucenie zmiany kandydata podczas triage przed Fixerem.
 Nie uruchamiano płatnych sesji dostawców.
 
 ## 5. Raportowanie, integracja z apply i odbiór całości
