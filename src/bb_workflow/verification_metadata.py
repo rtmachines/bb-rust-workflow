@@ -314,8 +314,12 @@ class MetadataCapture:
                         )
                     except BaseException as exc:
                         error = exc
-                    (probe_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8")
-                    (probe_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+                    (probe_dir / "stdout.txt").write_text(
+                        result.stdout, encoding="utf-8", newline=""
+                    )
+                    (probe_dir / "stderr.txt").write_text(
+                        result.stderr, encoding="utf-8", newline=""
+                    )
                     evidence = {
                         "command": command,
                         "returncode": result.returncode,

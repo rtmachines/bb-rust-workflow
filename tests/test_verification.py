@@ -467,6 +467,39 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
             (self.artifacts / metadata["probes"][0]["artifacts"] / "stdout.txt").is_file()
         )
 
+    def test_metadata_probe_audit_preserves_newlines_with_windows_text_translation(self):
+        process, _ = self.cargo()
+        original_write_text = Path.write_text
+
+        def windows_write_text(path, data, encoding=None, errors=None, newline=None):
+            # Keep real file writes; emulate only Windows' default newline translation.
+            return original_write_text(
+                path,
+                data,
+                encoding=encoding,
+                errors=errors,
+                newline="\r\n" if newline is None else newline,
+            )
+
+        def probe(argv, **kwargs):
+            if argv[-1] == "--version":
+                return ProcessResult(0, f"{argv[0]} 1.90.0\r\n", "first\r\nsecond\nprogress\r", 0)
+            return process(argv, **kwargs)
+
+        with patch.object(Path, "write_text", windows_write_text):
+            record = self.execute(process_fn=probe)[0]
+        metadata = json.loads((self.artifacts / record["metadata_file"]).read_text())
+        self.assertEqual(len(metadata["probes"]), 2)
+        for evidence, expected in zip(
+            metadata["probes"], (b"cargo 1.90.0\r\n", b"rustc 1.90.0\r\n"), strict=True
+        ):
+            with self.subTest(command=evidence["command"]):
+                directory = self.artifacts / evidence["artifacts"]
+                self.assertEqual((directory / "stdout.txt").read_bytes(), expected)
+                self.assertEqual(
+                    (directory / "stderr.txt").read_bytes(), b"first\r\nsecond\nprogress\r"
+                )
+
     def test_fatal_output_retains_diagnostics_before_propagation(self):
         process, _ = self.cargo(
             stderr="error[E0001]: broken\n --> src/lib.rs:1:1\n1 | broken\n",
