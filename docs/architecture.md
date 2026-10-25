@@ -172,6 +172,7 @@ końcowego zatwierdzenia. Sukces poświadcza skonfigurowany zakres, nie kompletn
 | `diagnostics.py` | Czyste parsowanie pełnych strumieni, zachowawcze porównanie diagnostyki i skróty dowodów; bez uprawnień do zmiany wyniku wykonania. |
 | `backends.py` | Jedna świeża sesja CLI dla roli, jawny model i format strukturalny, zapis surowego wyjścia, sprawdzenie zakończenia i zgłoszonego modelu. |
 | `usage.py` | Normalizacja liczników Claude/Codex, cache bez podwójnego liczenia, sumy zmierzonych tokenów i jawne braki danych. |
+| `lifecycle.py` | Doradcza telemetria bieżącej operacji i heartbeat, walidacja widoku postępu oraz ograniczona do CLI obsługa SIGTERM. |
 | `process.py` | Uruchomienie argv bez powłoki, przechwycenie stdout/stderr, timeout i próba zatrzymania drzewa procesów na Linux/macOS/Windows. |
 | `_windows_job.py` | Nadzorca Windows: przed uruchomieniem polecenia dołącza do Job Object z kończeniem członków przy zamknięciu; przekazuje kod zakończenia i błędy przez prywatny plik wyniku. |
 | `requirements.py` | Ścisły niezmienny kontrakt wymagań, hashe pełnego planu i ocena mechanicznego dowodu z audytowanych kontroli i pełnych logów. |
@@ -216,6 +217,40 @@ Kontekst agentów jest osobnym, skróconym widokiem dowodów: udane kontrole bez
 `agents[].prompt_chars` i `prompt_bytes` opisują wysłany tekst, `usage` zachowuje dane dostawcy, a `token_usage` daje liczby znormalizowane. Dla Claude wejście obejmuje sumę niebuforowanego wejścia, odczytu cache i zapisu cache; dla Codex `input_tokens` już zawiera cache. `token_usage.by_backend` pokazuje zmierzone sumy wraz z `missing_calls` dla każdego licznika. Nieznanych wywołań nie uznaje się za darmowe. `status --summary` pomija szczegółowe dowody, pozostawiając postęp, pomiary i odsyłacz do raportu.
 
 Poprawne pomiary zawarte w nieudanej odpowiedzi dostawcy są zachowywane w `invocation.json` i rekordzie agenta. Koszty są podsumowywane na podstawie rekordów przy każdym zapisie stanu; wywołanie przerwane lub zakończone wyjątkiem bez kwoty pozostaje nieznane. Odzyskane pomiary opisują raportowaną część użycia i nie gwarantują pełnego rozliczenia sesji zakończonej błędem.
+
+## Obserwacja i kontrolowane przerwanie przebiegu
+
+Po pierwszym trwałym zapisie stanu `run` ogłasza katalog przebiegu na stderr, przed
+kopiowaniem projektu i kosztownymi wywołaniami. Domyślnie kolejne fazy nadal są tekstem,
+a końcowy wynik JSON pozostaje na stdout. Opcjonalne `run --events-jsonl` zastępuje tekst
+na stderr zdarzeniami JSONL: `version = 1`, `run_dir`, `event` (`start`, `phase`, `finish`)
+i `phase`. Zdarzenia faz zawierają `active_operation`, a końcowe także `status`.
+
+`lifecycle.py` prowadzi niezależny, atomowo zastępowany `progress.json`: `version = 1`,
+`run_dir`, `pid`, `phase`, `active_operation`, `updated_at`, `elapsed_seconds` oraz
+`heartbeat_interval_seconds = 5`. Bieżąca operacja wskazuje `role` albo `check_id`,
+`variant` i `command`, również podczas zbierania metadanych kontroli. Wątek heartbeat ma
+własne metadane kopiowane przy zmianie; nie odczytuje ani nie modyfikuje stanu odbioru,
+kosztów i liczników tokenów. Jest zatrzymywany przed zapisem końcowego raportu, z ograniczonym
+czasem oczekiwania. Błąd zapisu telemetrycznego jest ujawniany jako nieudany przebieg,
+zamiast pozostawić status sukcesu. Pełne dowody nadal należą do `state.json` i artefaktów.
+
+`status --summary` dodaje zagnieżdżone `progress` tylko dla stanu `running` i poprawnego
+pliku należącego do tego samego katalogu. Uszkodzona telemetria jest pomijana. Końcowy
+stan pozostaje nadrzędny i ignoruje nawet pozostawiony plik postępu; pełne `status`
+zwraca zapisany stan bez dodatków. Aktualny heartbeat oznacza aktywność nadzorcy, nie
+postęp dostawcy, zakończenie kontroli ani zużycie tokenów. Nieaktualny heartbeat sam nie
+dowodzi śmierci procesu i nie upoważnia do usuwania blokady.
+
+CLI na POSIX instaluje obsługę SIGTERM tylko w głównym wątku, na czas wykonania polecenia.
+Pierwszy sygnał przechodzi przez istniejącą ścieżkę `KeyboardInterrupt`; następne SIGTERM
+są ignorowane podczas sprzątania. Poprzednia obsługa sygnału jest przywracana po zakończeniu.
+Kod wyjścia przerwania wynosi 130, także przed rozpoczęciem lub po powrocie `Workflow`.
+Zatrzymywanie dzieci, zachowanie logów, zapis przerwanego raportu i zwolnienie blokady
+pozostają zadaniem istniejących warstw wykonawczych. Przerwanie `apply` korzysta z jego
+dotychczasowej próby rollbacku i zapisu `apply.json`, bez rozszerzania gwarancji atomowości.
+Windows zachowuje obsługę Ctrl+C. SIGKILL i awaria procesu nie zapewniają łagodnego
+sprzątania; nie ma automatycznego wznowienia ani usuwania blokad.
 
 ## Granice bezpieczeństwa i zastosowanie zmian
 

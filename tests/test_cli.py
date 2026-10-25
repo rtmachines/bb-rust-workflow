@@ -2,8 +2,11 @@ import contextlib
 import io
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -217,6 +220,131 @@ class CliTests(unittest.TestCase):
                         self.assertEqual(summary["token_usage"], state["token_usage"])
                     else:
                         self.assertNotIn("token_usage", summary)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX termination")
+    def test_sigterm_long_run_preserves_logs_terminates_child_and_releases_lock(self):
+        for events in (False, True):
+            with self.subTest(events=events), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                repo = root / "repo"
+                repo.mkdir()
+                (repo / "source.txt").write_text("original")
+                marker = root / "child.json"
+                script = (
+                    "import json,os,time; from pathlib import Path; "
+                    "print('fixture output', flush=True); "
+                    f"Path({str(marker)!r}).write_text(json.dumps(os.getpid())); "
+                    "time.sleep(60)"
+                )
+                config = default_text().replace("config_version = 3", "config_version = 2")
+                start = config.index("checks = ")
+                end = config.index("\nexclude = ", start)
+                config = (
+                    config[:start]
+                    + "checks = "
+                    + json.dumps([[sys.executable, "-c", script]])
+                    + config[end:]
+                )
+                (repo / "workflow.toml").write_text(config)
+                argv = [sys.executable, "-m", "bb_workflow.cli", "run", "task", "--repo", str(repo)]
+                if events:
+                    argv.append("--events-jsonl")
+                with subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env={
+                        **os.environ,
+                        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                    },
+                ) as child:
+                    try:
+                        announcement = child.stderr.readline()
+                        if events:
+                            announcement_event = json.loads(announcement)
+                            self.assertEqual(announcement_event["event"], "start")
+                            directory = Path(announcement_event["run_dir"])
+                        else:
+                            self.assertTrue(announcement.startswith("Run directory: "))
+                            directory = Path(announcement.removeprefix("Run directory: ").strip())
+                        self.assertEqual(
+                            json.loads((directory / "state.json").read_text())["status"], "running"
+                        )
+                        deadline = time.monotonic() + 5
+                        while not marker.exists() and time.monotonic() < deadline:
+                            time.sleep(0.01)
+                        self.assertTrue(marker.exists())
+                        child_pid = json.loads(marker.read_text())
+                        active = json.loads((directory / "progress.json").read_text())
+                        self.assertEqual(
+                            active["active_operation"]["command"], [sys.executable, "-c", script]
+                        )
+                        child.send_signal(signal.SIGTERM)
+                        stdout, stderr = child.communicate(timeout=10)
+                    finally:
+                        if child.poll() is None:
+                            child.kill()
+                            child.communicate()
+                self.assertEqual(child.returncode, 130, stderr)
+                self.assertEqual(json.loads(stdout)["status"], "interrupted")
+                state = json.loads((directory / "state.json").read_text())
+                self.assertEqual(state["status"], "interrupted")
+                self.assertTrue(state["checks"][-1]["interrupted"])
+                self.assertIn(
+                    "fixture output", (directory / "checks/baseline/0/stdout.txt").read_text()
+                )
+                self.assertIn("interrupted", (directory / "report.md").read_text())
+                self.assertFalse((repo / ".bb-workflow/lock").exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(child_pid, 0)
+                if events:
+                    emitted = [
+                        announcement_event,
+                        *(json.loads(line) for line in stderr.splitlines()),
+                    ]
+                    self.assertEqual(emitted[-1]["event"], "finish")
+                    self.assertTrue(
+                        all(item["version"] == 1 and "phase" in item for item in emitted)
+                    )
+
+    def test_status_summary_uses_valid_live_progress_only_while_running(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            progress = {
+                "version": 1,
+                "run_dir": str(directory),
+                "pid": 123,
+                "phase": "implementation",
+                "active_operation": {"role": "implementation"},
+                "updated_at": "2026-10-25T10:00:00+00:00",
+                "elapsed_seconds": 5.0,
+                "heartbeat_interval_seconds": 5.0,
+            }
+            for status, telemetry, expected in (
+                ("running", json.dumps(progress), progress),
+                ("succeeded", json.dumps(progress), None),
+                ("running", "broken JSON", None),
+                ("running", "[]", None),
+                ("running", json.dumps({**progress, "run_dir": "/different/run"}), None),
+                ("running", json.dumps({**progress, "elapsed_seconds": 10**400}), None),
+                ("running", json.dumps({**progress, "heartbeat_interval_seconds": 0}), None),
+            ):
+                (directory / "state.json").write_text(json.dumps({"status": status}))
+                (directory / "progress.json").write_text(telemetry)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(main(["status", str(directory), "--summary"]), 0)
+                self.assertEqual(json.loads(output.getvalue()).get("progress"), expected)
+
+    def test_outer_interrupt_returns_130_and_restores_sigterm_handler(self):
+        import signal
+
+        previous = signal.getsignal(signal.SIGTERM)
+        with patch("bb_workflow.cli._config", side_effect=KeyboardInterrupt()):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["run", "task"]), 130)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_doctor_uses_target_directory_and_only_selected_backends(self):
         config = load_config()

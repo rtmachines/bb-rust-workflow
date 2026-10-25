@@ -6,6 +6,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -139,6 +141,104 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         self.assertEqual((self.repo / "src/lib.rs").read_text(), self.original)
         return flow, state
+
+    def test_live_run_announces_directory_and_exposes_active_check_and_role(self):
+        # Missing early events or operation updates hides the running work from operators.
+        entered = threading.Event()
+        release = threading.Event()
+        lifecycle_events = []
+        flow = self.workflow(event=lifecycle_events.append)
+        original_process = flow.process
+        original_invoke = flow.invoke
+        observed = []
+
+        def block():
+            entered.set()
+            self.assertTrue(release.wait(5))
+            release.clear()
+            entered.clear()
+
+        def process(argv, **kwargs):
+            if not observed:
+                observed.append("check")
+                block()
+            return original_process(argv, **kwargs)
+
+        def invoke(**kwargs):
+            if kwargs["role"] == "implementation":
+                block()
+            return original_invoke(**kwargs)
+
+        flow.process = process
+        flow.invoke = invoke
+        thread = threading.Thread(target=flow.run)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(lifecycle_events[0]["event"], "start")
+            self.assertEqual(lifecycle_events[0]["run_dir"], str(flow.run_dir))
+            progress = json.loads((flow.run_dir / "progress.json").read_text())
+            self.assertEqual(
+                progress["active_operation"],
+                {"check_id": "0", "variant": "default", "command": ["fixture-check", "--strict"]},
+            )
+            release.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                progress = json.loads((flow.run_dir / "progress.json").read_text())
+                if progress["active_operation"] == {"role": "implementation"}:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(progress["active_operation"], {"role": "implementation"})
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(flow.state["status"], "succeeded")
+        self.assertEqual(lifecycle_events[-1]["event"], "finish")
+
+    def test_heartbeat_failure_at_completion_cannot_publish_success(self):
+        # Ignoring tracker shutdown errors would publish succeeded after telemetry failed.
+        from bb_workflow.lifecycle import ProgressTracker
+        from bb_workflow.workspace import write_json
+
+        flow = self.workflow()
+        execute = flow._execute
+        failed = threading.Event()
+        armed = threading.Event()
+
+        def sidecar(path, value):
+            if armed.is_set() and threading.current_thread().name == "bb-progress":
+                failed.set()
+                raise OSError("heartbeat disk full")
+            write_json(path, value)
+
+        def complete_then_fail_heartbeat():
+            execute()
+            armed.set()
+            self.assertTrue(failed.wait(2))
+
+        flow._execute = complete_then_fail_heartbeat
+        with (
+            patch(
+                "bb_workflow.engine.ProgressTracker",
+                side_effect=lambda directory: ProgressTracker(directory, heartbeat_interval=0.01),
+            ),
+            patch("bb_workflow.lifecycle.write_json", side_effect=sidecar),
+        ):
+            flow.run()
+        state = json.loads((flow.run_dir / "state.json").read_text())
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("heartbeat disk full", state["reason"])
+        self.assertIn("failed", (flow.run_dir / "report.md").read_text())
+        self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+
+    def test_sidecar_failure_never_leaves_successful_state(self):
+        with patch("bb_workflow.lifecycle.write_json", side_effect=OSError("disk full")):
+            flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "failed")
+        self.assertIn("Progress persistence failed", state["reason"])
+        self.assertFalse(self.calls)
 
     def test_new_legacy_run_requires_final_artifact_and_rejects_metadata_downgrades(self):
         flow, state = self.run_workflow()

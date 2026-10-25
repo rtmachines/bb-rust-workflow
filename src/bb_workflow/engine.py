@@ -15,6 +15,7 @@ from .acceptance import REPORT_CONTRACT, build_acceptance, canonical_digest, val
 from .backends import BackendError, BackendInterrupted, invoke
 from .config import Config, Selection, route
 from .diagnostics import summarize_diagnostics
+from .lifecycle import ProgressTracker
 from .process import run_process
 from .protocol import merge_findings, resolve_triage, response_schema, validate_response
 from .reporting import render_report
@@ -61,6 +62,7 @@ class Workflow:
         invoke_fn: Callable = invoke,
         process_fn: Callable = run_process,
         progress: Callable[[str], None] = print,
+        event: Callable[[dict], None] | None = None,
     ):
         self.repo = repo.resolve()
         self.task = task
@@ -73,6 +75,8 @@ class Workflow:
         self.invoke = invoke_fn
         self.process = process_fn
         self.progress = progress
+        self.event = event
+        self._tracker: ProgressTracker | None = None
         self.started = time.monotonic()
         self.run_dir = self.repo / ".bb-workflow" / "runs" / uuid.uuid4().hex
         self.work = self.run_dir / "workspace"
@@ -114,6 +118,7 @@ class Workflow:
         if phase:
             self.state["phase"] = phase
             self.progress(phase)
+            self._activity()
         self.state["elapsed_seconds"] = round(time.monotonic() - self.started, 3)
         self.state["known_cost_usd"] = sum(
             (item["cost_usd"] for item in self.state["agents"] if item.get("cost_usd") is not None),
@@ -124,6 +129,28 @@ class Workflow:
         )
         self.state["token_usage"] = summarize_usage(self.state["agents"])
         write_json(self.run_dir / "state.json", self.state)
+
+    def _emit(self, event: str, **metadata) -> None:
+        if self.event is not None:
+            self.event(
+                {
+                    "version": 1,
+                    "run_dir": str(self.run_dir),
+                    "event": event,
+                    "phase": self.state["phase"],
+                    **metadata,
+                }
+            )
+
+    def _activity(self, operation: dict | None = None) -> None:
+        if self._tracker is not None:
+            self._tracker.update(self.state["phase"], operation)
+        self._emit("phase", active_operation=operation)
+
+    def _check_started(self, check: PlannedCheck) -> None:
+        self._activity(
+            {"check_id": check.id, "variant": check.variant, "command": list(check.argv)}
+        )
 
     def _timeout(self) -> float:
         remaining = self.config.max_seconds - (time.monotonic() - self.started)
@@ -138,7 +165,11 @@ class Workflow:
             self.run_dir.mkdir(parents=True)
             self._save()
             try:
-                self._execute()
+                self.progress(f"Run directory: {self.run_dir}")
+                self._emit("start")
+                with ProgressTracker(self.run_dir) as tracker:
+                    self._tracker = tracker
+                    self._execute()
             except WorkflowStop as exc:
                 self.state.update(status=exc.status, reason=str(exc))
             except KeyboardInterrupt:
@@ -146,6 +177,7 @@ class Workflow:
             except Exception as exc:
                 self.state.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
             finally:
+                self._tracker = None
                 for record in self.state["agents"]:
                     if record["status"] in {"running", "returned"}:
                         record.update(status=self.state["status"], error=self.state["reason"])
@@ -163,6 +195,7 @@ class Workflow:
                         reason=f"Report persistence failed: {type(exc).__name__}: {exc}",
                     )
                 self._save("finished")
+                self._emit("finish", status=self.state["status"])
         return self.run_dir
 
     def _execute(self) -> None:
@@ -458,6 +491,7 @@ class Workflow:
                 config=self.config,
                 timeout=self._timeout,
                 record=record,
+                on_start=self._check_started,
                 expected=expected,
                 preparing=preparing,
                 process_fn=self.process,
@@ -541,6 +575,7 @@ class Workflow:
                 record["binding"] = dict(binding)
             self.state["agents"].append(record)
             self._save(role)
+            self._activity({"role": role})
             try:
                 result = self.invoke(
                     selection=selection,

@@ -179,6 +179,7 @@ def execute_checks(
     process_fn: Callable = run_process,
     baseline_records: list[dict] | None = None,
     scope: dict | None = None,
+    on_start: Callable[[PlannedCheck], None] | None = None,
 ) -> list[dict]:
     """Execute a precomputed plan, retaining full logs and one frozen source manifest.
 
@@ -214,6 +215,8 @@ def execute_checks(
         command_started = False
         metadata = {"tool_versions": {}, "digest": None}
         environment = snapshot_environment()
+        if on_start is not None:
+            on_start(check)
         try:
             if not preparing:
                 metadata = capture.capture(check.argv, environment, directory)

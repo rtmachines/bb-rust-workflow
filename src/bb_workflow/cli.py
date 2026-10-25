@@ -19,6 +19,7 @@ from .config import (
     route,
 )
 from .engine import Workflow
+from .lifecycle import read_progress, termination_as_interrupt
 from .process import run_process
 from .requirements import (
     RequirementsError,
@@ -42,6 +43,10 @@ def _parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name)
         command.add_argument("--repo", type=Path, default=Path.cwd())
         command.add_argument("--config", type=Path)
+        if name == "run":
+            command.add_argument(
+                "--events-jsonl", action="store_true", help="Emit lifecycle JSONL on stderr"
+            )
         if name != "doctor":
             command.add_argument(
                 "--requirements", type=Path, help="Versioned acceptance criteria TOML"
@@ -155,6 +160,15 @@ def _doctor(config, repo: Path) -> tuple[dict, bool]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    with termination_as_interrupt():
+        try:
+            return _main(argv)
+        except KeyboardInterrupt:
+            print("Interrupted by user", file=sys.stderr)
+            return 130
+
+
+def _main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "init":
@@ -188,6 +202,10 @@ def main(argv: list[str] | None = None) -> int:
                     }
                 state["run_dir"] = str(args.run_dir.resolve())
                 state["report"] = str(args.run_dir.resolve() / "report.md")
+                if state.get("status") == "running":
+                    progress = read_progress(args.run_dir)
+                    if progress is not None:
+                        state["progress"] = progress
             print(json.dumps(state, indent=2, ensure_ascii=False))
             return 0
         if args.command == "apply":
@@ -277,7 +295,16 @@ def main(argv: list[str] | None = None) -> int:
             config,
             args.complexity,
             requirements=requirements,
-            progress=lambda text: print(text, file=sys.stderr, flush=True),
+            progress=(lambda text: None)
+            if args.events_jsonl
+            else (lambda text: print(text, file=sys.stderr, flush=True)),
+            event=(
+                lambda event: print(
+                    json.dumps(event, ensure_ascii=False), file=sys.stderr, flush=True
+                )
+            )
+            if args.events_jsonl
+            else None,
         )
         run_dir = workflow.run()
         print(

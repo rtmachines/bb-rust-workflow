@@ -1,8 +1,11 @@
 """Filesystem integration tests: capture, conflict guards, and recovery."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
+import signal
 import stat
 import tempfile
 import unittest
@@ -609,6 +612,35 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual((self.repo / "old.txt").read_text(), "user recreated file")
         self.assertEqual((self.repo / "dirty.txt").read_text(), "user's existing uncommitted edit")
         self.assertFalse((self.repo / "new").exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX termination")
+    def test_cli_sigterm_apply_uses_existing_rollback_and_ignores_repeat(self):
+        from bb_workflow.cli import main
+
+        self.make_run()
+        (self.workspace / "dirty.txt").write_text("model dirty")
+        self.save_candidate()
+        before = manifest(self.repo)
+        original = os.replace
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def interrupt_replace(source, target):
+            if Path(target) == self.repo / "new" / "file.txt":
+                try:
+                    signal.raise_signal(signal.SIGTERM)
+                finally:
+                    signal.raise_signal(signal.SIGTERM)
+            return original(source, target)
+
+        with patch("bb_workflow.workspace.os.replace", side_effect=interrupt_replace):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["apply", str(self.run)]), 130)
+        self.assertEqual(manifest(self.repo), before)
+        self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
+        report = json.loads((self.run / "apply.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertIsNone(report["rollback_error"])
 
     def test_interrupt_rolls_back_preceding_successful_replacement(self):
         self.make_run()
