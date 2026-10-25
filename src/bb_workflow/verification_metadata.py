@@ -54,7 +54,9 @@ def _tools(argv: tuple[str, ...], env: dict[str, str]) -> list[tuple[str, list[s
     return tools
 
 
-def _manifest_scope(cwd: Path, manifests: dict[Path, dict], argv: tuple[str, ...]) -> list[str]:
+def _manifest_scope(
+    cwd: Path, manifests: dict[Path, dict], argv: tuple[str, ...], captured_files: set[str]
+) -> list[str]:
     """Detect uncaptured Cargo scope without resolving external projects or glob trees."""
     root = cwd.resolve()
     reasons = []
@@ -79,7 +81,7 @@ def _manifest_scope(cwd: Path, manifests: dict[Path, dict], argv: tuple[str, ...
             elif any(character in reference for character in "*?["):
                 reasons.append("unresolved_manifest_glob")
             elif (
-                workspace_member or candidate.suffix != ".rs"
+                workspace_member or candidate.relative_to(root).as_posix() not in captured_files
             ) and candidate / "Cargo.toml" not in manifests:
                 reasons.append("uncaptured_manifest_reference")
 
@@ -131,9 +133,10 @@ def configuration(
         "clippy.toml",
         ".clippy.toml",
     }
+    captured_files = manifest(cwd, config.exclude)
     paths = {
         cwd / name: name
-        for name in manifest(cwd, config.exclude)
+        for name in captured_files
         if Path(name).name in names or name.endswith((".cargo/config", ".cargo/config.toml"))
     }
     for level, parent in enumerate((cwd, *cwd.parents)):
@@ -198,7 +201,7 @@ def configuration(
             reasons.append(f"configuration_unreadable:{label}:{type(exc).__name__}")
     if not argv or Path(argv[0]).name == "cargo":
         try:
-            reasons.extend(_manifest_scope(cwd, manifests, argv))
+            reasons.extend(_manifest_scope(cwd, manifests, argv, set(captured_files)))
         except (OSError, ValueError, RuntimeError):
             reasons.append("unresolved_manifest_scope")
     root_pattern = re.compile(r"(?<![\w./-])" + re.escape(str(cwd)) + r"(?=/|[\s\"'`:;,=]|$)")

@@ -914,3 +914,51 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
         )
         self.assertIsNone(metadata["digest"])
         self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+
+    def test_uncaptured_dependency_directory_with_rs_suffix_cannot_resolve(self):
+        from bb_workflow.verification_metadata import configuration
+
+        source = self.repo / "src/custom.rs"
+        source.parent.mkdir()
+        source.write_text("pub fn value() {}\n")
+        root_manifest = self.repo / "Cargo.toml"
+        local = (
+            '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n[lib]\npath="src/custom.rs"\n'
+        )
+        root_manifest.write_text(local + '[dependencies]\nfoo={path="target/foo.rs"}\n')
+        dependency = self.repo / "target/foo.rs/Cargo.toml"
+        dependency.parent.mkdir(parents=True)
+        dependency.write_text('[package]\nname="foo"\nversion="0.1.0"\n')
+        process, _ = self.cargo(
+            stderr="warning[unused]: warning\n --> src/custom.rs:1:1\n1 | code\n"
+        )
+        baseline = self.execute(process_fn=process)
+        root = self.artifacts
+        dependency.write_text('[package]\nname="foo"\nversion="0.2.0"\n')
+
+        def quiet(argv, **kwargs):
+            return (
+                process(argv, **kwargs) if argv[-1] == "--version" else ProcessResult(0, "", "", 0)
+            )
+
+        result = verification.execute_checks(
+            self.plan.checks,
+            cwd=self.repo,
+            artifact_root=root,
+            command_root=root / "candidate",
+            config=self.config,
+            timeout=lambda: 10,
+            baseline_records=baseline,
+            process_fn=quiet,
+        )[0]
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+        self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+        metadata = json.loads((root / result["metadata_file"]).read_text())
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("uncaptured_manifest_reference", metadata["reasons"])
+        # Captured source files can still identify legitimate source-target paths.
+        root_manifest.write_text(local)
+        self.assertIsNotNone(
+            configuration(self.repo, self.config, {}, ("cargo", "check"))["digest"]
+        )
