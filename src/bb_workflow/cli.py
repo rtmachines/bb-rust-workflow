@@ -8,6 +8,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from . import __version__
 from .backends import BackendError, probe
 from .cli_output import CommandResult, emit_result, known_artifacts
 from .config import (
@@ -34,10 +35,26 @@ from .workspace import WorkspaceError, apply_run, snapshot_environment
 
 
 class _ParserResponse(Exception):
-    def __init__(self, message: str, command: str | None, *, help_requested: bool = False):
+    def __init__(
+        self,
+        message: str,
+        command: str | None,
+        *,
+        help_requested: bool = False,
+        version_requested: bool = False,
+    ):
         super().__init__(message)
         self.command = command
         self.help_requested = help_requested
+        self.version_requested = version_requested
+
+
+class _VersionAction(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        if parser.machine:
+            raise _ParserResponse(__version__, None, version_requested=True)
+        print(f"{parser.prog} {__version__}")
+        parser.exit()
 
 
 class _CommandParser(argparse.ArgumentParser):
@@ -92,44 +109,94 @@ def _read_state(directory: Path) -> dict:
 
 def _parser(machine: bool = False) -> argparse.ArgumentParser:
     parser = _CommandParser(
-        machine=machine, prog="bb-workflow", description="Bounded Rust agent workflow"
+        machine=machine,
+        prog="bb-workflow",
+        description="Bounded Rust agent workflow with independent reviews and explicit apply.",
     )
-    parser.add_argument("--json", action="store_true", help="Emit a versioned command envelope")
+    parser.add_argument(
+        "--version", action=_VersionAction, nargs=0, help="Show package version and exit"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Emit one versioned command envelope on stdout"
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser(
         "init", help="Write a configuration template without overwriting files"
     )
-    init.add_argument("--config", type=Path, default=Path("workflow.toml"))
+    init.add_argument(
+        "--config",
+        type=Path,
+        default=Path("workflow.toml"),
+        help="New file path relative to caller (default: workflow.toml); refuses overwrite",
+    )
+    descriptions = {
+        "plan": "Inspect routing, limits and bound acceptance checks without running providers",
+        "run": "Run providers and checks in snapshots; save artifacts without applying changes",
+        "doctor": "Probe CLI flags and executable versions; no model session or authentication check",
+    }
     for name in ("plan", "run", "doctor"):
-        command = commands.add_parser(name)
-        command.add_argument("--repo", type=Path, default=Path.cwd())
-        command.add_argument("--config", type=Path)
+        command = commands.add_parser(name, help=descriptions[name], description=descriptions[name])
+        command.add_argument(
+            "--repo",
+            type=Path,
+            default=Path.cwd(),
+            help="Target project (default: caller directory)",
+        )
+        command.add_argument(
+            "--config",
+            type=Path,
+            help="TOML path relative to caller (default: <repo>/workflow.toml, then built-in defaults)",
+        )
         if name == "run":
             command.add_argument(
-                "--events-jsonl", action="store_true", help="Emit lifecycle JSONL on stderr"
+                "--events-jsonl",
+                action="store_true",
+                help="Emit lifecycle JSONL on stderr instead of text progress (default: off)",
             )
         if name != "doctor":
             command.add_argument(
-                "--requirements", type=Path, help="Versioned acceptance criteria TOML"
+                "--requirements",
+                type=Path,
+                help="Criteria TOML path relative to caller; required by run with config v3",
             )
             command.add_argument("task", help="Task text (quote spaces in your shell)")
             command.add_argument(
-                "--complexity", choices=("auto", "low", "medium", "high"), default="auto"
+                "--complexity",
+                choices=("auto", "low", "medium", "high"),
+                default="auto",
+                help="Routing profile (default: auto keyword heuristic); choose explicitly when needed",
             )
-    verify = commands.add_parser("verify", help="Run checks in the project without providers")
-    verify.add_argument("profile", choices=("fast", "focused", "lint", "gate"))
-    verify.add_argument("--repo", type=Path, default=Path.cwd())
-    verify.add_argument("--config", type=Path)
-    verify.add_argument("--package")
-    verify.add_argument("--test-filter")
+    verify_description = (
+        "Run checks directly in the project without providers; never authorizes apply"
+    )
+    verify = commands.add_parser("verify", help=verify_description, description=verify_description)
+    verify.add_argument(
+        "profile",
+        choices=("fast", "focused", "lint", "gate"),
+        help="Configured verification profile",
+    )
+    verify.add_argument(
+        "--repo", type=Path, default=Path.cwd(), help="Target project (default: caller directory)"
+    )
+    verify.add_argument(
+        "--config",
+        type=Path,
+        help="TOML path relative to caller (default: <repo>/workflow.toml, then built-in defaults)",
+    )
+    verify.add_argument("--package", help="Optional package scope; forbidden for the full gate")
+    verify.add_argument("--test-filter", help="Optional test scope; forbidden for the full gate")
+    descriptions = {
+        "status": "Read saved state; a successful read does not mean the workflow succeeded",
+        "apply": "Explicitly apply a succeeded run after acceptance and source/candidate conflict checks",
+    }
     for name in ("status", "apply"):
-        command = commands.add_parser(name)
-        command.add_argument("run_dir", type=Path)
+        command = commands.add_parser(name, help=descriptions[name], description=descriptions[name])
+        command.add_argument("run_dir", type=Path, help="Saved run directory, relative to caller")
         if name == "status":
             command.add_argument(
                 "--summary",
                 action="store_true",
-                help="Show progress and usage without raw evidence",
+                help="Show compact status, usage and advisory live progress (default: full saved state)",
             )
     for name, command in commands.choices.items():
         command.root = parser
@@ -410,6 +477,8 @@ def _main(argv: list[str] | None = None) -> int:
         result = (
             CommandResult({"help": str(response)})
             if response.help_requested
+            else CommandResult({"version": str(response)})
+            if response.version_requested
             else CommandResult(exit_code=2, code="invalid_arguments", message=str(response))
         )
     except KeyboardInterrupt:

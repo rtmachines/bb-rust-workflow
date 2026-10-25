@@ -58,6 +58,9 @@ artifacts. Standalone `verify` never authorizes apply, even when it passes.
 
 Root and subcommand `--help` return a successful envelope with
 `data: {"help": "..."}`. A root help request has `command: null`.
+`bb-workflow --json --version` also returns a successful root envelope with
+`command: null` and `data: {"version": "<package version>"}`. Without `--json`,
+`--version` prints `bb-workflow <package version>` and exits zero.
 Argument errors return `invalid_arguments` and exit 2; command selection comes
 from the parser, never from task text or option values. Status reads accept sparse
 legacy state objects. Malformed JSON, non-object states, invalid optional

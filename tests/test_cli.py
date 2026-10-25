@@ -1,3 +1,4 @@
+import argparse
 import contextlib
 import io
 import json
@@ -8,16 +9,213 @@ import sys
 import tempfile
 import time
 import unittest
+from importlib.resources import files
 from pathlib import Path
 from unittest.mock import patch
 
-from bb_workflow.cli import _doctor, main
+from bb_workflow import __version__
+from bb_workflow.backends import BackendResult
+from bb_workflow.cli import _doctor, _parser, main
 from bb_workflow.config import LEGACY_CHECKS, Selection, default_text, load_config
+from bb_workflow.engine import Workflow
 from bb_workflow.process import ProcessResult
 from bb_workflow.verification import verify_repository
 
 
 class CliTests(unittest.TestCase):
+    def test_all_commands_are_discoverable_and_help_has_no_side_effects(self):
+        parser = _parser()
+        commands = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        expected = {"init", "plan", "run", "doctor", "verify", "status", "apply"}
+        self.assertEqual(set(commands.choices), expected)
+        self.assertEqual(
+            {action.dest for action in commands._choices_actions if action.help}, expected
+        )
+        examples = (
+            ["init", "--config", "new.toml"],
+            ["plan", "task", "--repo", "project", "--requirements", "task.toml"],
+            ["run", "task", "--complexity", "low", "--events-jsonl"],
+            ["doctor", "--repo", "project"],
+            ["verify", "focused", "--package", "one", "--test-filter", "unit"],
+            ["status", "saved-run", "--summary"],
+            ["apply", "saved-run"],
+        )
+        with tempfile.TemporaryDirectory() as temporary, contextlib.chdir(temporary):
+            for argv in examples:
+                with self.subTest(command=argv[0]):
+                    self.assertEqual(parser.parse_args(argv).command, argv[0])
+                    stream = io.StringIO()
+                    with contextlib.redirect_stdout(stream):
+                        self.assertEqual(main([argv[0], "--help", "--json"]), 0)
+                    self.assertTrue(json.loads(stream.getvalue())["data"]["help"])
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_version_exits_without_command_or_project_and_preserves_json_contract(self):
+        with tempfile.TemporaryDirectory() as temporary, contextlib.chdir(temporary):
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream), self.assertRaises(SystemExit) as raised:
+                main(["--version"])
+            self.assertEqual(raised.exception.code, 0)
+            self.assertEqual(stream.getvalue().strip(), f"bb-workflow {__version__}")
+            for argv in (["--json", "--version"], ["--version", "--json"]):
+                with self.subTest(argv=argv):
+                    stream = io.StringIO()
+                    with contextlib.redirect_stdout(stream):
+                        self.assertEqual(main(argv), 0)
+                    self.assertEqual(
+                        json.loads(stream.getvalue()),
+                        {
+                            "schema_version": 1,
+                            "command": None,
+                            "ok": True,
+                            "exit_code": 0,
+                            "data": {"version": __version__},
+                            "error": None,
+                        },
+                    )
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_packaged_operator_skill_can_be_copied_without_overwriting(self):
+        resource = files("bb_workflow").joinpath("skills/bb-workflow/SKILL.md")
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "chosen-skills" / "bb-workflow" / "SKILL.md"
+            destination.parent.mkdir(parents=True)
+            with destination.open("xb") as stream:
+                stream.write(resource.read_bytes())
+            self.assertGreater(destination.stat().st_size, 0)
+            self.assertFalse(destination.is_symlink())
+            before = destination.read_bytes()
+            with self.assertRaises(FileExistsError), destination.open("xb"):
+                pass
+            self.assertEqual(destination.read_bytes(), before)
+
+    def test_operator_sequence_from_external_directory_keeps_source_until_explicit_apply(self):
+        """Catch path regressions and accidental apply or loss of bound independent reviews."""
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary).resolve()
+            repo, caller = base / "project", base / "caller"
+            repo.mkdir()
+            caller.mkdir()
+            source = repo / "lib.rs"
+            source.write_text("pub fn value() -> u32 { 0 }\n", encoding="utf-8")
+            calls, outputs = [], []
+
+            def provider(**call):
+                payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+                binding = payload["acceptance"]["binding"]
+                calls.append((call["role"], call["cwd"], binding))
+                response = {
+                    "schema_version": 2,
+                    "status": "completed",
+                    "summary": "Fixture inspected the requested value",
+                    "findings": [],
+                    "decisions": [],
+                    "binding": binding,
+                    "criterion_evidence": [],
+                    "criterion_assessments": [],
+                    "criterion_decisions": [],
+                }
+                if call["role"] == "implementation":
+                    (call["cwd"] / "lib.rs").write_text(
+                        "pub fn value() -> u32 { 1 }\n", encoding="utf-8"
+                    )
+                else:
+                    self.assertEqual(
+                        (call["cwd"] / "lib.rs").read_text(), "pub fn value() -> u32 { 1 }\n"
+                    )
+                    response["criterion_assessments"] = [
+                        {
+                            "criterion_id": "value",
+                            "verdict": "satisfied",
+                            "evidence": "Source inspected",
+                        }
+                    ]
+                return BackendResult(response, None, {}, call["selection"].model)
+
+            def workflow(*args, **kwargs):
+                return Workflow(
+                    *args,
+                    **kwargs,
+                    invoke_fn=provider,
+                    process_fn=lambda *args, **kwargs: ProcessResult(0, "Fixture passed", "", 0),
+                )
+
+            def command(argv, expected=0):
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    code = main(["--json", *argv])
+                self.assertEqual(code, expected, stderr.getvalue() + stdout.getvalue())
+                outputs.append(stdout.getvalue())
+                envelope = json.loads(stdout.getvalue())
+                self.assertEqual(envelope["ok"], expected == 0)
+                return envelope
+
+            with contextlib.chdir(caller), patch("bb_workflow.cli.Workflow", side_effect=workflow):
+                config = repo / "workflow.toml"
+                command(["init", "--config", str(config)])
+                text = config.read_text()
+                start, end = text.index("prepare = "), text.index("\nexclude = ")
+                config.write_text(
+                    text[:start] + 'prepare = []\nchecks = [["fixture-check"]]' + text[end:],
+                    encoding="utf-8",
+                )
+                Path("task.toml").write_text(
+                    'requirements_version = 1\n[[criteria]]\nid = "gate"\n'
+                    'description = "Configured check passes"\nkind = "mechanical"\n'
+                    'verification = "Run the full gate"\ncheck_id = "0"\n'
+                    '[[criteria]]\nid = "value"\ndescription = "value returns one"\n'
+                    'kind = "semantic"\nverification = "Inspect source and API"\n',
+                    encoding="utf-8",
+                )
+                arguments = [
+                    "Implement value",
+                    "--repo",
+                    str(repo),
+                    "--requirements",
+                    "task.toml",
+                    "--complexity",
+                    "low",
+                ]
+                plan = command(["plan", *arguments])["data"]
+                self.assertFalse(plan["requirements_needed"])
+                self.assertEqual(plan["complexity"], "low")
+                self.assertEqual(calls, [])
+                result = command(["run", *arguments, "--events-jsonl"])["data"]
+                self.assertEqual(result["status"], "succeeded")
+                directory = Path(result["run_dir"])
+                summary = command(["status", str(directory), "--summary"])["data"]
+                self.assertEqual(summary["status"], "succeeded")
+                self.assertEqual(summary["acceptance"]["requirements_id"], plan["requirements_id"])
+                self.assertEqual(
+                    summary["acceptance"]["verification_plan_id"], plan["verification_plan_id"]
+                )
+                self.assertEqual(source.read_text(), "pub fn value() -> u32 { 0 }\n")
+                self.assertFalse((directory / "apply.json").exists())
+                self.assertEqual(
+                    [call[0] for call in calls], ["implementation", "reviewer_a", "reviewer_b"]
+                )
+                self.assertNotEqual(calls[1][1], calls[2][1])
+                self.assertEqual(calls[1][2], calls[2][2])
+                acceptance = json.loads((directory / "acceptance.json").read_text())
+                self.assertEqual(acceptance["binding"], calls[1][2])
+                failure = command(["plan", *arguments, "--config", "missing.toml"], expected=2)
+                self.assertEqual(failure["error"]["code"], "invalid_config")
+                self.assertEqual(failure["error"]["next_action"], "correct_configuration")
+                self.assertEqual(len(calls), 3)
+                self.assertEqual(source.read_text(), "pub fn value() -> u32 { 0 }\n")
+                applied = command(["apply", str(directory)])["data"]
+                self.assertEqual(applied, {"status": "applied", "changed_paths": ["lib.rs"]})
+                self.assertEqual(source.read_text(), "pub fn value() -> u32 { 1 }\n")
+            self.operator_metrics = {
+                "happy_path_commands": len(outputs) - 1,
+                "planned_failure_probes": 1,
+                "accidental_configuration_failures": 0,
+                "stdout_chars": sum(map(len, outputs)),
+                "stdout_bytes": sum(len(output.encode("utf-8")) for output in outputs),
+            }
+
     def test_verify_uses_discovered_config_and_reports_without_provider_calls(self):
         with tempfile.TemporaryDirectory() as temp:
             repo = Path(temp).resolve()

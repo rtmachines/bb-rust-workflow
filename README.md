@@ -27,8 +27,6 @@ Z katalogu repozytorium Rust:
 ```sh
 bb-workflow init
 bb-workflow doctor --repo .
-bb-workflow plan "Dodaj obsługę błędu odczytu konfiguracji" --repo .
-bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml
 ```
 
 Na Windows te same polecenia działają w PowerShell, o ile instalator dodał `bb-workflow` do `PATH`; w przeciwnym razie użyj `python -m bb_workflow`. `init` tworzy edytowalny `workflow.toml` (lub ścieżkę podaną przez `--config`). `plan` pokazuje wersję konfiguracji, tryb zgodności, zakres kontroli, dokładne komendy i przypisanie modeli bez uruchamiania agentów. `doctor` pozwala sprawdzić zależności przed kosztownym `run`. Dla `plan` i `run` można podać `--complexity auto|low|medium|high`; `auto` jest prostą heurystyką słów w zadaniu, więc w razie potrzeby wybierz poziom jawnie. `--repo` wskazuje projekt Rust, a `--config` pozwala podać inny plik; bez niego program szuka `workflow.toml` w repozytorium.
@@ -36,7 +34,8 @@ Na Windows te same polecenia działają w PowerShell, o ile instalator dodał `b
 Nowy szablon i `Config()` używają `config_version = 3`: `run` wymaga niepustego pliku kryteriów
 `--requirements task.toml`. Przygotuj go dla zadania przed uruchomieniem. `plan` bez pliku nadal
 działa i pokazuje `requirements_needed`; `doctor` i `verify` nie wymagają kryteriów.
-Przykład minimalnego kryterium semantycznego:
+Zapisz poniższe minimalne kryterium semantyczne jako `task.toml` w katalogu polecenia,
+dostosowując opis do zadania:
 
 ```toml
 requirements_version = 1
@@ -47,10 +46,25 @@ kind = "semantic"
 verification = "Obaj recenzenci sprawdzają ścieżkę błędu, wywołania i testy"
 ```
 
+Następnie sprawdź plan. `run` uruchamia płatne sesje dostawców zgodnie z konfiguracją:
+
+```sh
+bb-workflow plan "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml --complexity low
+bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml --complexity low
+```
+
 Pełny przykład mechaniczny i semantyczny jest w
 [`examples/task-requirements.toml`](examples/task-requirements.toml).
 `bb-workflow plan "Zadanie" --requirements task.toml` sprawdza powiązanie z pełnym gate,
 bez wywołań modeli. Ścieżka pliku wymagań jest względem katalogu polecenia; `--repo` jej nie zmienia.
+
+`bb-workflow --help` i `<polecenie> --help` opisują wszystkie komendy i opcje;
+`bb-workflow --version` podaje wersję pakietu. Dla agenta wywołującego dostępny jest
+[`--json` i kontrakt maszynowy](docs/cli-contract.md),
+[przewodnik operatora](docs/agent-operator.md) oraz opcjonalny, pakowany skill
+`bb-workflow`. Przewodnik pokazuje jawne kopiowanie rzeczywistego `SKILL.md` do
+wybranego katalogu Codex/Claude Code bez nadpisywania. Instalacja pakietu sama
+nie zmienia osobistych katalogów agenta.
 
 Po `run` zanotuj wypisaną ścieżkę katalogu przebiegu. Obejrzyj wynik, logi i zmiany:
 
