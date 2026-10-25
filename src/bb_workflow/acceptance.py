@@ -13,6 +13,7 @@ import stat
 from dataclasses import asdict
 from pathlib import Path
 
+from .config import parse_rust_review
 from .protocol import merge_findings, resolve_triage, validate_response
 from .requirements import (
     Criterion,
@@ -21,6 +22,7 @@ from .requirements import (
     evaluate_mechanical,
     verification_plan_id,
 )
+from .rust_review import preserve_safety_gaps, rust_review_context, validate_rust_review
 from .verification import PlannedCheck, VerificationPlan
 from .workspace import WorkspaceError, _directory, _read_json, _reparse_point
 
@@ -150,16 +152,20 @@ def _construct(root: Path, state: dict) -> dict:
         acceptance["verification_plan_id"] == plan_id, "frozen verification plan hash mismatch"
     )
     bound = None
+    policy = parse_rust_review(state["config"].get("rust_review", {}))
     if mode == "criteria":
         _require(
             acceptance["compatibility_mode"] is False, "criteria cannot use legacy compatibility"
         )
-        bound = bind_requirements(_requirements(_read_json(root / "requirements.json")), plan)
+        requirements = _requirements(_read_json(root / "requirements.json"))
+        validate_rust_review(requirements, policy, plan)
+        bound = bind_requirements(requirements, plan)
         _require(
             acceptance["requirements_id"] == bound.requirements_id,
             "frozen requirements hash mismatch",
         )
     else:
+        validate_rust_review(None, policy, plan)
         _require(
             acceptance["compatibility_mode"] is True and acceptance["requirements_id"] is None,
             "legacy requirements must be explicitly absent",
@@ -297,6 +303,8 @@ def _construct(root: Path, state: dict) -> dict:
         semantic = [{**s, **decisions.get(s["criterion_id"], {})} for s in semantic]
     else:
         _require(triage is None, "unexpected triage without findings or disputed criteria")
+    if policy.enabled:
+        semantic = preserve_safety_gaps(semantic, reviews)
     _require(
         not unresolved
         and _canonical(review["confirmed"]) == _canonical(confirmed)
@@ -346,7 +354,7 @@ def _construct(root: Path, state: dict) -> dict:
             "every criterion must be satisfied",
         )
         final_criteria = [{**asdict(c), **derived[c.id]} for c in criteria]
-    return {
+    result = {
         "version": REPORT_CONTRACT,
         "mode": mode,
         "cycle": cycle,
@@ -363,6 +371,9 @@ def _construct(root: Path, state: dict) -> dict:
         "review": review,
         "provenance": provenance,
     }
+    if policy.enabled:
+        result["rust_review"] = rust_review_context(policy)
+    return result
 
 
 def build_acceptance(root: Path, state: dict) -> dict:

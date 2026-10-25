@@ -26,6 +26,7 @@ from .requirements import (
     load_requirements,
     verification_plan_id,
 )
+from .rust_review import prepare_rust_review, rust_review_context
 from .verification import plan_verification, verify_repository
 from .workspace import WorkspaceError, apply_run, snapshot_environment
 
@@ -229,19 +230,26 @@ def main(argv: list[str] | None = None) -> int:
         level, roles = route(config, args.task, args.complexity)
         if args.command == "plan":
             gate_plan = plan_verification(config, "gate")
+            if requirements is not None:
+                requirements = prepare_rust_review(requirements, config.rust_review, gate_plan)
             bound = bind_requirements(requirements, gate_plan) if requirements is not None else None
             print(
                 json.dumps(
                     {
                         "config_version": config.config_version,
-                        "compatibility_mode": bound is None and config.config_version < 3,
+                        "compatibility_mode": bound is None
+                        and config.config_version < 3
+                        and not config.rust_review.enabled,
                         "acceptance_mode": "criteria"
                         if bound is not None
                         else "required"
-                        if config.config_version >= 3
+                        if config.config_version >= 3 or config.rust_review.enabled
                         else "legacy",
-                        "requirements_needed": bound is None and config.config_version >= 3,
+                        "requirements_needed": bound is None
+                        and (config.config_version >= 3 or config.rust_review.enabled),
                         "requirements_id": bound.requirements_id if bound else None,
+                        "requirements": asdict(bound.requirements) if bound else None,
+                        "rust_review": rust_review_context(config.rust_review),
                         "verification_plan_id": verification_plan_id(gate_plan),
                         "complexity": level,
                         "roles": {k: asdict(v) for k, v in roles.items()},

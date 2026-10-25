@@ -97,3 +97,13 @@ effort = "high"
 backend = "claude"
 model = "claude-opus-5-5"
 effort = "high"
+
+# Optional Rust review policy; pair each required kind with a planned check and exact test name.
+# [rust_review]
+# enabled = true
+# version = 1
+# required = ["memory"]
+# [[rust_review.evidence]]
+# kind = "memory"
+# check_id = "5" # Example: append Miri after the five defaults; verify the ID with plan.
+# test_name = "arena::stable_reference"

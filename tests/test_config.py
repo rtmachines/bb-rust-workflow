@@ -1,5 +1,7 @@
+import json
 import tempfile
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 from bb_workflow.config import (
@@ -9,8 +11,11 @@ from bb_workflow.config import (
     Config,
     ConfigError,
     ContextConfig,
+    RustReviewConfig,
+    RustReviewEvidence,
     default_text,
     load_config,
+    parse_rust_review,
     route,
 )
 
@@ -59,6 +64,166 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.profiles["low"]["implementation"].effort, "low")
         self.assertEqual(config.profiles["medium"]["implementation"].model, "claude-sonnet-5-5")
         self.assertEqual(config.profiles["high"]["implementation"].model, "claude-opus-5-5")
+
+    def test_rust_review_defaults_are_disabled_for_current_and_legacy_configs(self):
+        for version in (None, 1, 2, 3):
+            text = default_text().replace(
+                "config_version = 3", "" if version is None else f"config_version = {version}"
+            )
+            with self.subTest(version=version):
+                config = self.write(text)
+                self.assertIn("rust_review", asdict(config))
+                self.assertEqual(
+                    asdict(config)["rust_review"],
+                    {"enabled": False, "version": 1, "required": (), "evidence": ()},
+                )
+
+    def test_rust_review_policy_loads_without_changing_model_routing(self):
+        baseline = load_config()
+        text = (
+            default_text()
+            + """
+[rust_review]
+enabled = true
+required = ["memory", "cancellation"]
+[[rust_review.evidence]]
+kind = "memory"
+check_id = "gate-1"
+test_name = "arena::stable_reference"
+[[rust_review.evidence]]
+kind = "cancellation"
+check_id = "gate-2"
+test_name = "worker::cancel_pending"
+"""
+        )
+        try:
+            config = self.write(text)
+        except ConfigError as exc:
+            self.fail(f"valid Rust review policy was rejected: {exc}")
+        self.assertEqual(
+            asdict(config)["rust_review"],
+            {
+                "enabled": True,
+                "version": 1,
+                "required": ("memory", "cancellation"),
+                "evidence": (
+                    {
+                        "kind": "memory",
+                        "check_id": "gate-1",
+                        "test_name": "arena::stable_reference",
+                    },
+                    {
+                        "kind": "cancellation",
+                        "check_id": "gate-2",
+                        "test_name": "worker::cancel_pending",
+                    },
+                ),
+            },
+        )
+        self.assertEqual(config.checks, baseline.checks)
+        for complexity in ("low", "medium", "high", "auto"):
+            self.assertEqual(
+                route(config, "Review unsafe concurrent Rust change", complexity),
+                route(baseline, "Review unsafe concurrent Rust change", complexity),
+            )
+
+    def test_rust_review_parser_accepts_defaults_and_serialized_policy_round_trip(self):
+        self.assertEqual(parse_rust_review({}), RustReviewConfig())
+        self.assertEqual(parse_rust_review({"enabled": True}), RustReviewConfig(enabled=True))
+        expected = RustReviewConfig(
+            enabled=True,
+            required=("memory", "deadlocks", "cancellation", "task_lifecycle", "loom"),
+            evidence=(
+                RustReviewEvidence("memory", "miri", "arena::stable_reference"),
+                RustReviewEvidence("memory", "miri", "arena::drop_order"),
+                RustReviewEvidence("deadlocks", "unit", "worker::lock_order"),
+                RustReviewEvidence("cancellation", "unit", "worker::cancel_pending"),
+                RustReviewEvidence("task_lifecycle", "unit", "worker::shutdown_joins"),
+                RustReviewEvidence("loom", "model", "queue::all_schedules"),
+            ),
+        )
+        serialized = json.loads(json.dumps(asdict(expected)))
+        parsed = parse_rust_review(serialized)
+        self.assertEqual(parsed, expected)
+        serialized["required"].append("changed")
+        serialized["evidence"][0]["test_name"] = "changed"
+        self.assertEqual(parsed, expected)
+
+    def test_rust_review_parser_rejects_unknown_fields_and_invalid_types(self):
+        valid = {
+            "enabled": True,
+            "required": ["memory"],
+            "evidence": [{"kind": "memory", "check_id": "miri", "test_name": "arena::drop"}],
+        }
+        invalid = [
+            None,
+            [],
+            (),
+            "enabled",
+            False,
+            1,
+            {"unknown": True},
+            {1: "non-string key"},
+            {1: "non-string key", "unknown": True},
+        ]
+        invalid.extend({"enabled": value} for value in (None, 0, 1, "true", [], {}))
+        invalid.extend({"version": value} for value in (None, 0, 2, True, 1.0, "1", [], {}))
+        invalid.extend(
+            valid | {"required": value}
+            for value in (None, "memory", ("memory",), {}, [True], [1], [[]], [""], [" "])
+        )
+        invalid.extend(
+            valid | {"evidence": value}
+            for value in (None, "memory", tuple(valid["evidence"]), {}, [None], [True], [[]])
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "rust_review"):
+                parse_rust_review(value)
+
+    def test_rust_review_parser_rejects_incomplete_and_duplicate_declarations(self):
+        evidence = {"kind": "memory", "check_id": "miri", "test_name": "arena::drop"}
+        valid = {"enabled": True, "required": ["memory"], "evidence": [evidence]}
+        invalid = [
+            {"required": ["memory"]},
+            valid | {"enabled": False},
+            {"enabled": False, "evidence": [evidence]},
+            {"enabled": True, "required": ["memory"]},
+            valid | {"required": ["memory", "deadlocks"]},
+            valid | {"required": ["memory", "memory"]},
+            valid | {"required": ["unknown"]},
+            valid | {"required": []},
+            valid | {"evidence": [evidence, dict(evidence)]},
+            valid | {"evidence": [evidence | {"kind": "unknown"}]},
+            valid | {"evidence": [evidence | {"kind": "deadlocks"}]},
+            valid | {"evidence": [evidence | {"unknown": "value"}]},
+            valid | {"evidence": [evidence | {1: "non-string key"}]},
+        ]
+        for field in ("kind", "check_id", "test_name"):
+            invalid.append(
+                valid
+                | {"evidence": [{key: value for key, value in evidence.items() if key != field}]}
+            )
+            invalid.extend(
+                valid | {"evidence": [evidence | {field: value}]}
+                for value in (None, "", " \t", False, 1, [], {})
+            )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "rust_review"):
+                parse_rust_review(value)
+
+    def test_rust_review_loader_uses_strict_policy_validation(self):
+        invalid = (
+            "[rust_review]\nenabled = 1",
+            "[rust_review]\nversion = 2",
+            '[rust_review]\nenabled = true\nrequired = ["memory"]',
+            '[rust_review]\nrequired = ["memory"]',
+            "[rust_review]\nunknown = true",
+        )
+        for policy in invalid:
+            with self.subTest(policy=policy), self.assertRaisesRegex(ConfigError, "rust_review"):
+                self.write(default_text() + "\n" + policy)
+        with self.assertRaisesRegex(ConfigError, "rust_review"):
+            self.write("rust_review = []\n" + default_text())
 
     def test_new_defaults_cover_workspace_and_doctests_in_order(self):
         expected = [

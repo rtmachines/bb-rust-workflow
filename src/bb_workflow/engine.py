@@ -24,6 +24,7 @@ from .requirements import (
     evaluate_mechanical,
     verification_plan_id,
 )
+from .rust_review import prepare_rust_review, preserve_safety_gaps, rust_review_context
 from .usage import normalize_usage, summarize_usage
 from .verification import (
     PlannedCheck,
@@ -166,9 +167,17 @@ class Workflow:
 
     def _execute(self) -> None:
         self._timeout()
-        if self.requirements is None and self.config.config_version >= 3:
-            raise WorkflowStop("blocked", "Configuration v3 requires nonempty requirements")
+        rust_review_context(self.config.rust_review)
+        if self.requirements is None and (
+            self.config.config_version >= 3 or self.config.rust_review.enabled
+        ):
+            raise WorkflowStop(
+                "blocked", "Configuration or Rust review requires nonempty requirements"
+            )
         if self.requirements is not None:
+            self.requirements = prepare_rust_review(
+                self.requirements, self.config.rust_review, self.gate_plan
+            )
             self.bound = bind_requirements(self.requirements, self.gate_plan)
             self.state["acceptance"]["requirements_id"] = self.bound.requirements_id
             write_json(self.run_dir / "requirements.json", asdict(self.bound.requirements))
@@ -318,6 +327,10 @@ class Workflow:
                     semantic = [
                         {**item, **by_id.get(item["criterion_id"], {})} for item in semantic
                     ]
+                    round_record["semantic"] = semantic
+            if self.config.rust_review.enabled:
+                semantic = preserve_safety_gaps(semantic, reviews)
+                if round_record is not None:
                     round_record["semantic"] = semantic
             record.update(confirmed=confirmed, unresolved=unresolved)
             self._save()
@@ -623,10 +636,16 @@ class Workflow:
                 "verification_plan": asdict(self.gate_plan),
                 "binding": binding,
             }
+        adapter = ""
+        if self.config.rust_review.enabled:
+            payload["rust_review"] = rust_review_context(self.config.rust_review)
+            if role in {"reviewer_a", "reviewer_b", "triage"}:
+                adapter = "\n" + prompts.joinpath("rust_pr_review.md").read_text(encoding="utf-8")
         return (
             prompts.joinpath("common.md").read_text(encoding="utf-8")
             + "\n"
             + prompts.joinpath(f"{role}.md").read_text(encoding="utf-8")
+            + adapter
             + "\nTask and evidence (JSON):\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         )

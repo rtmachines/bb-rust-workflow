@@ -454,3 +454,163 @@ class CargoInvocationProofTests(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(req.RequirementsError):
                 plan = replace(self.plan, checks=(replace(self.plan.checks[0], argv=argv),))
                 self.bound(replace(self.criterion(), test_name=None), plan)
+
+
+class MiriInvocationProofTests(unittest.TestCase):
+    setUp = RequirementsTests.setUp
+    criterion = RequirementsTests.criterion
+    bound = RequirementsTests.bound
+    binding = RequirementsTests.binding
+    record = RequirementsTests.record
+    verdict = RequirementsTests.verdict
+
+    COMMANDS = (
+        ("cargo", "miri", "test"),
+        ("/usr/bin/cargo", "+nightly", "miri", "test", "validation::upper"),
+        (r"C:\Rust\bin\cargo.exe", "+nightly", "--color=never", "miri", "test"),
+        ("cargo", "--config", "net.offline=true", "-Zunstable-options", "miri", "test"),
+        ("cargo", "+nightly", "-Z", "unstable-options", "-C", "project", "miri", "test"),
+        ("cargo", "--offline", "--locked", "--frozen", "-vv", "-q", "miri", "test"),
+    )
+    POSITIVE = (
+        "running 1 test\ntest validation::upper ... ok\n"
+        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+    )
+
+    def miri_plan(self, argv=("cargo", "+nightly", "miri", "test")):
+        return replace(self.plan, checks=(replace(self.plan.checks[0], argv=argv),))
+
+    def test_legacy_unnamed_miri_success_does_not_require_logs(self):
+        plan = self.miri_plan()
+        bound = self.bound(self.criterion(test_name=None), plan)
+        record = dict(self.record(), command=list(plan.checks[0].argv))
+        self.assertEqual(self.verdict([record], bound), "satisfied")
+
+    def test_named_miri_without_logs_cannot_prove_test_execution(self):
+        plan = self.miri_plan()
+        bound = self.bound(plan=plan)
+        record = dict(self.record(), command=list(plan.checks[0].argv))
+        self.assertEqual(self.verdict([record], bound), "unresolved")
+
+    def test_named_miri_requires_completed_nonempty_exact_test_proof(self):
+        cases = (
+            ("", "unresolved"),
+            ("all tests passed\n", "unresolved"),
+            ("test validation::upper ... ok\n", "unresolved"),
+            (
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+                "unmet",
+            ),
+            (
+                "test validation::upper ... ignored\n"
+                "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out\n",
+                "unmet",
+            ),
+            (
+                "test validation::upper_extra ... ok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
+                "unmet",
+            ),
+            (self.POSITIVE, "satisfied"),
+        )
+        for argv in self.COMMANDS:
+            with self.subTest(argv=argv):
+                bound = self.bound(plan=self.miri_plan(argv))
+                for output, expected in cases:
+                    with self.subTest(output=output):
+                        record = dict(self.record(output), command=list(argv))
+                        self.assertEqual(self.verdict([record], bound), expected)
+
+    def test_legacy_unnamed_miri_success_keeps_command_only_proof(self):
+        plan = self.miri_plan()
+        bound = self.bound(self.criterion(test_name=None), plan)
+        record = dict(
+            self.record(
+                "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+            ),
+            command=list(plan.checks[0].argv),
+        )
+        self.assertEqual(self.verdict([record], bound), "satisfied")
+
+    def test_miri_nonexecuting_flags_cannot_prove_named_test(self):
+        for suffix in (("--no-run",), ("--", "--list")):
+            with self.subTest(suffix=suffix):
+                argv = ("cargo", "+nightly", "miri", "test", *suffix)
+                bound = self.bound(plan=self.miri_plan(argv))
+                record = dict(self.record(self.POSITIVE), command=list(argv))
+                self.assertEqual(self.verdict([record], bound), "unmet")
+
+    def test_miri_stale_or_incomplete_validation_record_cannot_prove_named_test(self):
+        plan = self.miri_plan()
+        bound = self.bound(plan=plan)
+        record = dict(self.record(self.POSITIVE), command=list(plan.checks[0].argv))
+        for changes in (
+            {"snapshot_id": "stale"},
+            {"result_snapshot_id": "stale"},
+            {"source_unchanged": False},
+            {"command": ["cargo", "miri", "test"]},
+            {"returncode": None},
+            {"timed_out": None},
+            {"output_limit_exceeded": None},
+        ):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.verdict([dict(record, **changes)], bound), "unresolved")
+        for key in self.binding(bound):
+            with self.subTest(binding_key=key):
+                binding = dict(self.binding(bound), **{key: "stale"})
+                self.assertEqual(self.verdict([record], bound, binding), "unresolved")
+
+    def test_miri_named_test_must_belong_to_completed_successful_harness(self):
+        bound = self.bound(plan=self.miri_plan())
+        output = (
+            "running 1 test\ntest validation::upper ... ok\n"
+            "test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\n"
+            "running 1 test\ntest other ... ok\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        record = dict(self.record(output), command=list(bound.gate_plan.checks[0].argv))
+        self.assertEqual(self.verdict([record], bound), "unmet")
+
+    def test_classification_distinguishes_direct_tests_and_miri_from_other_commands(self):
+        for commands, expected in (
+            (CargoInvocationProofTests.COMMANDS, "test"),
+            (self.COMMANDS, "miri"),
+            (
+                (
+                    ("cargo", "miri"),
+                    ("cargo", "miri", "setup", "test"),
+                    ("cargo", "miri", "run", "test"),
+                    ("cargo", "miri", "--help", "test"),
+                    ("cargo", "nextest", "run"),
+                    ("cargo", "check", "test"),
+                    ("make", "test"),
+                    ("rustup", "run", "nightly", "cargo", "miri", "test"),
+                    ("sh", "-c", "cargo miri test"),
+                ),
+                None,
+            ),
+        ):
+            for argv in commands:
+                with self.subTest(argv=argv):
+                    self.assertEqual(req.cargo_test_kind(argv), expected)
+
+    def test_miri_other_subcommands_cannot_bind_named_test(self):
+        for argv in (
+            ("cargo", "miri"),
+            ("cargo", "miri", "setup", "test"),
+            ("cargo", "miri", "run", "test"),
+            ("cargo", "miri", "--help", "test"),
+        ):
+            with self.subTest(argv=argv), self.assertRaises(req.RequirementsError):
+                self.bound(plan=self.miri_plan(argv))
+
+    def test_miri_global_grammar_preserves_fail_closed_errors(self):
+        for argv in (
+            ("cargo", "--unknown", "miri", "test"),
+            ("cargo", "--color", "miri", "test"),
+            ("cargo", "--config=", "miri", "test"),
+            ("cargo", "-Z", "--offline", "miri", "test"),
+            ("cargo", "+", "miri", "test"),
+        ):
+            with self.subTest(argv=argv), self.assertRaises(req.RequirementsError):
+                req.cargo_test_kind(argv)

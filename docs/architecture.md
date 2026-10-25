@@ -50,8 +50,9 @@ Przed kontrolami i pierwszym wywołaniem dostawcy program sprawdza istnienie zas
 
 `Workflow(..., *, requirements: Requirements | None = None)` kopiuje konfigurację i jednorazowo
 rozwiązuje niezmienny pełny gate. V3 bez kryteriów blokuje `run` przed kontrolami i dostawcami;
-v1/v2 bez kryteriów mają jawny tryb `legacy` i schemat odpowiedzi v1. Podane kryteria w każdej
-wersji konfiguracji włączają schemat v2. Niepoprawne nowe wejście nigdy nie uruchamia fallbacku.
+v1/v2 bez kryteriów i bez włączonego `rust_review` mają jawny tryb `legacy` i schemat odpowiedzi v1.
+Podane kryteria w każdej wersji konfiguracji włączają schemat v2. Niepoprawne nowe wejście nigdy
+nie uruchamia fallbacku.
 `plan` bez kryteriów, `doctor` i samodzielne `verify` nadal są dostępne.
 
 Przed implementacją zapisuje się wymagania i plan. Powiązanie każdej odpowiedzi obejmuje
@@ -62,8 +63,10 @@ i dowody mechaniczne. Nie otrzymują wzajemnych ocen. Każdy ocenia wszystkie kr
 
 Po pełnym gate program zapisuje `acceptance.rounds[].mechanical`. Brak testu lub zero wykonanych
 przypadków kieruje do ograniczonego Fixera; nieznany wynik blokuje. Każde kryterium bezpośredniego
-Cargo test wymaga dodatniej liczby zaliczonych testów w zakończonym udanym wyniku libtest,
-a nazwane wymaga dokładnej zaliczonej nazwy. Sprawdzane są pełne logi, oba identyfikatory źródeł,
+`cargo test` wymaga dodatniej liczby zaliczonych testów w zakończonym udanym wyniku libtest,
+a nazwane wymaga dokładnej zaliczonej nazwy. Nazwane kryteria `cargo miri test` podlegają
+tej samej kontroli; historyczne Miri bez `test_name` zachowuje dowód poprawnego zakończenia
+komendy. Sprawdzane są pełne logi, oba identyfikatory źródeł,
 komenda, profil, wariant i brak błędów/limitów. Kryterium własnej nietestowej komendy ufa jej
 poprawnemu zakończeniu. Fatalna zmiana źródeł, przerwanie lub budżet zachowuje swój status;
 dostępny częściowy dowód jest audytowany bez kierowania do semantycznego override.
@@ -76,6 +79,47 @@ od wagi ustaleń. Cały gate i obie recenzje powtarzają się po każdej naprawi
 Sukces wymaga aktualnego dowodu dla każdego kryterium oraz wszystkich poprzednich gwarancji.
 
 `acceptance` w stanie zawiera tryb, hashe i pełne rundy. `status --summary` pomija pełne rundy.
+
+## Adapter Rust PR review
+
+Opcjonalne `[rust_review]` ma `enabled = false` i wersję polityki `1`. Przy włączeniu wymaga
+niepustych kryteriów zadania w każdej wersji konfiguracji. `required` deklaruje rodzaje
+`memory`, `deadlocks`, `cancellation`, `task_lifecycle`, `loom`; każdy musi mieć wpis
+`evidence` z `kind`, `check_id` i dokładnym `test_name`. Walidacja odrzuca brakujące,
+powtórzone i nieznane deklaracje. Polecenia nadal pochodzą wyłącznie z pełnego gate;
+adapter nie dopisuje ani nie zmienia komend podczas przebiegu.
+
+`rust_review.py` dopisuje przed zamrożeniem zwykłe kryteria semantyczne `rust-review-spec`,
+`rust-review-scope`, `rust-review-memory`, `rust-review-async`, `rust-review-sync` oraz
+mechaniczne `rust-review-test-<indeks>` dla zadeklarowanych testów. Prefiks jest zarezerwowany.
+Kryterium zakresu utrwala kanoniczną politykę, wersję adaptera i przypięte źródło metody.
+Tekst kryteriów wersji 1 pozostaje częścią trwałej tożsamości wymagań. Schemat wymagań v1
+i odpowiedzi v2 pozostają wspólne; wyłączona polityka nie zmienia wymagań ani ich skrótu.
+
+Dowód `memory` musi wskazywać bezpośrednie `cargo [+toolchain] miri test`; pozostałe rodzaje
+wskazują bezpośrednie testy Cargo. Wszystkie wymagają dokładnej zaliczonej nazwy w zakończonym,
+niepustym wyniku libtest oraz aktualnego powiązania kandydata i pełnych logów. Wrappery,
+nextest, samo przygotowanie Miri i sam kod wyjścia zero nie zastępują tego dowodu. Testy
+Miri używają jawnych argumentów i domyślnego wariantu; istniejący mechanizm macierzy nie
+przekształca takich niestandardowych komend.
+
+`prompts/rust_pr_review.md` jest dołączany do obu recenzentów i triage; każdy recenzent
+wykonuje przegląd poprawności oraz osobny przegląd specyfikacji, zachowując swój dotychczasowy
+zakres uwagi. Nie powstaje nowa rola ani etap. Obie recenzje widzą tę samą politykę i kryteria,
+bez wzajemnych odpowiedzi. Adapter nie uruchamia upstreamowych skryptów, hooków, agentów ani
+instalacji. Projektowe skills nadal dostarczają wybraną wiedzę; cała baza reguł nie jest
+pobierana automatycznie. Brak LSP/MCP wymaga ujawnienia ograniczenia, nie zgłoszenia usterki.
+
+Mechanicznego braku dowodu nie można rozstrzygnąć semantycznie. Ponadto `preserve_safety_gaps`
+zachowuje `unresolved` dowolnego recenzenta dla kryteriów `scope`, `memory`, `async` i `sync`,
+nawet gdy triage zwróci `satisfied`; końcowy wynik pozostaje zablokowany. Specyfikacja nadal
+podlega zwykłemu triage. Recenzenci oceniają niezależny argument aliasowania/FFI, adekwatność
+testów async oraz odwzorowanie, asercje, granice i zakończenie modelu Loom. Log zaliczonego
+testu nie rozstrzyga prawdziwości tych argumentów. Nowy obowiązek poza zamrożonym planem
+wymaga odpowiedzi `blocked` i nowego przebiegu z uzupełnioną polityką.
+
+Źródło metody: [rust-pr-review, rewizja 268582b5](https://github.com/rtmachines/rtm-coding/tree/268582b5c4d8f91bc709294b9ebbe270a181f9b2/skills/rust-pr-review).
+Przykład użytkowy: [konfiguracja Miri, async i Loom](../examples/rust-review/README.md).
 
 ## Końcowy odbiór i raport (etap 5)
 
@@ -99,6 +143,12 @@ Sprawdza kompletność i kolejność gate, niezmienność źródeł, powiązania
 protokół odpowiedzi i odrębne pochodzenie recenzji. `apply` wykonuje tę kontrolę lokalnie pod
 istniejącą blokadą, przed backupem; nie wywołuje modeli ani Cargo. Następnie obowiązują wszystkie
 dotychczasowe kontrole manifestów i odzyskiwanie po błędach.
+
+Przy aktywnym adapterze raport zawiera także `rust_review`. Odtworzenie odbioru sprawdza
+zapisaną politykę, dokładną treść i kolejność dopisanych kryteriów oraz ich zgodność z planem.
+Ponownie stosuje zachowanie nierozstrzygniętych kryteriów bezpieczeństwa i ocenia nazwane testy
+z pełnych logów. Usunięta polityka, zmienione kryteria lub brak dowodu nie uprawniają do `apply`.
+Historyczne raporty bez polityki zachowują dotychczasowy kontrakt.
 
 Historyczne stany bez wersji lub z wersją 1 zachowują dawny kontrakt tylko bez oznak nowego
 formatu. Znacznik, metadane raportu, sam raport lub nowe pochodzenie odpowiedzi/recenzji
@@ -125,6 +175,7 @@ końcowego zatwierdzenia. Sukces poświadcza skonfigurowany zakres, nie kompletn
 | `process.py` | Uruchomienie argv bez powłoki, przechwycenie stdout/stderr, timeout i próba zatrzymania drzewa procesów na Linux/macOS/Windows. |
 | `_windows_job.py` | Nadzorca Windows: przed uruchomieniem polecenia dołącza do Job Object z kończeniem członków przy zamknięciu; przekazuje kod zakończenia i błędy przez prywatny plik wyniku. |
 | `requirements.py` | Ścisły niezmienny kontrakt wymagań, hashe pełnego planu i ocena mechanicznego dowodu z audytowanych kontroli i pełnych logów. |
+| `rust_review.py` | Wersjonowana polityka Rust review, kanoniczne kryteria adaptera, kontrola ich odtworzenia i zachowanie nierozstrzygniętych dowodów bezpieczeństwa. |
 | `acceptance.py`, `reporting.py` | Budowa i lokalna walidacja końcowego kontraktu odbioru; czytelny raport pełnych, historycznych i częściowych dowodów. |
 | `protocol.py` | Wspólny schemat JSON odpowiedzi, walidacja ścieżek/linii ustaleń, deduplikacja oraz pełne rozstrzygnięcie triage. |
 | `workspace.py` | Manifesty hashujące treść i prawa plików, zweryfikowane kopie, blokada projektu oraz `apply` z kontrolą konfliktu i próbą wycofania. |

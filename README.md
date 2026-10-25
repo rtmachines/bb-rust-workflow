@@ -137,7 +137,8 @@ Aby przejść na v3 z kryteriami, ustaw `config_version = 3` i podaj plik przez 
 
 ### Kryteria odbioru i zgodność
 
-Pliki v1/v2 bez `--requirements` zachowują dotychczasowy protokół i jawny tryb `legacy`.
+Pliki v1/v2 bez `--requirements` i bez włączonego `rust_review` zachowują dotychczasowy protokół
+i jawny tryb `legacy`.
 Nie zapewniają odbioru kryteriów. Podanie pliku wymagań w v1/v2 włącza ten sam protokół v2
 co v3; błędny plik, odpowiedź lub powiązanie zatrzymuje przebieg bez powrotu do trybu zgodności.
 Jawne `checks` pozostają niezmienione we wszystkich trzech wersjach. Brak wersji oznacza v1.
@@ -146,7 +147,9 @@ Każde kryterium ma unikalne `id`, `description`, `kind` i niepusty opis `verifi
 Mechaniczne wymaga `check_id` z `verification.gate_plan.checks` w `plan`; opcjonalne `test_name`
 wskazuje dokładną nazwę testu Cargo. Semantyczne nie przyjmuje `check_id` ani `test_name`.
 Kontrola mechaniczna nie zawęża gate. Dla bezpośredniego `cargo test` także kryterium bez nazwy
-wymaga co najmniej jednego rzeczywiście zaliczonego, nieignorowanego testu. Zero przypadków,
+wymaga co najmniej jednego rzeczywiście zaliczonego, nieignorowanego testu. Nazwane kryteria
+`cargo miri test` podlegają tej samej kontroli; historyczne kryteria Miri bez `test_name`
+zachowują odbiór na podstawie poprawnego zakończenia komendy. Zero przypadków,
 `--no-run` i `--list` nie stanowią dowodu; nieznany format wyniku blokuje odbiór. Dla własnych
 poleceń nietestowych dowodem jest poprawne, niezmieniające źródeł zakończenie zaufanej komendy.
 Pełne stdout/stderr są zachowane i służą do oceny testów, nawet gdy kontekst pokazuje tylko skrót.
@@ -183,6 +186,58 @@ bez oznak nowego kontraktu, zachowuje dawną kontrolę manifestów; usunięcie s
 z nowego przebiegu nie włącza tego fallbacku, gdy pozostały nowe artefakty lub pochodzenie dowodów.
 Sukces oznacza odbiór skonfigurowanego zakresu i zadeklarowanych kryteriów, nie dowód kompletności
 wymagań. Lokalne skróty wykrywają niespójność, ale nie skoordynowane przepisanie wszystkich artefaktów.
+
+### Opcjonalny adapter Rust PR review
+
+`[rust_review]` jest domyślnie wyłączony. Po włączeniu dołącza wbudowane instrukcje do obu
+istniejących recenzentów i triage: osobny przegląd zgodności ze specyfikacją oraz ocenę pamięci,
+async i synchronizacji. Nie zmienia modeli, kolejności etapów ani niezależności recenzji.
+Nie instaluje narzędzi lub zależności. Dodatkowe projektowe `skills` pozostają opcjonalne;
+nie trzeba wskazywać pliku adaptera w konfiguracji ról.
+
+Przed przebiegiem dodaj wymagane testy do głównej listy `checks`, zachowując dotychczasowy gate.
+Następnie zadeklaruj rodzaje dowodów i dokładne nazwy testów. Przykład dla kontroli Miri
+dopisanej jako szósta po pięciu domyślnych kontrolach:
+
+```toml
+[rust_review]
+enabled = true
+version = 1
+required = ["memory"]
+
+[[rust_review.evidence]]
+kind = "memory"
+check_id = "5"
+test_name = "arena::stable_reference"
+```
+
+`memory` wymaga bezpośredniego `cargo [+toolchain] miri test`; `deadlocks`, `cancellation`,
+`task_lifecycle` i `loom` wymagają bezpośredniego `cargo test`. Każdy zadeklarowany rodzaj
+musi mieć co najmniej jeden wpis `evidence`. Sprawdź numery `check_id` w
+`verification.gate_plan.checks` przez `plan`; zmiana kolejności kontroli zmienia te numery.
+[Pełny przykład konfiguracji i wymagań](examples/rust-review/README.md) pokazuje zachowanie
+gate, polecenia Miri/async/Loom i ograniczenie do jawnych argumentów w domyślnym wariancie.
+Wrappery i nextest nie są obsługiwane jako dowód nazwanego testu.
+
+Adapter wymaga własnego pliku `--requirements` również przy konfiguracji v1/v2. Do przyjętych
+wymagań dopisuje zarezerwowane kryteria `rust-review-*` przed zamrożeniem; nie edytuje pliku
+użytkownika ani nie zastępuje wymagań zadania.
+Wymagany test musi mieć dokładną zaliczoną nazwę w pełnym, zakończonym wyniku libtest dla
+bieżącego kandydata. Sam kod wyjścia zero, podsumowanie recenzenta, test ignorowany lub zero
+wykonanych testów nie wystarczą. Triage nie może uchylić tych mechanicznych wymagań.
+
+Zaliczenie Miri nie zastępuje argumentu o własności, aliasowaniu i kontraktach FFI; zaliczenie
+testu Loom nie dowodzi poprawnego odwzorowania kodu ani kompletności modelu. Oceniają to
+recenzenci. `unresolved` od choć jednego z nich dla `rust-review-scope`, `rust-review-memory`,
+`rust-review-async` lub `rust-review-sync` blokuje sukces także po korzystnym triage. Kryterium
+specyfikacji podlega zwykłemu rozstrzyganiu. Nowy obowiązek bezpieczeństwa nieobecny w zamrożonym
+planie wymaga `blocked`, poprawienia konfiguracji i nowego przebiegu. `apply` ponownie sprawdza
+zapisaną politykę, wygenerowane kryteria i dowody z logów, bez uruchamiania testów lub modeli.
+
+Adapter korzysta z [rust-pr-review w przypiętej rewizji rtm-coding](https://github.com/rtmachines/rtm-coding/tree/268582b5c4d8f91bc709294b9ebbe270a181f9b2/skills/rust-pr-review).
+Nie pobiera całej bazy reguł ani skryptów tego projektu. Wybrane reguły można dostarczyć jako
+projektowe skills. Brak LSP/MCP jest ujawnianym ograniczeniem narzędzi, sam w sobie nie jest
+usterką kodu; recenzenci korzystają wtedy ze źródeł, testów i zapisanych wyników kontroli.
 
 ### Weryfikacja bez agentów
 

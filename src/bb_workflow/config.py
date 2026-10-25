@@ -78,6 +78,25 @@ class VerificationConfig:
     )
 
 
+@dataclass(frozen=True)
+class RustReviewEvidence:
+    """One exact planned test used to support a Rust review obligation."""
+
+    kind: str
+    check_id: str
+    test_name: str
+
+
+@dataclass(frozen=True)
+class RustReviewConfig:
+    """Immutable opt-in policy for Rust review evidence."""
+
+    enabled: bool = False
+    version: int = 1
+    required: tuple[str, ...] = ()
+    evidence: tuple[RustReviewEvidence, ...] = ()
+
+
 @dataclass
 class Config:
     max_cycles: int = 3
@@ -100,6 +119,7 @@ class Config:
     context: ContextConfig = field(default_factory=ContextConfig)
     config_version: int = CURRENT_CONFIG_VERSION
     verification: VerificationConfig = field(default_factory=VerificationConfig)
+    rust_review: RustReviewConfig = field(default_factory=RustReviewConfig)
 
 
 ROLE_NAMES = ("implementation", "reviewer_a", "reviewer_b", "triage", "fixer")
@@ -130,7 +150,9 @@ _TOP_KEYS = {
     "profiles",
     "roles",
     "verification",
+    "rust_review",
 }
+_RUST_REVIEW_KINDS = {"memory", "deadlocks", "cancellation", "task_lifecycle", "loom"}
 
 
 def default_text() -> str:
@@ -273,7 +295,53 @@ def load_config(path: Path | None = None) -> Config:
         roles=overrides,
         context=context,
         verification=_verification(raw.get("verification", {})),
+        rust_review=parse_rust_review(raw.get("rust_review", {})),
     )
+
+
+def parse_rust_review(value: object) -> RustReviewConfig:
+    """Parse a Rust review policy from its TOML or JSON representation."""
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ConfigError("rust_review must be a table with string field names")
+    _keys(value, {"enabled", "version", "required", "evidence"}, "rust_review")
+    enabled = value.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("rust_review.enabled must be a boolean")
+    version = value.get("version", 1)
+    if type(version) is not int or version != 1:
+        raise ConfigError("rust_review.version must be integer 1")
+    required = _strings(value.get("required", []), "rust_review.required")
+    if any(kind not in _RUST_REVIEW_KINDS for kind in required):
+        raise ConfigError("rust_review.required contains an unknown evidence kind")
+    if len(set(required)) != len(required):
+        raise ConfigError("rust_review.required contains duplicate evidence kinds")
+    evidence_raw = value.get("evidence", [])
+    if not isinstance(evidence_raw, list):
+        raise ConfigError("rust_review.evidence must be an array of tables")
+    evidence: list[RustReviewEvidence] = []
+    seen: set[RustReviewEvidence] = set()
+    for index, entry in enumerate(evidence_raw):
+        where = f"rust_review.evidence[{index}]"
+        if not isinstance(entry, dict) or any(not isinstance(key, str) for key in entry):
+            raise ConfigError(f"{where} must be a table with string field names")
+        _keys(entry, {"kind", "check_id", "test_name"}, where)
+        item = RustReviewEvidence(
+            kind=_nonempty_str(entry.get("kind"), f"{where}.kind"),
+            check_id=_nonempty_str(entry.get("check_id"), f"{where}.check_id"),
+            test_name=_nonempty_str(entry.get("test_name"), f"{where}.test_name"),
+        )
+        if item.kind not in required:
+            raise ConfigError(f"{where}.kind must be declared in rust_review.required")
+        if item in seen:
+            raise ConfigError(f"{where} duplicates an evidence declaration")
+        seen.add(item)
+        evidence.append(item)
+    if not enabled and (required or evidence):
+        raise ConfigError("disabled rust_review cannot declare required kinds or evidence")
+    missing = set(required) - {item.kind for item in evidence}
+    if enabled and missing:
+        raise ConfigError(f"rust_review is missing evidence for: {', '.join(sorted(missing))}")
+    return RustReviewConfig(enabled, version, required, tuple(evidence))
 
 
 def route(config: Config, task: str, complexity: str = "auto") -> tuple[str, dict[str, Selection]]:

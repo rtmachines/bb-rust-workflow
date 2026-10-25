@@ -112,11 +112,11 @@ def verification_plan_id(plan: VerificationPlan) -> str:
     return _hash(plan)
 
 
-def _cargo_test(argv: tuple[str, ...]) -> bool:
-    """Classify direct Cargo tests; unknown Cargo prefix grammar cannot become custom proof."""
+def cargo_test_kind(argv: tuple[str, ...]) -> str | None:
+    """Identify direct Cargo/Miri tests; reject ambiguous Cargo prefix grammar."""
     executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
     if executable not in {"cargo", "cargo.exe"}:
-        return False
+        return None
     position = 1
     if len(argv) > position and argv[position].startswith("+"):
         if len(argv[position]) == 1:
@@ -127,7 +127,11 @@ def _cargo_test(argv: tuple[str, ...]) -> bool:
     while position < len(argv):
         arg = argv[position]
         if not arg.startswith(("-", "+")):
-            return arg in {"test", "t"}
+            if arg in {"test", "t"}:
+                return "test"
+            if arg == "miri" and argv[position + 1 : position + 2] == ("test",):
+                return "miri"
+            return None
         if arg in flags or re.fullmatch(r"-[vq]+", arg):
             position += 1
             continue
@@ -150,6 +154,10 @@ def _cargo_test(argv: tuple[str, ...]) -> bool:
             raise RequirementsError(f"Invalid or missing Cargo global argument value: {option}")
         position += 1
     raise RequirementsError("Cargo acceptance check requires an unambiguous subcommand")
+
+
+def _cargo_test(argv: tuple[str, ...]) -> bool:
+    return cargo_test_kind(argv) is not None
 
 
 def bind_requirements(requirements: Requirements, gate_plan: VerificationPlan) -> BoundRequirements:
@@ -192,7 +200,7 @@ def bind_requirements(requirements: Requirements, gate_plan: VerificationPlan) -
             raise RequirementsError(f"Unknown check_id: {criterion.check_id}")
         is_test = _cargo_test(check.argv)
         if criterion.test_name is not None and not is_test:
-            raise RequirementsError("test_name requires a direct Cargo test command")
+            raise RequirementsError("test_name requires a direct Cargo test or Miri test command")
     return BoundRequirements(
         requirements, gate_plan, requirements_id(requirements), verification_plan_id(gate_plan)
     )
@@ -301,7 +309,11 @@ def evaluate_mechanical(
                     and record.get("timed_out") is False
                     and record.get("output_limit_exceeded") is False
                 ):
-                    if _cargo_test(check.argv):
+                    test_kind = cargo_test_kind(check.argv)
+                    # Unnamed Miri criteria retain their historical command-only proof contract.
+                    if test_kind == "test" or (
+                        test_kind == "miri" and criterion.test_name is not None
+                    ):
                         verdict, evidence = _test_proof(check, criterion, record, artifact_root)
                     else:
                         verdict, evidence = (
