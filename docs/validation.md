@@ -82,18 +82,20 @@ bb-workflow run "Make increment saturate at u32::MAX and add a regression test" 
 
 ## Etap 5 — lokalna weryfikacja 2026-10-25
 
-Zapis dotyczy implementacji końcowego raportu i walidacji apply oraz testu integracyjnego
-na gałęzi `codex/reporting-stage-5`, po bazie zadania integracyjnego `a0e7ffb`.
-Implementacja i lokalne kontrole są zakończone; niezależny przegląd zadania integracyjnego
-i całej gałęzi pozostaje do wykonania. Poniższe wyniki nie zastępują tego przeglądu.
+Zapis dotyczy implementacji końcowego raportu i walidacji apply na gałęzi
+`codex/reporting-stage-5`, opartej na zintegrowanych etapach 1–4 (`a90f978`).
+Implementację, lokalne kontrole oraz niezależne przeglądy obu zadań i całej gałęzi zakończono.
+Przeglądy wykryły obejście rozpoznawania nowego kontraktu po usunięciu części znaczników
+oraz pomijanie uzasadnień zablokowanego triage w Markdown. Obie usterki mają regresje i zostały
+zatwierdzone w ponownych przeglądach, bez pozostałych ustaleń. Ostatnia poprawka kodu: `03cc8d8`.
 
 | Wykonana kontrola na Linux | Wynik |
 | --- | --- |
-| `PYTHONPATH=src python3.11 -m unittest discover -s tests -q` (3.11.17) | 406 testów: 404 zaliczone, 2 pominięte; 80,126 s; exit 0 |
-| `PYTHONPATH=src python3.13 -m unittest discover -s tests -q` (3.13.17) | 406 testów: 404 zaliczone, 2 pominięte; 80,793 s; exit 0 |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -q` (3.14.8) | 406 testów: 404 zaliczone, 2 pominięte; 80,850 s; exit 0 |
+| `PYTHONPATH=src python3.11 -m unittest discover -s tests -q` (3.11.17) | 407 testów: 405 zaliczonych, 2 pominięte; 88,263 s; exit 0 |
+| `PYTHONPATH=src python3.13 -m unittest discover -s tests -q` (3.13.17) | 407 testów: 405 zaliczonych, 2 pominięte; 88,628 s; exit 0 |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -q` (3.14.8) | 407 testów: 405 zaliczonych, 2 pominięte; 89,865 s; exit 0 |
 | `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_rust_checks.py' -q` | 9 rzeczywistych testów Cargo offline; bez pominięć; 14,991 s; exit 0 |
-| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_acceptance.py' -q` | 34 zaliczone; 23,524 s; exit 0 |
+| Skupione regresje triage i raportowania po końcowej poprawce | 5 zaliczonych; exit 0 |
 | `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_reporting.py' -q` | 2 zaliczone; 0,000 s; exit 0 |
 | `ruff check src tests examples` | Brak ustaleń; exit 0 |
 | `ruff format --check src tests examples` | 40 plików zgodnych; exit 0 |
@@ -101,9 +103,14 @@ i całej gałęzi pozostaje do wykonania. Poniższe wyniki nie zastępują tego 
 | `git diff --check` | Bez błędów; exit 0 |
 | Lokalnie wykonany blok próby narzędzi z CI | Wszystkie narzędzia obecne, rustfmt/Clippy działają; exit 0 |
 
-Pełne zestawy uruchomiono równolegle w trzech interpreterach. Logi sesji zachowano lokalnie
-w `/tmp/bb-stage5-task2-validation/` (`python311.log`, `python313.log`, `python314.log`,
-`ruff-raw.log`, `reviewdog.log`); katalog tymczasowy nie jest częścią dystrybucji.
+Końcowe pełne zestawy uruchomiono równolegle w trzech interpreterach, dodatkowo ustawiając
+`PYTHONDONTWRITEBYTECODE=1` i osobny `TMPDIR` dla każdego interpretera na dysku katalogu
+roboczego. Pierwsza próba po ostatniej poprawce nie mogła zweryfikować zestawu: systemowy
+`/tmp` (tmpfs 32 GB) był pełny i zwracał `ENOSPC`. Nie usuwano cudzych plików; powtórzenie
+z własnymi katalogami tymczasowymi dało powyższe trzy wyniki exit 0.
+Logi końcowe zachowano lokalnie w `.bb-workflow/stage5-validation/` (`py311.log`,
+`py313.log`, `py314.log`, `ruff-raw.log`, `reviewdog.log`). Ten pomijany przez Git katalog
+zawiera również wcześniejsze logi zadania integracyjnego i mutacji; nie jest częścią dystrybucji.
 
 ```sh
 set -o pipefail
@@ -131,7 +138,7 @@ Wcześniejsze regresje awarii uruchomienia, przerwań, timeoutu/wyjścia/budżet
 niezależności review, migracji konfiguracji i schematów odpowiedzi pozostają w pełnym zestawie;
 audyt pokrycia nie wykazał potrzeby ich powielania dla etapu 5.
 
-Nie uruchamiano sesji modeli ani płatnych providerów. Historyczne sesje opisane wyżej nie
+Nie uruchamiano sesji dostawców workflow ani płatnych providerów w testach. Historyczne sesje opisane wyżej nie
 walidują obecnego kontraktu. Dwa pominięte testy nadal dotyczą natywnych junctions Windows;
 atrapy API Windows działające na Linux nie potwierdzają natywnej zgodności. Nie wykonano
 natywnych testów Windows/macOS ani zdalnego CI. Skonfigurowana macierz pozostaje Ubuntu/Windows
