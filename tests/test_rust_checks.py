@@ -111,7 +111,9 @@ class RustChecksTests(unittest.TestCase):
     def test_acceptance_rejects_real_zero_filter_and_proves_exact_passing_named_test(self):
         library = self.repo / "selected/src/lib.rs"
         library.write_text(
-            library.read_text() + "\n#[test]\nfn exact_regression() { assert_eq!(value(), 1); }\n"
+            library.read_text()
+            + "\n#[test]\nfn exact_regression() { assert_eq!(value(), 1); }\n"
+            + '\n#[test]\n#[should_panic]\nfn rejects_invalid_input() { panic!("invalid"); }\n'
         )
 
         def provider(**call):
@@ -133,11 +135,13 @@ class RustChecksTests(unittest.TestCase):
                 call["selection"].model,
             )
 
-        for test_filter, expected in (
-            ("missing_filter", "limit_exhausted"),
-            ("exact_regression", "succeeded"),
+        for test_filter, test_name, expected in (
+            ("missing_filter", "exact_regression", "limit_exhausted"),
+            ("exact_regression", "exact_regression", "succeeded"),
+            ("rejects_invalid_input", "rejects_invalid_input", "succeeded"),
+            ("rejects_invalid_input", "exact_regression", "limit_exhausted"),
         ):
-            with self.subTest(test_filter=test_filter):
+            with self.subTest(test_filter=test_filter, test_name=test_name):
                 config = replace(
                     self.config,
                     config_version=3,
@@ -163,7 +167,7 @@ class RustChecksTests(unittest.TestCase):
                             "mechanical",
                             "Run the exact named test",
                             "0",
-                            "exact_regression",
+                            test_name,
                         ),
                     )
                 )

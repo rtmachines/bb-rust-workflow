@@ -228,7 +228,7 @@ def _test_proof(
         for line in output.splitlines():
             match = _TEST.fullmatch(line)
             if match:
-                successful_names.add(match[1])
+                successful_names.add(match[1].removesuffix(" - should panic"))
             summary = _SUMMARY.fullmatch(line)
             if summary:
                 completed += 1

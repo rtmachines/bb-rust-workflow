@@ -190,6 +190,28 @@ check_id = "2"
         self.assertEqual(self.verdict([record]), "satisfied")
         self.assertEqual(record, original)
 
+    def test_should_panic_annotation_preserves_exact_named_test_proof(self):
+        log = (
+            "running 1 test\ntest rejects_invalid_input - should panic ... ok\n"
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+        )
+        bound = self.bound(self.criterion(test_name="rejects_invalid_input"))
+        self.assertEqual(self.verdict([self.record(log)], bound), "satisfied")
+
+    def test_should_panic_annotation_does_not_relax_exact_name_or_known_suffix(self):
+        for display_name in (
+            "validation::upper_extra - should panic",
+            "other - should panic",
+            "validation::upper - arbitrary annotation",
+            "validation::upper - should panic extra",
+        ):
+            with self.subTest(display_name=display_name):
+                log = (
+                    f"running 1 test\ntest {display_name} ... ok\n"
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
+                )
+                self.assertEqual(self.verdict([self.record(log)]), "unmet")
+
     def test_stale_missing_duplicate_or_mismatched_proof_is_unresolved(self):
         record = self.record(
             "test validation::upper ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n"
