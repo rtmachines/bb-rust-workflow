@@ -20,6 +20,7 @@ from bb_workflow.config import (
 )
 from bb_workflow.engine import Workflow
 from bb_workflow.process import run_process
+from bb_workflow.requirements import Criterion, Requirements
 from bb_workflow.verification import execute_checks, plan_verification, verify_repository
 from bb_workflow.workspace import manifest, snapshot_id
 
@@ -70,7 +71,9 @@ class RustChecksTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
-        self.config = replace(load_config(), max_cycles=0, timeout_seconds=60, max_seconds=240)
+        self.config = replace(
+            load_config(), config_version=2, max_cycles=0, timeout_seconds=60, max_seconds=240
+        )
         self.original = manifest(self.repo, self.config.exclude)
         self.calls = []
         self.implement = lambda directory: None
@@ -104,6 +107,86 @@ class RustChecksTests(unittest.TestCase):
         self.assertFalse((self.repo / "Cargo.lock").exists())
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         return flow, state
+
+    def test_acceptance_rejects_real_zero_filter_and_proves_exact_passing_named_test(self):
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + "\n#[test]\nfn exact_regression() { assert_eq!(value(), 1); }\n"
+            + '\n#[test]\n#[should_panic]\nfn rejects_invalid_input() { panic!("invalid"); }\n'
+        )
+
+        def provider(**call):
+            payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+            return BackendResult(
+                {
+                    "status": "completed",
+                    "summary": "Offline fixture",
+                    "findings": [],
+                    "decisions": [],
+                    "schema_version": 2,
+                    "binding": payload["acceptance"]["binding"],
+                    "criterion_evidence": [],
+                    "criterion_assessments": [],
+                    "criterion_decisions": [],
+                },
+                0.0,
+                {},
+                call["selection"].model,
+            )
+
+        for test_filter, test_name, expected in (
+            ("missing_filter", "exact_regression", "limit_exhausted"),
+            ("exact_regression", "exact_regression", "succeeded"),
+            ("rejects_invalid_input", "rejects_invalid_input", "succeeded"),
+            ("rejects_invalid_input", "exact_regression", "limit_exhausted"),
+        ):
+            with self.subTest(test_filter=test_filter, test_name=test_name):
+                config = replace(
+                    self.config,
+                    config_version=3,
+                    prepare=[["cargo", "generate-lockfile", "--offline"]],
+                    checks=[
+                        [
+                            "cargo",
+                            "test",
+                            "--workspace",
+                            "--lib",
+                            "--offline",
+                            test_filter,
+                            "--",
+                            "--exact",
+                        ]
+                    ],
+                )
+                requirements = Requirements(
+                    criteria=(
+                        Criterion(
+                            "regression",
+                            "Exact regression passes",
+                            "mechanical",
+                            "Run the exact named test",
+                            "0",
+                            test_name,
+                        ),
+                    )
+                )
+                flow = Workflow(
+                    self.repo,
+                    "Validate regression",
+                    config,
+                    requirements=requirements,
+                    invoke_fn=provider,
+                    progress=lambda text: None,
+                )
+                flow.run()
+                self.assertEqual(flow.state["status"], expected, flow.state["reason"])
+                assessment = flow.state["acceptance"]["rounds"][0]["mechanical"][0]
+                self.assertEqual(
+                    assessment["verdict"], "satisfied" if expected == "succeeded" else "unmet"
+                )
+                self.assertEqual(flow.state["checks"][-1]["returncode"], 0)
+                self.assertFalse((self.repo / "Cargo.lock").exists())
 
     def test_standalone_gate_executes_real_offline_feature_variants(self):
         package = self.repo / "selected/Cargo.toml"

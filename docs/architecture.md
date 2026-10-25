@@ -14,16 +14,18 @@ flowchart TD
     Q -->|błąd| F
     G --> E[Kontrole kandydata: bez zmian źródeł]
     E -->|błąd| F{Limit Fixera?}
-    E -->|sukces| H[Reviewer A: osobna kopia i proces]
-    E -->|sukces| I[Reviewer B: osobna kopia i proces]
+    E -->|sukces i dowód mechaniczny| H[Reviewer A: osobna kopia i proces]
+    E -->|sukces i dowód mechaniczny| I[Reviewer B: osobna kopia i proces]
+    E -->|niespełnione kryterium mechaniczne| F
+    E -->|nierozstrzygnięty dowód mechaniczny| M
     E -->|zmiana źródeł| R[Wyniki unieważnione: failed]
     H --> J[Scalenie dokładnych duplikatów]
     I --> J
-    J -->|ustalenia| K[Triage na osobnej kopii]
-    J -->|brak ustaleń| L[Wynik succeeded]
+    J -->|ustalenia lub sporne kryteria| K[Triage na osobnej kopii]
+    J -->|brak ustaleń i spełnione kryteria| L[Wynik succeeded]
     K -->|nierozstrzygnięte| M[Wynik blocked]
-    K -->|potwierdzone blokujące| F
-    K -->|bez blokujących| L
+    K -->|blokujące ustalenia lub niespełnione kryteria| F
+    K -->|bez blokujących ustaleń i spełnione kryteria| L
     F -->|limit wyczerpany| N[Wynik limit_exhausted]
     F -->|dostępny| O[Fixer]
     O --> Q
@@ -42,6 +44,38 @@ Przed kontrolami i pierwszym wywołaniem dostawcy program sprawdza istnienie zas
 
 `BackendError.retryable` rozróżnia błędy dopuszczające ograniczone ponowienie od błędów konfiguracji adaptera, uruchomienia procesu, zmiany modelu i przekroczenia limitu wyjścia. Te ostatnie zatrzymują rolę bez ponowień. Pozostałe błędy dostawcy mogą być ponawiane tylko dla odczytowych ról, po ponownym sprawdzeniu niezmienności kopii i w ramach istniejących limitów.
 
+## Kryteria odbioru (etap 4)
+
+`Workflow(..., *, requirements: Requirements | None = None)` kopiuje konfigurację i jednorazowo
+rozwiązuje niezmienny pełny gate. V3 bez kryteriów blokuje `run` przed kontrolami i dostawcami;
+v1/v2 bez kryteriów mają jawny tryb `legacy` i schemat odpowiedzi v1. Podane kryteria w każdej
+wersji konfiguracji włączają schemat v2. Niepoprawne nowe wejście nigdy nie uruchamia fallbacku.
+`plan` bez kryteriów, `doctor` i samodzielne `verify` nadal są dostępne.
+
+Przed implementacją zapisuje się wymagania i plan. Powiązanie każdej odpowiedzi obejmuje
+`candidate_id`, `requirements_id`, `verification_plan_id`. Dla roli zapisującej kandydat oznacza
+migawkę przed wywołaniem; `criterion_evidence` są propozycjami, bez prawa zatwierdzenia. Recenzenci
+otrzymują powiązanie rzeczywistego przygotowanego i sprawdzonego kandydata oraz identyczne kryteria
+i dowody mechaniczne. Nie otrzymują wzajemnych ocen. Każdy ocenia wszystkie kryteria semantyczne.
+
+Po pełnym gate program zapisuje `acceptance.rounds[].mechanical`. Brak testu lub zero wykonanych
+przypadków kieruje do ograniczonego Fixera; nieznany wynik blokuje. Każde kryterium bezpośredniego
+Cargo test wymaga dodatniej liczby zaliczonych testów w zakończonym udanym wyniku libtest,
+a nazwane wymaga dokładnej zaliczonej nazwy. Sprawdzane są pełne logi, oba identyfikatory źródeł,
+komenda, profil, wariant i brak błędów/limitów. Kryterium własnej nietestowej komendy ufa jej
+poprawnemu zakończeniu. Fatalna zmiana źródeł, przerwanie lub budżet zachowuje swój status;
+dostępny częściowy dowód jest audytowany bez kierowania do semantycznego override.
+
+Obustronne `satisfied` rozstrzyga kryterium semantyczne. Każde inne zestawienie trafia do triage,
+nawet przy pustych `findings`; `criterion_decisions` rozstrzyga dokładnie sporne ID, oddzielnie od
+oryginalnych `decisions` ustaleń kodowych. `unresolved` blokuje; `unmet` wymaga naprawy niezależnie
+od wagi ustaleń. Cały gate i obie recenzje powtarzają się po każdej naprawie. Status odpowiedzi
+`completed` oznacza wykonanie przydzielonego review/triage i może zawierać niespełnione kryteria.
+Sukces wymaga aktualnego dowodu dla każdego kryterium oraz wszystkich poprzednich gwarancji.
+
+`acceptance` w stanie zawiera tryb, hashe i pełne rundy. Raport pokazuje podstawowy tryb i hashe;
+`status --summary` pomija rundy. Bogatszy raport i dodatkowe powiązanie przy `apply` są etapem 5.
+
 ## Odpowiedzialności modułów
 
 | Moduł | Odpowiedzialność |
@@ -55,6 +89,7 @@ Przed kontrolami i pierwszym wywołaniem dostawcy program sprawdza istnienie zas
 | `usage.py` | Normalizacja liczników Claude/Codex, cache bez podwójnego liczenia, sumy zmierzonych tokenów i jawne braki danych. |
 | `process.py` | Uruchomienie argv bez powłoki, przechwycenie stdout/stderr, timeout i próba zatrzymania drzewa procesów na Linux/macOS/Windows. |
 | `_windows_job.py` | Nadzorca Windows: przed uruchomieniem polecenia dołącza do Job Object z kończeniem członków przy zamknięciu; przekazuje kod zakończenia i błędy przez prywatny plik wyniku. |
+| `requirements.py` | Ścisły niezmienny kontrakt wymagań, hashe pełnego planu i ocena mechanicznego dowodu z audytowanych kontroli i pełnych logów. |
 | `protocol.py` | Wspólny schemat JSON odpowiedzi, walidacja ścieżek/linii ustaleń, deduplikacja oraz pełne rozstrzygnięcie triage. |
 | `workspace.py` | Manifesty hashujące treść i prawa plików, zweryfikowane kopie, blokada projektu oraz `apply` z kontrolą konfliktu i próbą wycofania. |
 | `prompts/*.md` | Instrukcje poszczególnych ról; nie są mechanizmem egzekwowania limitów ani kolejności. |
@@ -70,6 +105,7 @@ Jeden `run` tworzy `.bb-workflow/runs/<id>/` wewnątrz oryginalnego projektu:
 - `workspace/`: kandydat edytowany przez implementera i Fixera;
 - `baseline/`, `baseline_manifest.json`: kopia i manifest stanu początkowego;
 - `checks/`: komendy, stdout i stderr każdej kontroli;
+- `requirements.json`, `verification_plan.json`: znormalizowane wejścia zamrożone przed implementacją;
 - `round-*-reviewer_a/`, `round-*-reviewer_b/`, `round-*-triage/`: odczytowe kopie danej rundy;
 - `agents/`: prompty, wywołania, schematy, odpowiedzi oraz surowe logi agentów;
 - `state.json`: bieżący stan, routing, limity, przebieg kontroli, recenzje, triage i koszty;

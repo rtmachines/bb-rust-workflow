@@ -4,6 +4,8 @@ from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from .requirements import Criterion, Requirements, RequirementsError, _validate_requirements
+
 
 class ProtocolError(ValueError):
     """An agent response does not meet the workflow contract."""
@@ -53,6 +55,93 @@ RESPONSE_SCHEMA = _object(
 )
 
 
+_BINDING_SCHEMA = _object(
+    {"candidate_id": _TEXT, "requirements_id": _TEXT, "verification_plan_id": _TEXT}
+)
+_VERDICT_SCHEMA = {"type": "string", "enum": ["satisfied", "unmet", "unresolved"]}
+_RESPONSE_SCHEMA_V2 = _object(
+    {
+        **RESPONSE_SCHEMA["properties"],
+        "schema_version": {"type": "integer", "enum": [2]},
+        "binding": _BINDING_SCHEMA,
+        "criterion_evidence": {
+            "type": "array",
+            "items": _object({"criterion_id": _TEXT, "evidence": _TEXT}),
+        },
+        "criterion_assessments": {
+            "type": "array",
+            "items": _object(
+                {"criterion_id": _TEXT, "verdict": _VERDICT_SCHEMA, "evidence": _TEXT}
+            ),
+        },
+        "criterion_decisions": {
+            "type": "array",
+            "items": _object(
+                {"criterion_id": _TEXT, "verdict": _VERDICT_SCHEMA, "rationale": _TEXT}
+            ),
+        },
+    }
+)
+
+
+def response_schema(version: int = 1) -> dict:
+    """Return an isolated portable schema, preserving the legacy response contract."""
+    if type(version) is not int or version not in {1, 2}:
+        raise ProtocolError("Unsupported response schema version")
+    return deepcopy(RESPONSE_SCHEMA if version == 1 else _RESPONSE_SCHEMA_V2)
+
+
+def _validate_acceptance(
+    value: dict,
+    role: str,
+    expected_binding: dict | None,
+    criteria: tuple[Criterion, ...],
+    disputed_criteria: tuple[str, ...],
+) -> None:
+    if expected_binding is None:
+        raise ProtocolError("Version 2 requires the expected input binding")
+    _validate(expected_binding, _BINDING_SCHEMA, "expected_binding")
+    if value["binding"] != expected_binding:
+        raise ProtocolError("Response binding does not match the expected input")
+    try:
+        _validate_requirements(Requirements(criteria=criteria))
+    except RequirementsError as exc:
+        raise ProtocolError(f"Invalid response criteria: {exc}") from exc
+    known = {criterion.id for criterion in criteria}
+    semantic = {criterion.id for criterion in criteria if criterion.kind == "semantic"}
+    if (
+        type(disputed_criteria) is not tuple
+        or any(type(identifier) is not str for identifier in disputed_criteria)
+        or len(disputed_criteria) != len(set(disputed_criteria))
+        or not set(disputed_criteria) <= semantic
+    ):
+        raise ProtocolError("Disputed criteria must be unique known semantic IDs")
+    role_fields = {
+        "implementation": "criterion_evidence",
+        "fixer": "criterion_evidence",
+        "reviewer_a": "criterion_assessments",
+        "reviewer_b": "criterion_assessments",
+        "triage": "criterion_decisions",
+    }
+    if role not in role_fields:
+        raise ProtocolError("Unsupported acceptance response role")
+    for field in ("criterion_evidence", "criterion_assessments", "criterion_decisions"):
+        items = value[field]
+        if field != role_fields[role] and items:
+            raise ProtocolError(f"{role} must not return {field}")
+        ids = [item["criterion_id"] for item in items]
+        if len(ids) != len(set(ids)) or not set(ids) <= known:
+            raise ProtocolError(f"{field} requires unique known criterion IDs")
+    if role in {"reviewer_a", "reviewer_b"}:
+        if {item["criterion_id"] for item in value["criterion_assessments"]} != semantic:
+            raise ProtocolError("Reviewers must assess every semantic criterion exactly once")
+    elif role == "triage":
+        if {item["criterion_id"] for item in value["criterion_decisions"]} != set(
+            disputed_criteria
+        ):
+            raise ProtocolError("Triage must decide every disputed semantic criterion exactly once")
+
+
 def _validate(value: Any, schema: dict, where: str = "response") -> None:
     kind = schema["type"]
     expected = {"object": dict, "array": list, "string": str, "integer": int}[kind]
@@ -75,9 +164,19 @@ def _validate(value: Any, schema: dict, where: str = "response") -> None:
 
 
 def validate_response(
-    value: Any, role: str, workspace: Path, baseline_root: Path | None = None
+    value: Any,
+    role: str,
+    workspace: Path,
+    baseline_root: Path | None = None,
+    *,
+    version: int = 1,
+    expected_binding: dict | None = None,
+    criteria: tuple[Criterion, ...] = (),
+    disputed_criteria: tuple[str, ...] = (),
 ) -> dict:
-    _validate(value, RESPONSE_SCHEMA)
+    _validate(value, response_schema(version))
+    if version == 2:
+        _validate_acceptance(value, role, expected_binding, criteria, disputed_criteria)
     if role != "triage" and value["decisions"]:
         raise ProtocolError(f"{role} must not return triage decisions")
     if role not in {"reviewer_a", "reviewer_b"} and value["findings"]:

@@ -103,8 +103,10 @@ class CliTests(unittest.TestCase):
                 code = main(["plan", "Improve unsafe code", "--config", str(path)])
             self.assertEqual(code, 0)
             plan = json.loads(stream.getvalue())
-            self.assertEqual(plan["config_version"], 2)
+            self.assertEqual(plan["config_version"], 3)
             self.assertFalse(plan["compatibility_mode"])
+            self.assertTrue(plan["requirements_needed"])
+            self.assertEqual(plan["acceptance_mode"], "required")
             self.assertEqual(plan["checks"], load_config(path).checks)
             self.assertEqual(plan["checks_scope"]["kind"], "workspace_all_targets_and_doctests")
             self.assertEqual(plan["complexity"], "high")
@@ -121,7 +123,7 @@ class CliTests(unittest.TestCase):
 
     def test_plan_preserves_custom_commands_and_reports_compatibility(self):
         custom_checks = [["custom checker", "--package", "one member"], ["cargo", "test", "unit"]]
-        for version in (None, 1, 2):
+        for version in (None, 1, 2, 3):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as temporary:
                 repo = Path(temporary)
                 text = default_text()
@@ -134,7 +136,7 @@ class CliTests(unittest.TestCase):
                     + text[checks_end:]
                 )
                 text = text.replace(
-                    "config_version = 2\n",
+                    "config_version = 3\n",
                     "" if version is None else f"config_version = {version}\n",
                 )
                 (repo / "workflow.toml").write_text(text, encoding="utf-8")
@@ -147,7 +149,7 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(main(["plan", "task", "--repo", str(repo)]), 0)
                 plan = json.loads(stream.getvalue())
                 self.assertEqual(plan["config_version"], 1 if version is None else version)
-                self.assertEqual(plan["compatibility_mode"], version != 2)
+                self.assertEqual(plan["compatibility_mode"], version != 3)
                 self.assertEqual(plan["checks"], custom_checks)
                 self.assertEqual(plan["checks_scope"]["kind"], "configured_commands")
                 probe.assert_not_called()
@@ -156,7 +158,7 @@ class CliTests(unittest.TestCase):
     def test_plan_exposes_legacy_fallback_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "legacy.toml"
-            text = default_text().replace("config_version = 2\n", "")
+            text = default_text().replace("config_version = 3\n", "")
             start = text.index("checks = ")
             end = text.index("\nexclude = ", start)
             path.write_text(text[:start] + text[end:], encoding="utf-8")

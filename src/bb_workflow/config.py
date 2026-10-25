@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-CURRENT_CONFIG_VERSION = 2
+CURRENT_CONFIG_VERSION = 3
 DEFAULT_CHECKS = (
     ("cargo", "fmt", "--all", "--", "--check"),
     ("cargo", "check", "--workspace", "--all-targets", "--locked"),
@@ -148,9 +148,9 @@ def load_config(path: Path | None = None) -> Config:
         raise ConfigError(f"cannot load configuration: {exc}") from exc
     _keys(raw, _TOP_KEYS, "root")
     config_version = _integer(raw.get("config_version", 1), "config_version", 1)
-    if config_version not in (1, CURRENT_CONFIG_VERSION):
+    if config_version not in (1, 2, 3):
         raise ConfigError(
-            f"unsupported config_version {config_version}; supported versions are 1 and "
+            f"unsupported config_version {config_version}; supported versions are 1, 2 and "
             f"{CURRENT_CONFIG_VERSION}"
         )
     context_raw = raw.get("context", {})
@@ -197,7 +197,7 @@ def load_config(path: Path | None = None) -> Config:
     )
     if any(s not in {"critical", "high", "medium", "low"} for s in severities):
         raise ConfigError("blocking_severities contains an unknown severity")
-    default_checks = DEFAULT_CHECKS if config_version == CURRENT_CONFIG_VERSION else LEGACY_CHECKS
+    default_checks = DEFAULT_CHECKS if config_version >= 2 else LEGACY_CHECKS
     checks_raw = raw.get("checks", [list(command) for command in default_checks])
     if (
         not isinstance(checks_raw, list)

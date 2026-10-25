@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from bb_workflow.backends import BackendError, invoke, probe
 from bb_workflow.process import ProcessResult
+from bb_workflow.protocol import response_schema
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,20 @@ class BackendTests(unittest.TestCase):
             )
 
         self.run.side_effect = fake
+
+    def test_full_v2_schema_reaches_both_native_adapters_unchanged(self):
+        self.schema = response_schema(2)
+        self.result({"structured_output": {}})
+        self.invoke()
+        argv = self.run.call_args.args[0]
+        self.assertEqual(json.loads(argv[argv.index("--json-schema") + 1]), self.schema)
+        self.codex_result(payload={})
+        self.invoke(Selection(backend="codex"))
+        argv = self.run.call_args.args[0]
+        schema_path = Path(argv[argv.index("--output-schema") + 1])
+        self.assertEqual(json.loads(schema_path.read_text()), self.schema)
+        self.assertIn("binding", self.schema["required"])
+        self.assertIn("criterion_assessments", self.schema["required"])
 
     def test_claude_parses_structured_output_and_records_raw_audit(self):
         value = {

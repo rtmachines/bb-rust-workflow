@@ -1,0 +1,17 @@
+requirements_version = 1
+
+# For examples/rust-counter and the packaged default gate (check 2 is Cargo tests).
+# Use `plan --requirements ...` to validate IDs against your configured full gate.
+[[criteria]]
+id = "saturates"
+description = "increment(u32::MAX) returns u32::MAX without overflow"
+kind = "mechanical"
+verification = "Run the exact passing saturation regression in the full gate"
+check_id = "2"
+test_name = "tests::saturates_at_maximum"
+
+[[criteria]]
+id = "public-api"
+description = "Preserve the public increment(value: u32) -> u32 API"
+kind = "semantic"
+verification = "Both independent reviewers compare exported signatures and callers with baseline"

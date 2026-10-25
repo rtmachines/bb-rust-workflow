@@ -10,7 +10,6 @@ from pathlib import Path
 
 from .backends import probe
 from .config import (
-    CURRENT_CONFIG_VERSION,
     DEFAULT_CHECKS,
     LEGACY_CHECKS,
     Config,
@@ -21,6 +20,12 @@ from .config import (
 )
 from .engine import Workflow
 from .process import run_process
+from .requirements import (
+    RequirementsError,
+    bind_requirements,
+    load_requirements,
+    verification_plan_id,
+)
 from .verification import plan_verification, verify_repository
 from .workspace import WorkspaceError, apply_run, snapshot_environment
 
@@ -37,6 +42,9 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--repo", type=Path, default=Path.cwd())
         command.add_argument("--config", type=Path)
         if name != "doctor":
+            command.add_argument(
+                "--requirements", type=Path, help="Versioned acceptance criteria TOML"
+            )
             command.add_argument("task", help="Task text (quote spaces in your shell)")
             command.add_argument(
                 "--complexity", choices=("auto", "low", "medium", "high"), default="auto"
@@ -169,9 +177,14 @@ def main(argv: list[str] | None = None) -> int:
                         "known_cost_usd",
                         "unknown_cost_calls",
                         "token_usage",
+                        "acceptance",
                     )
                     if key in state
                 }
+                if "acceptance" in state:
+                    state["acceptance"] = {
+                        key: value for key, value in state["acceptance"].items() if key != "rounds"
+                    }
                 state["run_dir"] = str(args.run_dir.resolve())
                 state["report"] = str(args.run_dir.resolve() / "report.md")
             print(json.dumps(state, indent=2, ensure_ascii=False))
@@ -212,20 +225,31 @@ def main(argv: list[str] | None = None) -> int:
             payload, ok = _doctor(config, args.repo)
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0 if ok else 1
+        requirements = load_requirements(args.requirements) if args.requirements else None
         level, roles = route(config, args.task, args.complexity)
         if args.command == "plan":
+            gate_plan = plan_verification(config, "gate")
+            bound = bind_requirements(requirements, gate_plan) if requirements is not None else None
             print(
                 json.dumps(
                     {
                         "config_version": config.config_version,
-                        "compatibility_mode": config.config_version < CURRENT_CONFIG_VERSION,
+                        "compatibility_mode": bound is None and config.config_version < 3,
+                        "acceptance_mode": "criteria"
+                        if bound is not None
+                        else "required"
+                        if config.config_version >= 3
+                        else "legacy",
+                        "requirements_needed": bound is None and config.config_version >= 3,
+                        "requirements_id": bound.requirements_id if bound else None,
+                        "verification_plan_id": verification_plan_id(gate_plan),
                         "complexity": level,
                         "roles": {k: asdict(v) for k, v in roles.items()},
                         "checks": config.checks,
                         "checks_scope": _checks_scope(config),
                         "verification": {
                             **asdict(config.verification),
-                            "gate_plan": asdict(plan_verification(config, "gate")),
+                            "gate_plan": asdict(gate_plan),
                         },
                         "prepare": config.prepare,
                         "max_cycles": config.max_cycles,
@@ -244,6 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             args.task,
             config,
             args.complexity,
+            requirements=requirements,
             progress=lambda text: print(text, file=sys.stderr, flush=True),
         )
         run_dir = workflow.run()
@@ -265,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             if workflow.state["status"] == "interrupted"
             else 1
         )
-    except (ConfigError, WorkspaceError, OSError, ValueError) as exc:
+    except (ConfigError, RequirementsError, WorkspaceError, OSError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
