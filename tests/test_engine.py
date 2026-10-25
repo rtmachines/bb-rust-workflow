@@ -60,7 +60,7 @@ class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.repo = Path(self.temporary.name) / "project"
+        self.repo = Path(self.temporary.name).resolve() / "project"
         (self.repo / "src").mkdir(parents=True)
         self.original = "pub fn value() -> u32 {\n    0\n}\n"
         (self.repo / "src/lib.rs").write_text(self.original, encoding="utf-8")

@@ -26,7 +26,7 @@ class BackendTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.cwd = Path(self.temporary.name)
+        self.cwd = Path(self.temporary.name).resolve()
         self.artifacts = self.cwd / "artifacts"
         self.schema = {"type": "object"}
         self.runner = patch("bb_workflow.backends.run_process")
@@ -88,6 +88,24 @@ class BackendTests(unittest.TestCase):
         command = json.loads((self.artifacts / "command.json").read_text())
         self.assertEqual(command["cwd"], str(self.cwd))
         self.assertEqual(self.run.call_args.kwargs["input_text"], "prompt from stdin")
+
+    def test_raw_audit_preserves_newlines_with_windows_text_translation(self):
+        stdout = '{"structured_output": {}}\r\n'
+        stderr = "first\r\nsecond\nprogress\r"
+        self.run.return_value = ProcessResult(0, stdout, stderr, 0.1)
+        original_open = Path.open
+
+        def windows_open(path, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+            # Use a real TextIOWrapper with Windows defaults even on POSIX.
+            if "b" not in mode and newline is None:
+                newline = "\r\n"
+            return original_open(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", windows_open):
+            result = self.invoke()
+        self.assertEqual(result.payload, {})
+        self.assertEqual((self.artifacts / "stdout.txt").read_bytes(), stdout.encode("utf-8"))
+        self.assertEqual((self.artifacts / "stderr.txt").read_bytes(), stderr.encode("utf-8"))
 
     def test_claude_role_tool_boundaries_and_explicit_mcp(self):
         self.result({"structured_output": {}})
