@@ -99,14 +99,25 @@ def _regular(path: Path) -> os.stat_result:
 
 def _file_hash(path: Path) -> str:
     before = _regular(path)
+    # Windows path stat infers execute bits from the suffix; fstat does not.
+    shared_mode_mask = ~0o111 if os.name == "nt" else -1
     digest = hashlib.sha256()
     digest.update(f"mode:{stat.S_IMODE(before.st_mode):o}\0".encode("ascii"))
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if not stat.S_ISREG(opened.st_mode) or (before.st_dev, before.st_ino) != (
+        if not stat.S_ISREG(opened.st_mode) or (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_mode & shared_mode_mask,
+        ) != (
             opened.st_dev,
             opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_mode & shared_mode_mask,
         ):
             raise WorkspaceError(f"file changed while reading: {path}")
         for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -123,7 +134,10 @@ def _file_hash(path: Path) -> str:
             info.st_mode,
         )
 
-    if signature(before) != signature(after) or signature(after) != signature(path.lstat()):
+    # Windows path stat can report birth time as ctime while fstat reports
+    # change time. Compare full metadata within each API, retaining the shared
+    # identity/content checks above between the path and its opened handle.
+    if signature(before) != signature(path.lstat()) or signature(opened) != signature(after):
         raise WorkspaceError(f"file changed while reading: {path}")
     return digest.hexdigest()
 

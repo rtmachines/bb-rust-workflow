@@ -234,8 +234,8 @@ def execute_checks(
             fatal = exc
         if fatal is not None:
             result = ProcessResult(-1, "", "", time.monotonic() - started)
-        (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8")
-        (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8")
+        (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8", newline="")
+        (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8", newline="")
         try:
             after = manifest(cwd, config.exclude)
         except (OSError, WorkspaceError) as exc:

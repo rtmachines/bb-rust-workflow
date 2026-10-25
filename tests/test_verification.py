@@ -8,6 +8,7 @@ import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from bb_workflow import verification
 from bb_workflow.config import (
@@ -165,7 +166,7 @@ class ExecutionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo = Path(temporary.name)
+        self.repo = Path(temporary.name).resolve()
         (self.repo / "source.txt").write_text("original", encoding="utf-8")
         self.config = Config(checks=[[sys.executable, "-c", "print('full output')"]])
         self.plan = verification.plan_verification(self.config)
@@ -198,6 +199,34 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(
             json.loads((directory / "command.json").read_text()), self.config.checks[0]
         )
+
+    def test_execution_preserves_raw_newlines_with_windows_text_translation(self):
+        self.config.checks = [
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'first\\r\\nsecond\\nprogress\\r'); "
+                "os.write(2, b'error\\r\\n')",
+            ]
+        ]
+        self.plan = verification.plan_verification(self.config)
+        original_open = Path.open
+
+        def windows_open(path, mode="r", buffering=-1, encoding=None, errors=None, newline=None):
+            # Use a real TextIOWrapper with Windows defaults even on POSIX.
+            if "b" not in mode and newline is None:
+                newline = "\r\n"
+            return original_open(path, mode, buffering, encoding, errors, newline)
+
+        with patch.object(Path, "open", windows_open):
+            records = self.execute()
+        result = records[0]
+        self.assertTrue(result["passed"])
+        directory = self.artifacts / result["artifacts"]
+        self.assertEqual((directory / "stdout.txt").read_bytes(), b"first\r\nsecond\nprogress\r")
+        self.assertEqual((directory / "stderr.txt").read_bytes(), b"error\r\n")
+        self.assertEqual(result["stdout_tail"], "first\r\nsecond\nprogress\r")
+        self.assertEqual(result["stderr_tail"], "error\r\n")
 
     def test_source_mutation_invalidates_result_and_stops_later_commands(self):
         def mutate(argv, **kwargs):
