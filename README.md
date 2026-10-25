@@ -28,10 +28,29 @@ Z katalogu repozytorium Rust:
 bb-workflow init
 bb-workflow doctor --repo .
 bb-workflow plan "Dodaj obsługę błędu odczytu konfiguracji" --repo .
-bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo .
+bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml
 ```
 
 Na Windows te same polecenia działają w PowerShell, o ile instalator dodał `bb-workflow` do `PATH`; w przeciwnym razie użyj `python -m bb_workflow`. `init` tworzy edytowalny `workflow.toml` (lub ścieżkę podaną przez `--config`). `plan` pokazuje wersję konfiguracji, tryb zgodności, zakres kontroli, dokładne komendy i przypisanie modeli bez uruchamiania agentów. `doctor` pozwala sprawdzić zależności przed kosztownym `run`. Dla `plan` i `run` można podać `--complexity auto|low|medium|high`; `auto` jest prostą heurystyką słów w zadaniu, więc w razie potrzeby wybierz poziom jawnie. `--repo` wskazuje projekt Rust, a `--config` pozwala podać inny plik; bez niego program szuka `workflow.toml` w repozytorium.
+
+Nowy szablon i `Config()` używają `config_version = 3`: `run` wymaga niepustego pliku kryteriów
+`--requirements task.toml`. Przygotuj go dla zadania przed uruchomieniem. `plan` bez pliku nadal
+działa i pokazuje `requirements_needed`; `doctor` i `verify` nie wymagają kryteriów.
+Przykład minimalnego kryterium semantycznego:
+
+```toml
+requirements_version = 1
+[[criteria]]
+id = "error-handling"
+description = "Błąd odczytu konfiguracji jest zwracany wywołującemu bez paniki"
+kind = "semantic"
+verification = "Obaj recenzenci sprawdzają ścieżkę błędu, wywołania i testy"
+```
+
+Pełny przykład mechaniczny i semantyczny jest w
+[`examples/task-requirements.toml`](examples/task-requirements.toml).
+`bb-workflow plan "Zadanie" --requirements task.toml` sprawdza powiązanie z pełnym gate,
+bez wywołań modeli. Ścieżka pliku wymagań jest względem katalogu polecenia; `--repo` jej nie zmienia.
 
 Po `run` zanotuj wypisaną ścieżkę katalogu przebiegu. Obejrzyj wynik, logi i zmiany:
 
@@ -102,9 +121,40 @@ Dotyczy to również zagnieżdżonego komunikatu Codex `model rerouted`. Plik `a
 
 Pole `prepare` zawiera polecenia, które mogą zmieniać pliki przed kontrolami. Szablon tworzony przez `init` zawiera `cargo check --workspace --all-targets`: przygotowuje `Cargo.lock` i pliki generowane przez budowanie przed zamrożeniem źródeł. Etap działa przed kontrolami bazowymi i po każdej implementacji lub naprawie. Pole pominięte w dowolnej konfiguracji oznacza pustą listę; tak samo `Config()` zachowuje pustą listę, aby utrzymać dotychczasowe zachowanie API. Można też jawnie ustawić `prepare = []`.
 
-Po `prepare` program zapamiętuje identyfikator źródeł. Dla v2 brak `checks` oznacza domyślnie `cargo fmt --all -- --check`, `cargo check --workspace --all-targets --locked`, `cargo test --workspace --all-targets --locked`, osobne `cargo test --workspace --doc --locked` oraz `cargo clippy --workspace --all-targets --locked -- -D warnings`. Plik bez `config_version` oznacza v1; jawna wersja 1 także jest obsługiwana. W v1 brak `checks` zachowuje fallback API `Config().checks`: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne polecenia `checks` z szablonu zawierają `--locked` i pozostają niezmienione. Jawnie podane `checks` pozostają bez zmian niezależnie od wersji; nieznana wersja konfiguracji jest odrzucana.
+Po `prepare` program zapamiętuje identyfikator źródeł. Dla v2 i v3 brak `checks` oznacza domyślnie `cargo fmt --all -- --check`, `cargo check --workspace --all-targets --locked`, `cargo test --workspace --all-targets --locked`, osobne `cargo test --workspace --doc --locked` oraz `cargo clippy --workspace --all-targets --locked -- -D warnings`. Plik bez `config_version` oznacza v1; jawna wersja 1 także jest obsługiwana. W v1 brak `checks` zachowuje dawny fallback: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne polecenia `checks` z szablonu zawierają `--locked` i pozostają niezmienione. Jawnie podane `checks` pozostają bez zmian niezależnie od wersji; nieznana wersja konfiguracji jest odrzucana.
 
-Aby przejść na pełny zakres v2, ustaw `config_version = 2` i świadomie zastąp albo usuń własne `checks`. Samo podbicie wersji zachowuje jawne polecenia. Nie włączaj automatycznie `--all-features`; wybierz konfiguracje features zgodnie ze wspieranymi wariantami projektu. Wyniki oraz recenzje odnoszą się do tej samej wersji plików. **Zmiana źródeł podczas kontroli unieważnia wyniki i zatrzymuje przebieg przed recenzjami**; generatory i formatowanie zapisujące pliki należy przenieść do `prepare`. Wykluczone artefakty budowania mogą się zmieniać. Polecenia w `prepare` i `checks` to listy argumentów, bez składni powłoki. Kontrole bazowe pokazują zastane problemy; **przejście kandydata przez kontrole jest obowiązkowe**. Zaufaj tylko komendom z własnego `workflow.toml`: są uruchamiane z uprawnieniami użytkownika.
+Aby przejść na v3 z kryteriami, ustaw `config_version = 3` i podaj plik przez `--requirements`. Aby jednocześnie przyjąć pełne domyślne kontrole, świadomie zastąp albo usuń własne `checks`. Samo podbicie wersji zachowuje jawne polecenia. Nie włączaj automatycznie `--all-features`; wybierz konfiguracje features zgodnie ze wspieranymi wariantami projektu. Wyniki oraz recenzje odnoszą się do tej samej wersji plików. **Zmiana źródeł podczas kontroli unieważnia wyniki i zatrzymuje przebieg przed recenzjami**; generatory i formatowanie zapisujące pliki należy przenieść do `prepare`. Wykluczone artefakty budowania mogą się zmieniać. Polecenia w `prepare` i `checks` to listy argumentów, bez składni powłoki. Kontrole bazowe pokazują zastane problemy; **przejście kandydata przez kontrole jest obowiązkowe**. Zaufaj tylko komendom z własnego `workflow.toml`: są uruchamiane z uprawnieniami użytkownika.
+
+### Kryteria odbioru i zgodność
+
+Pliki v1/v2 bez `--requirements` zachowują dotychczasowy protokół i jawny tryb `legacy`.
+Nie zapewniają odbioru kryteriów. Podanie pliku wymagań w v1/v2 włącza ten sam protokół v2
+co v3; błędny plik, odpowiedź lub powiązanie zatrzymuje przebieg bez powrotu do trybu zgodności.
+Jawne `checks` pozostają niezmienione we wszystkich trzech wersjach. Brak wersji oznacza v1.
+
+Każde kryterium ma unikalne `id`, `description`, `kind` i niepusty opis `verification`.
+Mechaniczne wymaga `check_id` z `verification.gate_plan.checks` w `plan`; opcjonalne `test_name`
+wskazuje dokładną nazwę testu Cargo. Semantyczne nie przyjmuje `check_id` ani `test_name`.
+Kontrola mechaniczna nie zawęża gate. Dla bezpośredniego `cargo test` także kryterium bez nazwy
+wymaga co najmniej jednego rzeczywiście zaliczonego, nieignorowanego testu. Zero przypadków,
+`--no-run` i `--list` nie stanowią dowodu; nieznany format wyniku blokuje odbiór. Dla własnych
+poleceń nietestowych dowodem jest poprawne, niezmieniające źródeł zakończenie zaufanej komendy.
+Pełne stdout/stderr są zachowane i służą do oceny testów, nawet gdy kontekst pokazuje tylko skrót.
+
+Program zapisuje znormalizowane `requirements.json` i `verification_plan.json` przed implementacją.
+Zamraża konfigurację oraz pełny plan; edycja pliku kryteriów lub konfiguracji w trakcie przebiegu
+nie zmienia przyjętego kontraktu. Każdy wynik ma powiązanie `candidate_id`, `requirements_id`,
+`verification_plan_id`. Implementer i Fixer podają wyłącznie propozycje dowodów dla wejściowej
+migawki. Obaj niezależni recenzenci oceniają wszystkie kryteria semantyczne. Każda ocena inna niż
+obustronne `satisfied` trafia do triage, również bez ustaleń kodowych. Nierozstrzygnięte kryterium
+blokuje sukces, a potwierdzone niespełnienie kieruje do ograniczonego Fixera niezależnie od
+`blocking_severities`. Po naprawie cały gate i oba review powtarzają się dla nowego kandydata.
+Triage nie może nadpisać mechanicznej porażki.
+
+`state.json` zawiera `acceptance.mode`, hashe i `acceptance.rounds` z wynikami mechanicznymi,
+niezależnymi ocenami i triage. Raport i `status --summary` ujawniają tryb oraz hashe. Rozbudowany
+raport końcowy i dodatkowa kontrola powiązania odbioru przez `apply` należą do etapu 5;
+obecne jawne `apply` zachowuje dotychczasowe kontrole manifestów.
 
 ### Weryfikacja bez agentów
 

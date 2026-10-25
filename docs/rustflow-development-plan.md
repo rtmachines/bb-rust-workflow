@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etapy 1–2 zaimplementowane i zweryfikowane; etapy 3–5 do realizacji
+Status: etapy 1–2 zaimplementowane i zweryfikowane; etap 4 zaimplementowany na osobnej gałęzi; etapy 3 i 5 niezależnie do realizacji
 
 ## Cel i zachowane gwarancje
 
@@ -23,7 +23,7 @@ Najpierw uzupełniamy domyślny zestaw:
 
 Szablon tworzony przez `init` zawiera `prepare = [["cargo", "check", "--workspace", "--all-targets"]]`, uruchamiane przed zamrożeniem źródeł. Pominięte pole `prepare` oznacza pustą listę we wszystkich wersjach konfiguracji, podobnie jak `Config()` zachowuje pustą listę dla zgodności API. Każda późniejsza zmiana źródeł unieważnia kontrolę.
 
-Konfiguracja szablonu ma `config_version = 2`. Brak pola oznacza wersję 1; jawna wersja 1 jest również obsługiwana, a inne nieznane wersje są odrzucane. Jeśli `checks` nie podano, v2 używa powyższego pełnego zestawu, a v1 zachowuje dotychczasowy fallback `Config().checks`: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne komendy z szablonu zawierają `--locked` i pozostają bez zmian. W obu wersjach jawne `checks` pozostają dokładnie takie, jak skonfigurował użytkownik.
+Etap 1 wprowadził `config_version = 2`; od etapu 4 szablon i `Config()` mają wersję 3. Brak pola oznacza wersję 1; jawna wersja 1 jest również obsługiwana, a inne nieznane wersje są odrzucane. Jeśli `checks` nie podano, v2 i v3 używają powyższego pełnego zestawu, a v1 zachowuje dawny fallback: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne komendy z szablonu zawierają `--locked` i pozostają bez zmian. We wszystkich obsługiwanych wersjach jawne `checks` pozostają dokładnie takie, jak skonfigurował użytkownik.
 
 Migracja do pełnego zakresu v2 wymaga ustawienia `config_version = 2` oraz świadomego zastąpienia lub usunięcia jawnego `checks`; samo podbicie wersji nie zmienia tych poleceń. Nie włączamy automatycznie `--all-features`. `plan` pokazuje wersję, tryb zgodności, zakres i dokładne komendy. Zmiany obejmują [szablon konfiguracji](../src/bb_workflow/default.toml) i [wartości domyślne w kodzie](../src/bb_workflow/config.py).
 
@@ -86,6 +86,9 @@ Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego fo
 
 ## 4. Jawne kryteria odbioru powiązane z dowodami
 
+**Status: implementacja etapu 4 gotowa; weryfikacja opisana poniżej. Etap 3 nie jest zależnością.**
+
+
 Dodajemy plik wymagań przekazywany do `run`, np.:
 
 ```text
@@ -114,6 +117,37 @@ Triage nie może nadpisać nieudanego wyniku kontroli mechanicznej. Przefiltrowa
 Rozszerzenie wymaga wersjonowanego schematu odpowiedzi — obecny [protokół](../src/bb_workflow/protocol.py) odrzuca nieoczekiwane pola. Nowe konfiguracje wymagają niepustych kryteriów; stare działają w wyraźnie oznaczonym trybie zgodności, bez deklarowania nowych gwarancji.
 
 **Odbiór etapu:** brak oceny kryterium, nieznany identyfikator, nieaktualny dowód lub pozytywna deklaracja implementera nie pozwalają zakończyć zadania sukcesem.
+
+**Implementacja:** plik TOML `requirements_version = 1` zawiera niepuste `criteria` z unikalnym
+`id`, `description`, `kind` i wymaganym opisem `verification`. Mechaniczne kryterium wiąże
+`check_id` i opcjonalne dokładne `test_name` z całym, niezwężanym gate. Program wymaga aktualnego
+wyniku komendy; bezpośredni Cargo test zawsze wymaga dodatniej liczby zaliczonych nieignorowanych
+testów, a nazwany test również własnej zakończonej linii sukcesu. Nieznany harness pozostaje
+nierozstrzygnięty. Własne komendy nietestowe opierają się na zaufaniu do poprawnego zakończenia.
+
+V3 wymaga kryteriów w `run`. V1/v2 bez pliku zachowują jawny `legacy`; podanie pliku włącza
+protokół v2. `plan` obsługuje plik i raportuje brak wymaganych kryteriów; `verify` i `doctor`
+działają bez niego. Zamrożone kopie konfiguracji, wymagań i planu zapobiegają zmianie kontraktu
+w trakcie przebiegu. Znormalizowane pliki i hashe trafiają do katalogu audytu przed implementacją.
+Implementer/Fixer dostają powiązanie wejściowej migawki i mogą jedynie proponować dowody.
+Obaj recenzenci oceniają każdy semantyczny ID; każde inne zestawienie niż dwa `satisfied`
+uruchamia triage, także bez ustaleń kodowych. Brak oceny/ID/powiązania odrzuca odpowiedź.
+`unmet` kieruje do Fixera bez względu na `blocking_severities`, `unresolved` blokuje;
+nowy kandydat przechodzi cały gate i oba niezależne review od początku.
+
+Podstawowy stan i raport ujawniają tryb oraz hashe; szczegóły rund są w `acceptance.rounds`.
+Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` pozostają etapem 5.
+Przykład: [`task-requirements.toml`](../examples/task-requirements.toml); demo offline używa
+rzeczywistych kontroli Cargo i jawnie oznaczonych atrap ocen semantycznych.
+
+**Weryfikacja lokalna etapu 4 (2026-10-25):** pełny zestaw na Python 3.14 wykonał
+303 testy: 301 zaliczonych, 2 testy natywnych junctions Windows pominięte na Linux.
+24 testy integracji odbioru oraz 19 konfiguracji i 13 CLI przeszły także na Python 3.11.
+Sześć regresji Cargo używa rzeczywistych poleceń offline; nowa porównuje poprawne zakończenie
+z zerem dopasowanych przypadków (kryterium `unmet`) i dokładny zaliczony test (`satisfied`).
+Demo z plikiem kryteriów przeszło pełny gate offline. Ruff przez lokalny reviewdog, formatowanie
+i kontrola diffu są poprawne. Niezależny przegląd etapu i całej gałęzi pozostaje do wykonania.
+Nie uruchamiano płatnych sesji dostawców.
 
 ## 5. Raportowanie, integracja z apply i odbiór całości
 

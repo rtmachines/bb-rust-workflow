@@ -1,6 +1,6 @@
 # Claude model IDs checked against official Claude Code documentation on 2026-10-25.
 # Auto complexity is a recommendation heuristic, not a guarantee; choose explicitly when needed.
-config_version = 2
+config_version = 3
 blocking_severities = ["critical", "high", "medium"]
 prepare = [["cargo", "check", "--workspace", "--all-targets"]] # Resolve Cargo.lock and generated files before freezing sources.
 checks = [["cargo", "fmt", "--all", "--", "--check"], ["cargo", "check", "--workspace", "--all-targets", "--locked"], ["cargo", "test", "--workspace", "--all-targets", "--locked"], ["cargo", "test", "--workspace", "--doc", "--locked"], ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]]

@@ -66,6 +66,7 @@ class EngineTests(unittest.TestCase):
         (self.repo / "src/lib.rs").write_text(self.original, encoding="utf-8")
         self.config = replace(
             load_config(),
+            config_version=2,
             prepare=[],
             checks=[["fixture-check", "--strict"]],
             max_cycles=2,
@@ -132,6 +133,17 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         self.assertEqual((self.repo / "src/lib.rs").read_text(), self.original)
         return flow, state
+
+    def test_old_config_without_requirements_retains_v1_schema_and_explicit_legacy_mode(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                flow, state = self.run_workflow(config=replace(self.config, config_version=version))
+                self.assertEqual(state["status"], "succeeded", state["reason"])
+                self.assertEqual(state["acceptance"]["mode"], "legacy")
+                self.assertTrue(state["acceptance"]["compatibility_mode"])
+                self.assertEqual(state["acceptance"]["rounds"], [])
+                self.assertEqual(self.calls[-1]["schema"], RESPONSE_SCHEMA)
+                self.assertIn("legacy", (flow.run_dir / "report.md").read_text())
 
     def test_every_gate_variant_precedes_independent_reviews(self):
         verification = VerificationConfig()
