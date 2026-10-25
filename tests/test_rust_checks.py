@@ -12,9 +12,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bb_workflow.backends import BackendResult
-from bb_workflow.config import load_config
+from bb_workflow.config import (
+    VerificationConfig,
+    VerificationProfile,
+    VerificationVariant,
+    load_config,
+)
 from bb_workflow.engine import Workflow
 from bb_workflow.process import run_process
+from bb_workflow.verification import verify_repository
 from bb_workflow.workspace import manifest, snapshot_id
 
 
@@ -98,6 +104,54 @@ class RustChecksTests(unittest.TestCase):
         self.assertFalse((self.repo / "Cargo.lock").exists())
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         return flow, state
+
+    def test_standalone_gate_executes_real_offline_feature_variants(self):
+        package = self.repo / "selected/Cargo.toml"
+        package.write_text(package.read_text() + "\n[features]\nextra = []\n", encoding="utf-8")
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[cfg(all(test, feature = "extra"))]\n#[test]\nfn extra_enabled() { assert_eq!(value(), 1); }\n',
+            encoding="utf-8",
+        )
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(
+            features=("extra",), no_default_features=True
+        )
+        config = replace(
+            self.config,
+            verification=verification,
+            checks=[["cargo", "test", "--workspace", "--all-targets", "--locked"]],
+        )
+        _, report = verify_repository(self.repo, config, "gate")
+        self.assertEqual(report["status"], "passed", report["reason"])
+        self.assertEqual([r["variant"] for r in report["results"]], ["default", "feature"])
+        self.assertNotIn("extra_enabled", report["results"][0]["stdout_tail"])
+        self.assertIn("extra_enabled ... ok", report["results"][1]["stdout_tail"])
+        self.assertTrue(report["source_unchanged"])
+
+    def test_standalone_focused_limits_real_package_and_test_filter(self):
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[test]\nfn needle_case() { assert_eq!(value(), 1); }\n#[test]\nfn unrelated_case() { panic!("must be filtered"); }\n',
+            encoding="utf-8",
+        )
+        (self.repo / "extra/src/lib.rs").write_text(
+            'compile_error!("outside chosen package");\n', encoding="utf-8"
+        )
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        _, report = verify_repository(
+            self.repo, self.config, "focused", package="selected", test_filter="needle"
+        )
+        self.assertEqual(report["status"], "passed", report["reason"])
+        self.assertIn("needle_case ... ok", report["results"][1]["stdout_tail"])
+        self.assertIn("1 filtered out", report["results"][1]["stdout_tail"])
+        self.assertTrue(report["source_unchanged"])
 
     def test_error_outside_default_members_blocks_success(self):
         # Isolate validation coverage; the healthy control exercises the default prepare.
