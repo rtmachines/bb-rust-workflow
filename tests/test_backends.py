@@ -2,6 +2,7 @@
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -217,6 +218,60 @@ class BackendTests(unittest.TestCase):
         with self.assertRaisesRegex(BackendError, "Cannot start"):
             self.invoke()
         self.assertTrue((self.artifacts / "command.json").exists())
+
+    def test_interrupted_provider_retains_raw_logs_and_measured_or_unknown_audit(self):
+        from bb_workflow.process import _OutputCapture, run_process
+
+        cases = (
+            (
+                "claude",
+                '{"usage":{"input_tokens":7},"total_cost_usd":0.02,"model":"exact-model"}',
+                {"input_tokens": 7},
+                0.02,
+            ),
+            (
+                "codex",
+                '{"type":"turn.completed","usage":{"input_tokens":9},"model":"exact-model"}\n{"partial":',
+                {"input_tokens": 9},
+                None,
+            ),
+            ("codex", '{"type":"turn.started"}\n{"partial":', {}, None),
+        )
+        original_drain = _OutputCapture.drain
+        for backend, stdout, usage, cost in cases:
+            interrupted = False
+
+            def drain(capture):
+                nonlocal interrupted
+                active = original_drain(capture)
+                if (
+                    not interrupted
+                    and capture.stdout == stdout.encode()
+                    and capture.stderr == b"provider diagnostic"
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt("cancel provider")
+                return active
+
+            def provider(argv, **kwargs):
+                code = f"import os,time; os.write(1,{stdout.encode()!r}); os.write(2,b'provider diagnostic'); time.sleep(30)"
+                return run_process([sys.executable, "-c", code], **kwargs)
+
+            self.run.side_effect = provider
+            with (
+                self.subTest(backend=backend, usage=usage),
+                patch.object(_OutputCapture, "drain", drain),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                self.invoke(Selection(backend=backend))
+            self.assertEqual((self.artifacts / "stdout.txt").read_text(), stdout)
+            self.assertEqual((self.artifacts / "stderr.txt").read_text(), "provider diagnostic")
+            audit = json.loads((self.artifacts / "invocation.json").read_text())
+            self.assertEqual(audit["status"], "interrupted")
+            self.assertFalse(audit["retryable"])
+            self.assertEqual(audit["usage"], usage)
+            self.assertEqual(audit["cost_usd"], cost)
+            self.assertFalse((self.artifacts / "response.json").exists())
 
     def test_invalid_backend_role_tool_and_codex_mcp_fail_before_spawn(self):
         cases = (

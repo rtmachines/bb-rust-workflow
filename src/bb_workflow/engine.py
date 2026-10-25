@@ -10,9 +10,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-from .backends import BackendError, invoke
+from .backends import BackendError, BackendInterrupted, invoke
 from .config import Config, Selection, route
-from .process import run_process
+from .process import ProcessInterrupted, run_process
 from .protocol import RESPONSE_SCHEMA, merge_findings, resolve_triage, validate_response
 from .usage import normalize_usage, summarize_usage
 from .workspace import (
@@ -253,6 +253,7 @@ class Workflow:
             directory = self.run_dir / "checks" / label / str(index)
             directory.mkdir(parents=True)
             write_json(directory / "command.json", argv)
+            interrupted = None
             try:
                 result = self.process(
                     argv,
@@ -261,25 +262,30 @@ class Workflow:
                     env=snapshot_environment(),
                     max_output_bytes=self.config.max_output_bytes,
                 )
+            except ProcessInterrupted as exc:
+                interrupted = exc
+                result = exc.result
             except FileNotFoundError as exc:
                 raise WorkflowStop(
                     "blocked", f"Validation executable unavailable: {argv[0]}"
                 ) from exc
             (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8")
             (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8")
-            after = manifest(self.work, self.config.exclude)
-            unchanged = before == after
+            after = manifest(self.work, self.config.exclude) if interrupted is None else None
+            unchanged = before == after if after is not None else None
             record = {
                 "kind": "preparation" if preparing else "validation",
                 "snapshot_id": snapshot_id(before),
-                "result_snapshot_id": snapshot_id(after),
+                "result_snapshot_id": snapshot_id(after) if after is not None else None,
                 "source_unchanged": unchanged,
                 "command": argv,
                 "returncode": result.returncode,
                 "timed_out": result.timed_out,
                 "output_limit_exceeded": result.output_limit_exceeded,
                 "duration": result.duration,
-                "passed": result.returncode == 0
+                "interrupted": interrupted is not None,
+                "passed": interrupted is None
+                and result.returncode == 0
                 and not result.timed_out
                 and not result.output_limit_exceeded
                 and (preparing or unchanged),
@@ -296,6 +302,8 @@ class Workflow:
             results.append(record)
             self.state["checks"].append({"phase": label, **record})
             self._save()
+            if interrupted is not None:
+                raise interrupted
             if result.output_limit_exceeded:
                 raise WorkflowStop(
                     "failed",
@@ -369,10 +377,12 @@ class Workflow:
                     executable=self.config.executables[selection.backend],
                     max_output_bytes=self.config.max_output_bytes,
                 )
-            except BackendError as exc:
+            except (BackendError, BackendInterrupted) as exc:
                 record.update(
-                    status="failed",
-                    error=str(exc),
+                    status="interrupted" if isinstance(exc, BackendInterrupted) else "failed",
+                    error="Interrupted by user"
+                    if isinstance(exc, BackendInterrupted)
+                    else str(exc),
                     observed_model=exc.observed_model,
                     retryable=exc.retryable,
                     cost_usd=exc.cost_usd,
@@ -380,6 +390,8 @@ class Workflow:
                     token_usage=normalize_usage(selection.backend, exc.usage),
                 )
                 self._save()
+                if isinstance(exc, BackendInterrupted):
+                    raise
                 if frozen is not None and manifest(directory, self.config.exclude) != frozen:
                     raise WorkflowStop(
                         "failed", f"Read-only agent {role} changed its snapshot"

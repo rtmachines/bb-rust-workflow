@@ -124,7 +124,9 @@ Kopie robocze zapewniają izolację zmian funkcjonalnych, **nie są piaskownicą
 
 Przerwanego przebiegu nie da się automatycznie wznowić. Zachowaj jego `state.json`, raport i logi do ręcznej analizy; kolejny `run` tworzy nową migawkę. Jeśli pozostanie `.bb-workflow/lock`, **najpierw sprawdź, że żaden proces workflow nie działa**, a dopiero potem usuń plik blokady ręcznie. Recenzenci dostają oddzielne kopie tego samego kandydata i oddzielne procesy, wywoływane kolejno w celu kontroli budżetu. To nie jest pełna izolacja całego systemu.
 
-Jeśli projekt zawiera dowiązania w `.claude/skills`, można dodać `exclude = [".claude/skills"]` i wskazać rzeczywiste pliki z `.agents/skills` w konfiguracji ról. Katalogi wykluczone nie są przenoszone do kopii ani objęte porównaniem przy `apply`; wymagane do budowania zasoby muszą znaleźć się w migawce. MVP nie obsługuje zmiany pliku w katalog lub odwrotnie podczas `apply`. Kopie zachowują puste katalogi, lecz `apply` synchronizuje wyłącznie pliki; zmiany samych pustych katalogów nie są przenoszone.
+Jeśli projekt zawiera dowiązania w `.claude/skills`, można dodać `exclude = [".claude/skills"]` i wskazać rzeczywiste pliki z `.agents/skills` w konfiguracji ról. Katalogi wykluczone nie są przenoszone do kopii ani objęte porównaniem przy `apply`; wymagane do budowania zasoby muszą znaleźć się w migawce. Nazwy plików i katalogów zawierające `:` lub `\` są odrzucane już podczas tworzenia migawki, także na Linux/macOS. Zmień takie nazwy albo jawnie wyklucz zbędne zasoby, zanim uruchomisz workflow. MVP nie obsługuje zmiany pliku w katalog lub odwrotnie podczas `apply`. Kopie zachowują puste katalogi, lecz `apply` synchronizuje wyłącznie pliki; zmiany samych pustych katalogów nie są przenoszone.
+
+Przerwanie procesu przez Ctrl+C zachowuje zebrane do tego momentu stdout i stderr w katalogu jego artefaktów. Dotyczy to dostawców oraz poleceń przygotowania i kontroli; przebieg nadal kończy się jako `interrupted`. Audyt wywołania dostawcy zapisuje status przerwania i dostępne pomiary, które mogą być częściowe.
 
 ## Testy i przykład
 

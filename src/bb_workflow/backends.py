@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .process import run_process
+from .process import ProcessInterrupted, run_process
 from .workspace import snapshot_environment
 
 
@@ -41,6 +41,18 @@ class BackendError(RuntimeError):
         self.retryable = retryable
         self.cost_usd = cost_usd
         self.usage = dict(usage) if usage is not None else {}
+
+
+class BackendInterrupted(ProcessInterrupted):
+    """Provider cancellation retaining measured invocation evidence."""
+
+    def __init__(self, interrupted: ProcessInterrupted, audit: dict) -> None:
+        super().__init__(interrupted.result, *interrupted.args)
+        self.requested_model = audit["requested_model"]
+        self.observed_model = audit["observed_models"][-1] if audit["observed_models"] else None
+        self.retryable = False
+        self.cost_usd = audit["cost_usd"]
+        self.usage = dict(audit["usage"])
 
 
 @dataclass(frozen=True)
@@ -368,6 +380,7 @@ def invoke(
                 "max_output_bytes": max_output_bytes,
             },
         )
+        interrupted = None
         try:
             result = run_process(
                 argv,
@@ -377,11 +390,18 @@ def invoke(
                 env=snapshot_environment(),
                 max_output_bytes=max_output_bytes,
             )
+        except ProcessInterrupted as exc:
+            interrupted = exc
+            result = exc.result
         except OSError as exc:
             raise BackendError(f"Cannot start {selection.backend}: {exc}", retryable=False) from exc
         (artifact_dir / "stdout.txt").write_text(result.stdout, encoding="utf-8")
         (artifact_dir / "stderr.txt").write_text(result.stderr, encoding="utf-8")
         audit.update(_invocation_evidence(result.stdout, selection.backend))
+        if interrupted is not None:
+            audit.update(status="interrupted", error="Interrupted by user", retryable=False)
+            _write_json(artifact_dir / "invocation.json", audit)
+            raise BackendInterrupted(interrupted, audit) from interrupted
         if result.output_limit_exceeded:
             raise BackendError(
                 f"{selection.backend} exceeded the output byte limit", retryable=False

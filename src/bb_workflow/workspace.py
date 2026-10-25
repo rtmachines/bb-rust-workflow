@@ -74,6 +74,22 @@ def _excluded(relative: str, exclude: tuple[str, ...]) -> bool:
     return excluded
 
 
+def _validate_relative_path(relative: str, exclude: tuple[str, ...] | None = None) -> None:
+    """Reject relative paths that cannot be represented portably by apply."""
+    if (
+        not relative
+        or "\\" in relative
+        or ":" in relative
+        or "\0" in relative
+        or relative.startswith("/")
+        or any(part in {"", ".", ".."} for part in relative.split("/"))
+        or (exclude is not None and _excluded(relative, exclude))
+    ):
+        raise WorkspaceError(
+            f"unsupported or excluded relative path {relative!r}; rename it or exclude it explicitly"
+        )
+
+
 def _reparse_point(info: os.stat_result) -> bool:
     return bool(
         getattr(info, "st_file_attributes", 0)
@@ -162,11 +178,13 @@ def _scan(root: Path, exclude: tuple[str, ...]) -> tuple[dict[str, str], set[str
                 )
             if stat.S_ISDIR(info.st_mode):
                 if not excluded:
+                    _validate_relative_path(relative)
                     directories.add(relative)
                 walk(path)
             elif excluded:
                 continue
             elif stat.S_ISREG(info.st_mode):
+                _validate_relative_path(relative)
                 result[relative] = _file_hash(path)
             else:
                 raise WorkspaceError(
@@ -385,17 +403,9 @@ def _read_manifest(path: Path, exclude: tuple[str, ...]) -> dict[str, str]:
     if not isinstance(value, dict):
         raise WorkspaceError(f"manifest must be an object: {path}")
     for relative, digest in value.items():
-        if (
-            not isinstance(relative, str)
-            or not relative
-            or "\\" in relative
-            or ":" in relative
-            or "\0" in relative
-            or relative.startswith("/")
-            or any(part in {"", ".", ".."} for part in relative.split("/"))
-            or _excluded(relative, exclude)
-        ):
-            raise WorkspaceError(f"invalid or excluded manifest path: {relative!r}")
+        if not isinstance(relative, str):
+            raise WorkspaceError(f"invalid manifest path: {relative!r}")
+        _validate_relative_path(relative, exclude)
         if (
             not isinstance(digest, str)
             or len(digest) != 64
