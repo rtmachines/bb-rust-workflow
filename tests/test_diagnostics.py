@@ -2,9 +2,12 @@
 
 import copy
 import json
+import ntpath
 import unittest
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from bb_workflow.diagnostics import (
     DiagnosticContext,
@@ -13,7 +16,7 @@ from bb_workflow.diagnostics import (
     summarize_diagnostics,
 )
 
-ROOT = Path("/work/baseline")
+ROOT = Path("/work/baseline").resolve()
 CONTEXT = DiagnosticContext(
     profile="gate",
     variant="default",
@@ -240,7 +243,7 @@ class ParserTests(unittest.TestCase):
                 f'warning: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = "{root}/data";\n'
             )
 
-        other_root = Path("/scratch/candidate")
+        other_root = Path("/scratch/candidate").resolve()
         result = compare_diagnostics(
             parse("", text(other_root), root=other_root), parse("", text(ROOT))
         )
@@ -270,29 +273,29 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(suite["identity"])
 
     def test_external_paths_are_preserved_and_project_paths_rebased(self):
-        report = parse(cargo(path="/registry/dependency/src/lib.rs"))
-        self.assertEqual(
-            report["findings"][0]["locations"][0]["path"], "/registry/dependency/src/lib.rs"
-        )
-        external = parse(cargo(path="/work/baseline-other/src/lib.rs"))
-        self.assertEqual(
-            external["findings"][0]["locations"][0]["path"], "/work/baseline-other/src/lib.rs"
-        )
+        for path in (
+            ROOT.parent.parent / "registry/dependency/src/lib.rs",
+            ROOT.with_name(ROOT.name + "-other") / "src/lib.rs",
+        ):
+            with self.subTest(path=path):
+                report = parse(cargo(path=str(path)))
+                self.assertEqual(report["findings"][0]["locations"][0]["path"], str(path))
 
     def test_relative_external_paths_keep_absolute_dependency_identity(self):
         record = diagnostic()
         record["spans"][0]["file_name"] = "../dependency/src/lib.rs"
         report = parse(json.dumps(record))
         self.assertEqual(
-            report["findings"][0]["locations"][0]["path"], "/work/dependency/src/lib.rs"
+            report["findings"][0]["locations"][0]["path"],
+            str(ROOT.parent / "dependency/src/lib.rs"),
         )
 
     def test_root_paths_in_source_labels_match_between_snapshots(self):
-        other_root = Path("/scratch/candidate")
+        other_root = Path("/scratch/candidate").resolve()
         left = diagnostic()
-        left["spans"][0]["label"] = "declared in /work/baseline/src/lib.rs"
+        left["spans"][0]["label"] = f"declared in {ROOT / 'src/lib.rs'}"
         right = diagnostic(other_root)
-        right["spans"][0]["label"] = "declared in /scratch/candidate/src/lib.rs"
+        right["spans"][0]["label"] = f"declared in {other_root / 'src/lib.rs'}"
         result = compare_diagnostics(
             parse(json.dumps(right), root=other_root), parse(json.dumps(left))
         )
@@ -314,6 +317,66 @@ class ParserTests(unittest.TestCase):
         self.assertTrue(report["execution"]["successful"])
 
 
+class WindowsPathTests(unittest.TestCase):
+    def setUp(self):
+        # The parser only needs lexical paths, so exercise Windows semantics on any host.
+        self.enterContext(patch("bb_workflow.diagnostics.Path", PureWindowsPath))
+        self.enterContext(patch("bb_workflow.diagnostics.os", SimpleNamespace(path=ntpath)))
+        self.baseline_root = PureWindowsPath("D:/work/baseline")
+        self.current_root = PureWindowsPath("E:/scratch/candidate")
+
+    def report(self, root, root_text, *, suffix="\\data", external=None):
+        record = diagnostic(root, anchor=f'let x = "{root_text}{suffix}";')
+        record["message"] = f"warning in {root_text}{suffix}"
+        record["spans"][0]["label"] = f"declared in {root_text}{suffix}"
+        if external is not None:
+            record["spans"][0]["file_name"] = external
+        context = replace(
+            CONTEXT, argv=("cargo", "check", f"--manifest-path={root_text}\\Cargo.toml")
+        )
+        return parse(json.dumps(record), root=root, context=context)
+
+    def test_native_windows_roots_match_in_text_and_manifest_arguments(self):
+        baseline = self.report(self.baseline_root, str(self.baseline_root))
+        current = self.report(self.current_root, str(self.current_root))
+        result = compare_diagnostics(current, baseline)
+        self.assertEqual(result["counts"]["persistent"], 1)
+        self.assertEqual(current["context"]["comparison_argv"][-1], "--manifest-path=.\\Cargo.toml")
+        self.assertEqual(current["findings"][0]["locations"][0]["source"], 'let x = ".\\data";')
+
+    def test_windows_roots_accept_forward_and_mixed_separators(self):
+        baseline = self.report(self.baseline_root, str(self.baseline_root))
+        for root_text in ("E:/scratch/candidate", "E:/scratch\\candidate"):
+            with self.subTest(root_text=root_text):
+                current = self.report(self.current_root, root_text)
+                self.assertEqual(compare_diagnostics(current, baseline)["counts"]["persistent"], 1)
+
+    def test_windows_external_dependency_paths_keep_drive_and_full_identity(self):
+        for path, expected in (
+            ("D:/registry/dependency/src/lib.rs", "D:\\registry\\dependency\\src\\lib.rs"),
+            ("../dependency/src/lib.rs", "D:\\work\\dependency\\src\\lib.rs"),
+            ("D:/work/baseline-other/src/lib.rs", "D:\\work\\baseline-other\\src\\lib.rs"),
+        ):
+            with self.subTest(path=path):
+                report = self.report(self.baseline_root, str(self.baseline_root), external=path)
+                self.assertEqual(report["findings"][0]["locations"][0]["path"], expected)
+
+    def test_windows_root_text_does_not_rebase_other_paths(self):
+        for text in (
+            "D:\\work\\baseline-other\\data",
+            "D:\\work\\baseline.rs",
+            "X:\\prefix\\D:\\work\\baseline\\data",
+        ):
+            with self.subTest(text=text):
+                record = diagnostic(self.baseline_root, anchor=text, message=text)
+                record["spans"][0]["label"] = text
+                report = parse(json.dumps(record), root=self.baseline_root)
+                finding = report["findings"][0]
+                self.assertEqual(finding["message"], text)
+                self.assertEqual(finding["locations"][0]["source"], text)
+                self.assertEqual(finding["locations"][0]["label"], text)
+
+
 class ComparisonTests(unittest.TestCase):
     def test_no_baseline_is_unclassified_with_all_classification_lists(self):
         compared = compare_diagnostics(parse(cargo()), None)
@@ -327,7 +390,7 @@ class ComparisonTests(unittest.TestCase):
 
     def test_changed_roots_and_lines_match_without_local_package_url(self):
         baseline = parse(cargo())
-        new_root = Path("/scratch/candidate")
+        new_root = Path("/scratch/candidate").resolve()
         current = parse(cargo(new_root, line=100), root=new_root)
         compared = compare_diagnostics(current, baseline)
         self.assertEqual(compared["counts"]["persistent"], 1)
@@ -522,17 +585,17 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result["counts"]["resolved"], 0)
 
     def test_absolute_manifest_arguments_compare_across_project_roots(self):
-        other_root = Path("/scratch/candidate")
+        other_root = Path("/scratch/candidate").resolve()
         baseline_context = replace(
-            CONTEXT, argv=("cargo", "check", "--manifest-path=/work/baseline/Cargo.toml")
+            CONTEXT, argv=("cargo", "check", f"--manifest-path={ROOT / 'Cargo.toml'}")
         )
         current_context = replace(
-            CONTEXT, argv=("cargo", "check", "--manifest-path=/scratch/candidate/Cargo.toml")
+            CONTEXT, argv=("cargo", "check", f"--manifest-path={other_root / 'Cargo.toml'}")
         )
         baseline = parse(cargo(), context=baseline_context)
         current = parse(cargo(other_root, line=99), root=other_root, context=current_context)
         self.assertEqual(
-            current["context"]["argv"][-1], "--manifest-path=/scratch/candidate/Cargo.toml"
+            current["context"]["argv"][-1], f"--manifest-path={other_root / 'Cargo.toml'}"
         )
         self.assertEqual(compare_diagnostics(current, baseline)["counts"]["persistent"], 1)
 

@@ -4,10 +4,9 @@ import json
 import os
 import sys
 import tempfile
-import time
 import unittest
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest.mock import patch
 
 from bb_workflow import verification
@@ -409,17 +408,42 @@ class ExecutionTests(unittest.TestCase):
         self.assertEqual(report["status"], "failed")
         self.assertFalse(report["source_unchanged"])
 
+        now = 0.0
+
         def slow(*args, **kwargs):
-            time.sleep(0.02)
+            nonlocal now
+            now += 0.02
             return ProcessResult(0, "", "", 0.02)
 
         config = replace(self.config, max_seconds=0.01)
-        directory, report = verification.verify_repository(
-            self.repo, config, "gate", process_fn=slow
-        )
+        # Setup time must not decide whether the fixture command launches.
+        with patch("bb_workflow.verification.time.monotonic", side_effect=lambda: now):
+            directory, report = verification.verify_repository(
+                self.repo, config, "gate", process_fn=slow
+            )
         self.assertEqual(report["status"], "budget_exhausted")
         self.assertEqual(len(report["results"]), 1)
         self.assertTrue((directory / "report.json").exists())
+
+    def test_standalone_budget_exhausted_before_launch_has_no_command_results(self):
+        config = replace(self.config, max_seconds=0.01)
+        clock = iter((0.0, 0.02))
+
+        def must_not_launch(*args, **kwargs):
+            self.fail("A command launched after the global budget was exhausted")
+
+        with patch(
+            "bb_workflow.verification.time.monotonic", side_effect=lambda: next(clock, 0.02)
+        ):
+            directory, report = verification.verify_repository(
+                self.repo, config, "gate", process_fn=must_not_launch
+            )
+        self.assertEqual(report["status"], "budget_exhausted")
+        self.assertEqual(report["results"], [])
+        self.assertTrue(report["source_unchanged"])
+        self.assertEqual(
+            json.loads((directory / "report.json").read_text())["status"], "budget_exhausted"
+        )
 
 
 if __name__ == "__main__":
@@ -793,9 +817,40 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
 
         other_root = self.repo / "other-root"
         other_root.mkdir()
+        left = configuration(self.repo, self.config, {"RUSTFLAGS": f"-L {self.repo}{os.sep}lib"})
+        right = configuration(other_root, self.config, {"RUSTFLAGS": f"-L {other_root}{os.sep}lib"})
+        self.assertEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])
         left = configuration(self.repo, self.config, {"RUSTFLAGS": str(self.repo) + "-external"})
         right = configuration(other_root, self.config, {"RUSTFLAGS": str(other_root) + "-external"})
         self.assertNotEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])
+
+    def test_environment_digest_normalizes_native_windows_roots_and_keeps_path_boundaries(self):
+        from bb_workflow.verification_metadata import _environment_digest
+
+        baseline = PureWindowsPath(r"C:\baseline")
+        candidate = PureWindowsPath(r"D:\candidate")
+        for left, right in (
+            (r"-L C:\baseline\lib", r"-L D:\candidate\lib"),
+            (r"-L C:/baseline\lib", r"-L D:/candidate\lib"),
+            (r'"C:\baseline\bin";C:\tools', r'"D:\candidate\bin";C:\tools'),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(
+                    _environment_digest(baseline, left), _environment_digest(candidate, right)
+                )
+        for left, right in (
+            (r"-L C:\baseline-external\lib", r"-L D:\candidate-external\lib"),
+            (r"-L Z:\other\C:\baseline\lib", r"-L Z:\other\D:\candidate\lib"),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertNotEqual(
+                    _environment_digest(baseline, left), _environment_digest(candidate, right)
+                )
+        # A backslash is a legal filename character on POSIX, not a separator.
+        self.assertNotEqual(
+            _environment_digest(PurePosixPath("/baseline"), r"-L /baseline\lib"),
+            _environment_digest(PurePosixPath("/candidate"), r"-L /candidate\lib"),
+        )
 
     def test_external_and_excluded_selected_manifests_cannot_resolve(self):
         process, _ = self.cargo(stderr="warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n")
@@ -878,6 +933,89 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(captured["digest"])
         self.assertIn("member/Cargo.toml", captured["files"])
         self.assertIn("Cargo.lock", captured["files"])
+
+    def test_array_target_paths_outside_captured_source_make_scope_unknown(self):
+        from bb_workflow.verification_metadata import configuration
+
+        package = '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n'
+        manifest_file = self.repo / "Cargo.toml"
+        for reference in ("src/main.rs", "target/main.rs", "../shared/main.rs"):
+            if not reference.startswith(".."):
+                source = self.repo / reference
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text("fn main() {}\n")
+            for kind in ("bin", "test", "example", "bench"):
+                with self.subTest(kind=kind, reference=reference):
+                    manifest_file.write_text(
+                        package + f'[[{kind}]]\nname="fixture"\npath="{reference}"\n'
+                    )
+                    metadata = configuration(self.repo, self.config, {})
+                    if reference == "src/main.rs":
+                        self.assertIsNotNone(metadata["digest"], metadata["reasons"])
+                    else:
+                        self.assertIsNone(metadata["digest"])
+                        self.assertTrue(metadata["reasons"])
+
+    def test_explicit_build_script_must_be_inside_captured_source(self):
+        from bb_workflow.verification_metadata import configuration
+
+        manifest_file = self.repo / "Cargo.toml"
+        for value in (
+            '"scripts/build.rs"',
+            '"target/build.rs"',
+            '"../shared/build.rs"',
+            "true",
+            "false",
+        ):
+            with self.subTest(build=value):
+                if value.startswith(('"scripts/', '"target/')):
+                    source = self.repo / value.strip('"')
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    source.write_text("fn main() {}\n")
+                manifest_file.write_text(
+                    '[package]\nname="fixture"\nversion="0.1.0"\nbuild=' + value + "\n[workspace]\n"
+                )
+                metadata = configuration(self.repo, self.config, {})
+                if value in ('"scripts/build.rs"', "true", "false"):
+                    self.assertIsNotNone(metadata["digest"], metadata["reasons"])
+                else:
+                    self.assertIsNone(metadata["digest"])
+                    self.assertTrue(metadata["reasons"])
+
+    def test_cargo_configuration_path_overrides_leave_dependency_scope_unknown(self):
+        from bb_workflow.verification_metadata import configuration
+
+        (self.repo / "Cargo.toml").write_text(
+            '[package]\nname="fixture"\nversion="0.1.0"\n[workspace]\n'
+        )
+        directory = self.repo / ".cargo"
+        directory.mkdir()
+        config_file = directory / "config.toml"
+        with tempfile.TemporaryDirectory() as cargo_home:
+            for origin, path, env in (
+                ("local", config_file, {}),
+                ("ancestor", config_file, {}),
+                ("cargo-home", Path(cargo_home) / "config.toml", {"CARGO_HOME": cargo_home}),
+            ):
+                root = self.repo
+                if origin == "ancestor":
+                    root = self.repo / "member"
+                    root.mkdir()
+                    (root / "Cargo.toml").write_text(
+                        '[package]\nname="member"\nversion="0.1.0"\n[workspace]\n'
+                    )
+                for text in (
+                    'paths=["../shared"]\n',
+                    '[patch.crates-io]\nfoo={path="../../shared"}\n',
+                ):
+                    with self.subTest(origin=origin, configuration=text):
+                        path.write_text(text)
+                        metadata = configuration(root, self.config, env)
+                        self.assertTrue(metadata["files"])
+                        self.assertIsNone(metadata["digest"])
+                        self.assertIn("uncaptured_cargo_path_reference", metadata["reasons"])
+                path.write_text("paths=[]\n[build]\njobs=1\n")
+                self.assertIsNotNone(configuration(root, self.config, env)["digest"])
 
     def test_plain_cargo_test_probes_actual_rustdoc_and_changed_version_is_incomparable(self):
         from unittest.mock import patch
@@ -976,6 +1114,34 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
         )
         self.assertIsNone(metadata["digest"])
         self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+
+    def test_nul_manifest_scope_is_unknown_when_path_resolution_accepts_invalid_paths(self):
+        from bb_workflow.verification_metadata import configuration
+
+        original_resolve = Path.resolve
+
+        def permissive_resolve(path, *args, **kwargs):
+            # Some Windows/Python versions retain NUL under strict=False.
+            if "\0" in str(path):
+                return path
+            return original_resolve(path, *args, **kwargs)
+
+        manifest_file = self.repo / "Cargo.toml"
+        package = '[package]\nname="fixture"\nversion="0.1.0"\n'
+        cases = (
+            (package + '[dependencies]\nfoo={path="\\u0000"}\n', ("cargo", "check")),
+            (package + 'build="\\u0000"\n', ("cargo", "check")),
+            (package + '[[bin]]\nname="fixture"\npath="\\u0000"\n', ("cargo", "check")),
+            (package, ("cargo", "check", "--manifest-path=\0")),
+            (package, ("cargo", "check", "--manifest-path", "\0")),
+        )
+        for text, argv in cases:
+            with self.subTest(argv=argv, manifest=text):
+                manifest_file.write_text(text)
+                with patch.object(Path, "resolve", permissive_resolve):
+                    metadata = configuration(self.repo, self.config, {}, argv)
+                self.assertIsNone(metadata["digest"])
+                self.assertIn("unresolved_manifest_scope", metadata["reasons"])
 
     def test_uncaptured_dependency_directory_with_rs_suffix_cannot_resolve(self):
         from bb_workflow.verification_metadata import configuration

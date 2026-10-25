@@ -7,7 +7,7 @@ import json
 import re
 import time
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Callable
 
 from .config import Config
@@ -21,6 +21,18 @@ class MetadataError(RuntimeError):
 
 def _digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _environment_digest(root: PurePath, value: str) -> str:
+    prefix = re.escape(str(root))
+    before = r"(?<![\w./-])"
+    after = r"(?=/|[\s\"'`:;,=]|$)"
+    if root.drive:
+        # Windows accepts either root separator; preserve the remaining value.
+        prefix = re.escape(root.as_posix()).replace("/", r"[/\\]")
+        before = r"(?<![\w./\\-])"
+        after = r"(?=[/\\]|[\s\"'`:;,=]|$)"
+    return _digest(re.sub(before + prefix + after, ".", value))
 
 
 def _tools(argv: tuple[str, ...], env: dict[str, str]) -> list[tuple[str, list[str]]]:
@@ -62,6 +74,10 @@ def _manifest_scope(
     reasons = []
 
     def references(value: object):
+        if isinstance(value, list):
+            for item in value:
+                yield from references(item)
+            return
         if not isinstance(value, dict):
             return
         for key, item in value.items():
@@ -74,7 +90,13 @@ def _manifest_scope(
             yield from references(item)
 
     for path, data in manifests.items():
-        for reference, workspace_member in references(data):
+        source_references = list(references(data))
+        package = data.get("package", {})
+        if isinstance(package, dict) and isinstance(package.get("build"), str):
+            source_references.append((package["build"], False))
+        for reference, workspace_member in source_references:
+            if "\0" in reference:
+                raise ValueError("embedded null byte in manifest reference")
             candidate = (path.parent / reference).resolve()
             if not candidate.is_relative_to(root):
                 reasons.append("external_manifest_reference")
@@ -94,6 +116,8 @@ def _manifest_scope(
             selections.append(argument.split("=", 1)[1])
         elif argument == "--manifest-path":
             selections.append(args[index + 1] if index + 1 < len(args) else "")
+    if selections and "\0" in selections[0]:
+        raise ValueError("embedded null byte in selected manifest")
     selected = (
         (root / selections[0]).resolve() if selections and selections[0] else root / "Cargo.toml"
     )
@@ -196,6 +220,19 @@ def configuration(
                 # Included config may resolve outside the captured hierarchy.
                 if "include" in parsed:
                     reasons.append("included_cargo_configuration")
+                patches = parsed.get("patch", {})
+                if not isinstance(patches, dict):
+                    raise ValueError("invalid Cargo patch configuration")
+                if parsed.get("paths") or any(
+                    isinstance(source, dict)
+                    and any(
+                        isinstance(dependency, dict) and "path" in dependency
+                        for dependency in source.values()
+                    )
+                    for source in patches.values()
+                ):
+                    # Config hashes do not capture the overridden dependency's source.
+                    reasons.append("uncaptured_cargo_path_reference")
         except (OSError, ValueError, UnicodeError) as exc:
             files[label] = None
             reasons.append(f"configuration_unreadable:{label}:{type(exc).__name__}")
@@ -204,9 +241,8 @@ def configuration(
             reasons.extend(_manifest_scope(cwd, manifests, argv, set(captured_files)))
         except (OSError, ValueError, RuntimeError):
             reasons.append("unresolved_manifest_scope")
-    root_pattern = re.compile(r"(?<![\w./-])" + re.escape(str(cwd)) + r"(?=/|[\s\"'`:;,=]|$)")
     relevant = {
-        key: _digest(root_pattern.sub(".", value))
+        key: _environment_digest(cwd, value)
         for key, value in env.items()
         if key.startswith(("CARGO_", "RUST", "CLIPPY_", "RUSTUP_"))
         or key

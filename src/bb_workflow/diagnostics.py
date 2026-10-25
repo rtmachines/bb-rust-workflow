@@ -47,8 +47,16 @@ def _hash(value: object) -> str:
 
 
 def _local_text(text: str, root: Path) -> str:
-    # Boundaries avoid rewriting /project-other or source code identifiers.
-    return re.sub(r"(?<![\w./-])" + re.escape(str(root)) + r'(?=/|[\s"\'`):,]|$)', ".", text)
+    # Root spelling may use either Windows separator. Keep path/source suffixes
+    # verbatim and require boundaries so sibling/external paths retain identity.
+    prefix = re.escape(str(root))
+    before = r"(?<![\w./-])"
+    after = r'(?=/|[\s"\'`):,]|$)'
+    if root.drive:
+        prefix = re.escape(root.as_posix()).replace("/", r"[/\\]")
+        before = r"(?<![\w./\\-])"
+        after = r'(?=[/\\\s"\'`):,]|$)'
+    return re.sub(before + prefix + after, ".", text)
 
 
 def _path(value: str, root: Path) -> str:
