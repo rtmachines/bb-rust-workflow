@@ -12,7 +12,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bb_workflow.backends import BackendError, BackendResult
-from bb_workflow.config import ContextConfig, Selection, load_config, route
+from bb_workflow.config import (
+    ContextConfig,
+    Selection,
+    VerificationConfig,
+    VerificationProfile,
+    VerificationVariant,
+    load_config,
+    route,
+)
 from bb_workflow.engine import Workflow
 from bb_workflow.process import ProcessResult, run_process
 from bb_workflow.protocol import RESPONSE_SCHEMA
@@ -53,12 +61,13 @@ class EngineTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.repo = Path(self.temporary.name) / "project"
+        self.repo = Path(self.temporary.name).resolve() / "project"
         (self.repo / "src").mkdir(parents=True)
         self.original = "pub fn value() -> u32 {\n    0\n}\n"
         (self.repo / "src/lib.rs").write_text(self.original, encoding="utf-8")
         self.config = replace(
             load_config(),
+            config_version=2,
             prepare=[],
             checks=[["fixture-check", "--strict"]],
             max_cycles=2,
@@ -96,6 +105,11 @@ class EngineTests(unittest.TestCase):
         return BackendResult(payload, 0.1, {"input_tokens": 10}, kwargs["selection"].model)
 
     def process(self, argv, **kwargs):
+        if argv[-1] == "--version" and Path(argv[0]).name in {"cargo", "rustc", "rustdoc"}:
+            tool = (
+                "clippy" if "clippy" in argv else "rustfmt" if "fmt" in argv else Path(argv[0]).name
+            )
+            return ProcessResult(0, tool + " 1.90.0 (fixture)\n", "", 0)
         self.events.append("check")
         self.check_calls.append({"argv": argv, **kwargs})
         if self.check_script:
@@ -125,6 +139,90 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         self.assertEqual((self.repo / "src/lib.rs").read_text(), self.original)
         return flow, state
+
+    def test_new_legacy_run_requires_final_artifact_and_rejects_metadata_downgrades(self):
+        flow, state = self.run_workflow()
+        path = flow.run_dir / "acceptance.json"
+        self.assertTrue(path.is_file(), "New legacy runs require the final report contract")
+        report = json.loads(path.read_text())
+        self.assertEqual(report["mode"], "legacy")
+        self.assertIsNone(report["binding"]["requirements_id"])
+        self.assertIsNone(report["criteria"])
+        for version in (None, 1, 3, True, "2"):
+            downgraded = {**state, "version": version}
+            with self.subTest(version=version):
+                (flow.run_dir / "state.json").write_text(json.dumps(downgraded))
+                with self.assertRaises(WorkspaceError):
+                    apply_run(flow.run_dir)
+        (flow.run_dir / "state.json").write_text(json.dumps(state))
+        path.unlink()
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+        self.assertFalse((flow.run_dir / "apply-backup").exists())
+
+    def test_old_config_without_requirements_retains_v1_schema_and_explicit_legacy_mode(self):
+        for version in (1, 2):
+            with self.subTest(version=version):
+                flow, state = self.run_workflow(config=replace(self.config, config_version=version))
+                self.assertEqual(state["status"], "succeeded", state["reason"])
+                self.assertEqual(state["acceptance"]["mode"], "legacy")
+                self.assertTrue(state["acceptance"]["compatibility_mode"])
+                self.assertEqual(state["acceptance"]["rounds"], [])
+                self.assertEqual(self.calls[-1]["schema"], RESPONSE_SCHEMA)
+                self.assertIn("legacy", (flow.run_dir / "report.md").read_text())
+
+    def test_every_gate_variant_precedes_independent_reviews(self):
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(features=("extra",))
+        self.config = replace(
+            self.config, checks=[["cargo", "check", "--workspace"]], verification=verification
+        )
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded", state["reason"])
+        self.assertEqual(
+            self.events,
+            ["check", "check", "implementation", "check", "check", "reviewer_a", "reviewer_b"],
+        )
+        candidate = [c for c in state["checks"] if c["phase"] == "candidate-0"]
+        self.assertEqual([c["variant"] for c in candidate], ["default", "feature"])
+        self.assertEqual(
+            candidate[1]["command"], ["cargo", "check", "--workspace", "--features", "extra"]
+        )
+        self.assertEqual({c["snapshot_id"] for c in candidate}, {state["candidate_id"]})
+        self.assertNotEqual(self.calls[1]["cwd"], self.calls[2]["cwd"])
+        self.assertTrue((flow.run_dir / candidate[1]["artifacts"] / "stdout.txt").exists())
+
+    def test_variant_failure_runs_fixer_and_repeats_full_gate_before_reviews(self):
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(all_features=True)
+        self.config = replace(
+            self.config, checks=[["cargo", "test", "--workspace"]], verification=verification
+        )
+        self.check_script = [ProcessResult(0, "", "", 0)] * 3 + [
+            ProcessResult(1, "", "feature failed", 0)
+        ]
+        _, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded", state["reason"])
+        self.assertEqual(
+            self.events,
+            [
+                "check",
+                "check",
+                "implementation",
+                "check",
+                "check",
+                "fixer",
+                "check",
+                "check",
+                "reviewer_a",
+                "reviewer_b",
+            ],
+        )
+        failed = [c for c in state["checks"] if not c["passed"]]
+        self.assertEqual([(c["phase"], c["variant"]) for c in failed], [("candidate-0", "feature")])
+        self.assertEqual(len([c for c in state["checks"] if c["phase"] == "candidate-1"]), 2)
 
     def test_success_uses_identical_separate_review_snapshots_and_no_cross_review_prompt(self):
         self.scripts["reviewer_a"] = [response(summary="REVIEW_A_SECRET")]
@@ -1068,6 +1166,96 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.events.count("reviewer_a"), 1)
         self.assertFalse(state["agents"][-1]["retryable"])
         self.assertNotIn("reviewer_b", self.events)
+
+    def test_candidate_change_during_finding_triage_fails_before_repair(self):
+        def mutate_candidate(call):
+            (flow.work / "src/lib.rs").write_text("External change during triage\n")
+            return response(decisions=[decision("F1", "confirmed")])
+
+        self.scripts["reviewer_a"] = [response(findings=[finding()])]
+        self.scripts["triage"] = [mutate_candidate]
+        flow = self.workflow()
+        flow.run()
+        self.assertEqual(flow.state["status"], "failed", flow.state["reason"])
+        self.assertIn("changed during triage", flow.state["reason"])
+        self.assertEqual(flow.state["cycles"], 0)
+        self.assertEqual(
+            self.events, ["check", "implementation", "check", "reviewer_a", "reviewer_b", "triage"]
+        )
+
+
+class DiagnosticsEngineTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    invoke = EngineTests.invoke
+    process = EngineTests.process
+    workflow = EngineTests.workflow
+    run_workflow = EngineTests.run_workflow
+
+    def diagnostic(self):
+        return (
+            "warning[unused_variables]: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = 1;\n"
+        )
+
+    def test_phase_summary_reaches_independent_review_prompts_without_audit_mutation(self):
+        self.config = replace(self.config, checks=[["cargo", "check", "--offline"]])
+        self.check_script = [
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", "", 0),
+        ]
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["diagnostics"]["candidate-0"]["counts"]["resolved"], 1)
+        baseline_file = flow.run_dir / state["baseline_checks"][0]["diagnostics_file"]
+        baseline = json.loads(baseline_file.read_text())
+        self.assertEqual(baseline["comparison"]["counts"]["unclassified"], 1)
+        self.assertNotIn("classification", baseline["findings"][0])
+        for call in self.calls:
+            evidence = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])[
+                "evidence"
+            ]
+            self.assertIn("diagnostics", evidence)
+            if call["role"].startswith("reviewer"):
+                self.assertEqual(evidence["diagnostics"]["counts"]["resolved"], 1)
+                self.assertNotIn("reviews", evidence)
+            else:
+                self.assertEqual(evidence["diagnostics"]["counts"]["unclassified"], 1)
+        self.assertTrue((flow.run_dir / state["diagnostics"]["candidate-0"]["file"]).exists())
+
+    def test_partial_phase_keeps_skipped_baseline_findings_unobserved(self):
+        self.config = replace(self.config, checks=[["cargo", "check"], ["cargo", "test", "--lib"]])
+        self.check_script = [
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", "", 0, output_limit_exceeded=True),
+        ]
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "failed")
+        summary = state["diagnostics"]["candidate-0"]
+        self.assertEqual(summary["counts"]["resolved"], 0)
+        self.assertEqual(summary["counts"]["unobserved_previous"], 2)
+        aggregate = json.loads((flow.run_dir / summary["file"]).read_text())
+        self.assertEqual(
+            {item["check_id"] for item in aggregate["unobserved_previous"]}, {"0", "1"}
+        )
+        self.assertEqual([call["role"] for call in self.calls], ["implementation"])
+
+    def test_persistent_red_baseline_still_blocks_reviews_and_reaches_fixer(self):
+        self.config = replace(self.config, checks=[["cargo", "check"]], max_cycles=1)
+        self.check_script = [
+            ProcessResult(1, "", self.diagnostic(), 0),
+            ProcessResult(1, "", self.diagnostic(), 0),
+            ProcessResult(1, "", self.diagnostic(), 0),
+        ]
+        _, state = self.run_workflow()
+        self.assertEqual(state["status"], "limit_exhausted")
+        self.assertEqual(state["diagnostics"]["candidate-0"]["counts"]["persistent"], 1)
+        fixer = next(call for call in self.calls if call["role"] == "fixer")
+        evidence = json.loads(fixer["prompt"].split("Task and evidence (JSON):\n", 1)[1])[
+            "evidence"
+        ]
+        self.assertEqual(evidence["diagnostics"]["counts"]["persistent"], 1)
+        self.assertFalse(any(call["role"].startswith("reviewer") for call in self.calls))
+        self.assertFalse(any(item["passed"] for item in state["checks"]))
 
 
 if __name__ == "__main__":

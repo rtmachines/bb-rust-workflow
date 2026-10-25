@@ -71,3 +71,17 @@ Final GPT-6 Astra review found one interaction: an interrupted command can leave
 Final fix wave: addressed; 54 engine tests passed. GPT-6 Astra scoped re-review marked the finding addressed and both Task 1 and combined review PASS, with no remaining findings.
 
 Final verification after the fix wave: 222 tests in 43.800s, OK (2 native Windows tests skipped on Linux). Raw Ruff through local reviewdog, Ruff format check and git diff --check all passed. The user subsequently requested a commit of these fixes, tests and documentation on codex/fix-review-p2, excluding unrelated changes.
+
+## Integration with current main
+
+The user requested resolving PR #6 against main at ec5aa166583a01f07a206d310bd77a1e87537e83, preserving both P2 fixes and all main features, then testing, committing and pushing the branch.
+
+- [x] Retain main's shared verification runner, diagnostics, acceptance and final report contracts while porting interruption audit handling into the shared runner and metadata probes.
+- [x] Preserve both sets of workspace regressions and main's permission/report-binding safeguards; adapt the early-capture fixture to the current configuration contract.
+- [x] Independently review the integrated diff against main, then run the full test suite, Ruff, formatting and local reviewdog.
+
+The integration adds two regression tests covering four interruption scenarios: standalone verification with zero exit and optional output overflow, and cancellation during a Cargo version probe versus the actual check. Interrupted probes retain their own output without attributing it to an unstarted check. All test methods from both parents remain. Independent GPT-6 Astra review: PASS, no actionable regressions.
+
+Full integrated verification: 421 tests in 85.366s, OK (2 native Windows tests skipped on Linux). Raw Ruff through local reviewdog passed with no findings; Ruff format check passed for all 40 files; git diff --check passed. The offline-provider demo with real Cargo completed with status succeeded. No paid provider sessions were invoked.
+
+Publication is authorized on codex/fix-review-p2, excluding unrelated local changes. The merge commit and GitHub integration status are recorded in PR #6 after pushing.

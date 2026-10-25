@@ -287,5 +287,212 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(findings, original)
 
 
+class AcceptanceProtocolTests(unittest.TestCase):
+    def setUp(self):
+        ProtocolTests.setUp(self)
+        from bb_workflow.requirements import Criterion
+
+        self.criteria = (
+            Criterion("test", "Pass regression", "mechanical", "Run test", "2"),
+            Criterion("scope", "Keep API", "semantic", "Inspect exported signatures"),
+            Criterion("behavior", "Keep behavior", "semantic", "Inspect callers"),
+        )
+        self.binding = dict(
+            candidate_id="candidate", requirements_id="requirements", verification_plan_id="plan"
+        )
+
+    def v2(self, **changes):
+        return response(
+            schema_version=2,
+            binding=dict(self.binding),
+            criterion_evidence=[],
+            criterion_assessments=[],
+            criterion_decisions=[],
+            **changes,
+        )
+
+    def validate(self, payload, role, **changes):
+        return validate_response(
+            payload,
+            role,
+            self.work,
+            version=2,
+            expected_binding=self.binding,
+            criteria=self.criteria,
+            **changes,
+        )
+
+    def assessment(self, criterion_id="scope", **changes):
+        return {
+            "criterion_id": criterion_id,
+            "verdict": "satisfied",
+            "evidence": "Source checked",
+            **changes,
+        }
+
+    def test_version_two_all_roles_have_exact_fields_and_coverage(self):
+        for role in ("implementation", "fixer"):
+            payload = self.v2()
+            payload["criterion_evidence"] = [{"criterion_id": "test", "evidence": "Test added"}]
+            self.assertEqual(self.validate(payload, role), payload)
+        for role in ("reviewer_a", "reviewer_b"):
+            payload = self.v2()
+            payload["criterion_assessments"] = [self.assessment(), self.assessment("behavior")]
+            self.assertEqual(self.validate(payload, role), payload)
+        payload = self.v2()
+        payload["criterion_decisions"] = [
+            dict(criterion_id="scope", verdict="unresolved", rationale="Evidence conflicts")
+        ]
+        self.assertEqual(self.validate(payload, "triage", disputed_criteria=("scope",)), payload)
+
+    def test_version_two_rejects_each_stale_binding_and_wrong_version(self):
+        for key in self.binding:
+            payload = self.v2()
+            payload["binding"][key] = "old"
+            with self.subTest(key=key), self.assertRaises(ProtocolError):
+                self.validate(payload, "implementation")
+        for version in (1, True, "2", 3):
+            payload = self.v2()
+            payload["schema_version"] = version
+            with self.subTest(version=version), self.assertRaises(ProtocolError):
+                self.validate(payload, "implementation")
+        for binding in ({}, dict(self.binding, extra="x"), dict(self.binding, candidate_id=" ")):
+            payload = self.v2()
+            payload["binding"] = binding
+            with self.subTest(binding=binding), self.assertRaises(ProtocolError):
+                self.validate(payload, "implementation")
+        with self.assertRaises(ProtocolError):
+            validate_response(self.v2(), "implementation", self.work, version=2)
+
+    def test_version_two_rejects_missing_unknown_duplicate_and_blank_criterion_values(self):
+        valid = self.v2()
+        valid["criterion_assessments"] = [self.assessment(), self.assessment("behavior")]
+        invalid = [
+            [],
+            [self.assessment()],
+            [self.assessment(), self.assessment()],
+            [self.assessment(), self.assessment("unknown")],
+            [self.assessment(), self.assessment("test")],
+            [self.assessment(), self.assessment("behavior", evidence=" ")],
+            [self.assessment(), self.assessment("behavior", verdict="approved")],
+        ]
+        for assessments in invalid:
+            payload = copy.deepcopy(valid)
+            payload["criterion_assessments"] = assessments
+            with self.subTest(assessments=assessments), self.assertRaises(ProtocolError):
+                self.validate(payload, "reviewer_a")
+        for key in (
+            "schema_version",
+            "binding",
+            "criterion_evidence",
+            "criterion_assessments",
+            "criterion_decisions",
+        ):
+            payload = copy.deepcopy(valid)
+            payload.pop(key)
+            with self.subTest(missing=key), self.assertRaises(ProtocolError):
+                self.validate(payload, "reviewer_a")
+        for hints in (
+            [dict(criterion_id="unknown", evidence="hint")],
+            [dict(criterion_id="test", evidence="hint")] * 2,
+            [dict(criterion_id="test", evidence=" ")],
+        ):
+            payload = self.v2()
+            payload["criterion_evidence"] = hints
+            with self.subTest(hints=hints), self.assertRaises(ProtocolError):
+                self.validate(payload, "fixer")
+
+    def test_version_two_role_inappropriate_fields_are_rejected(self):
+        for role in ("implementation", "fixer", "reviewer_a", "reviewer_b", "triage"):
+            for field in ("criterion_evidence", "criterion_assessments", "criterion_decisions"):
+                allowed = {
+                    "implementation": "criterion_evidence",
+                    "fixer": "criterion_evidence",
+                    "reviewer_a": "criterion_assessments",
+                    "reviewer_b": "criterion_assessments",
+                    "triage": "criterion_decisions",
+                }[role]
+                if field == allowed:
+                    continue
+                payload = self.v2()
+                payload[field] = [self.assessment()]
+                if field == "criterion_evidence":
+                    payload[field] = [dict(criterion_id="scope", evidence="hint")]
+                if field == "criterion_decisions":
+                    payload[field] = [
+                        dict(criterion_id="scope", verdict="satisfied", rationale="yes")
+                    ]
+                with self.subTest(role=role, field=field), self.assertRaises(ProtocolError):
+                    self.validate(payload, role)
+
+    def test_triage_decides_exactly_the_disputed_semantic_ids(self):
+        choice = dict(criterion_id="scope", verdict="satisfied", rationale="Source inspected")
+        for decisions in (
+            [],
+            [choice, choice],
+            [dict(choice, criterion_id="behavior")],
+            [dict(choice, criterion_id="test")],
+            [dict(choice, rationale=" ")],
+        ):
+            payload = self.v2()
+            payload["criterion_decisions"] = decisions
+            with self.subTest(decisions=decisions), self.assertRaises(ProtocolError):
+                self.validate(payload, "triage", disputed_criteria=("scope",))
+        for disputed in (("unknown",), ("test",), ("scope", "scope")):
+            with self.subTest(disputed=disputed), self.assertRaises(ProtocolError):
+                self.validate(self.v2(), "triage", disputed_criteria=disputed)
+
+    def test_version_two_requires_valid_nonempty_frozen_criteria(self):
+        from bb_workflow.requirements import Criterion
+
+        for criteria in (
+            (),
+            list(self.criteria),
+            self.criteria * 2,
+            (Criterion("bad", "Bad", [], "Inspect"),),
+        ):
+            with self.subTest(criteria=criteria), self.assertRaises(ProtocolError):
+                validate_response(
+                    self.v2(),
+                    "implementation",
+                    self.work,
+                    version=2,
+                    expected_binding=self.binding,
+                    criteria=criteria,
+                )
+        for role in ("implementation", "fixer", "reviewer_a", "reviewer_b", "triage"):
+            validate_response(
+                self.v2(),
+                role,
+                self.work,
+                version=2,
+                expected_binding=self.binding,
+                criteria=(self.criteria[0],),
+            )
+        with self.assertRaises(ProtocolError):
+            self.validate(self.v2(), "unknown")
+
+    def test_legacy_shape_rejects_acceptance_fields_and_schemas_are_detached(self):
+        from bb_workflow.protocol import RESPONSE_SCHEMA, response_schema
+
+        for key, value in self.v2().items():
+            if key not in response():
+                with self.subTest(key=key), self.assertRaises(ProtocolError):
+                    validate_response(response(**{key: value}), "implementation", self.work)
+        legacy = copy.deepcopy(RESPONSE_SCHEMA)
+        detached = response_schema()
+        detached["properties"]["summary"]["minLength"] = 999
+        self.assertEqual(RESPONSE_SCHEMA, legacy)
+        second = response_schema(2)
+        second["properties"]["binding"]["properties"]["candidate_id"]["minLength"] = 999
+        self.assertEqual(
+            response_schema(2)["properties"]["binding"]["properties"]["candidate_id"]["minLength"],
+            1,
+        )
+        for version in (True, 0, 3, "2"):
+            with self.subTest(version=version), self.assertRaises(ProtocolError):
+                response_schema(version)
+
+
 if __name__ == "__main__":
     unittest.main()

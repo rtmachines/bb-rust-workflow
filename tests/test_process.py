@@ -19,7 +19,7 @@ class ProcessTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.cwd = Path(self.temporary.name)
+        self.cwd = Path(self.temporary.name).resolve()
 
     def test_utf8_input_output_cwd_environment_and_literal_arguments(self):
         code = (
@@ -36,12 +36,27 @@ class ProcessTests(unittest.TestCase):
             env={**os.environ, "BB_TEST": "works"},
         )
         self.assertEqual(result.returncode, 0)
-        self.assertIn("zażółć\n$(should-not-run); literal", result.stdout)
+        self.assertIn(f"zażółć{os.linesep}$(should-not-run); literal", result.stdout)
         self.assertIn(str(self.cwd), result.stdout)
         self.assertIn("works", result.stdout)
-        self.assertEqual(result.stderr, "błąd\n")
+        self.assertEqual(result.stderr, f"błąd{os.linesep}")
         self.assertFalse(result.timed_out)
         self.assertGreaterEqual(result.duration, 0)
+
+    def test_capture_preserves_raw_mixed_newlines_in_both_streams(self):
+        result = run_process(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'first\\r\\nsecond\\nprogress\\r'); "
+                "os.write(2, b'error\\r\\n')",
+            ],
+            self.cwd,
+            5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "first\r\nsecond\nprogress\r")
+        self.assertEqual(result.stderr, "error\r\n")
 
     def test_large_simultaneous_streams_do_not_deadlock(self):
         result = run_process(

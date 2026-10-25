@@ -25,12 +25,34 @@ class ConfigTests(unittest.TestCase):
         self.path.write_text(text, encoding="utf-8")
         return load_config(self.path)
 
+    def test_strict_verification_config(self):
+        invalid = [
+            "[verification]\nunknown = true",
+            '[verification.profiles.nope]\nvariants = ["default"]',
+            '[verification.profiles.gate]\nchecks = [["cargo", "check"]]',
+            "[verification.profiles.fast]\nchecks = []",
+            "[verification.profiles.fast]\nvariants = []",
+            '[verification.profiles.fast]\nvariants = ["missing"]',
+            '[verification.profiles.fast]\nvariants = ["default", "default"]',
+            '[verification.variants.x]\nfeatures = [""]',
+            '[verification.variants.x]\nfeatures = ["a"]\nall_features = true',
+            '[verification.variants.x]\nall_features = "true"',
+            "[verification.variants.x]\nno_default_features = 1",
+            '[verification.variants.x]\ntarget = " "',
+            '[verification.variants.x]\ntoolchain = ""',
+            "[verification.variants.x]\nunknown = true",
+            "verification = []",
+        ]
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(ConfigError):
+                self.write(default_text() + "\n" + text)
+
     def test_default_template_loads_all_profiles(self):
         config = load_config()
         self.assertEqual(config.max_cycles, 3)
         self.assertEqual(config.max_agent_calls, 20)
         self.assertEqual(config.max_output_bytes, 16 * 1024 * 1024)
-        self.assertEqual(config.config_version, 2)
+        self.assertEqual(config.config_version, 3)
         self.assertEqual(config.prepare, [["cargo", "check", "--workspace", "--all-targets"]])
         self.assertEqual(set(config.profiles), {"low", "medium", "high"})
         self.assertEqual(config.profiles["low"]["implementation"].model, "claude-haiku-5-5")
@@ -55,8 +77,8 @@ class ConfigTests(unittest.TestCase):
                 "warnings",
             ],
         ]
-        self.assertEqual(CURRENT_CONFIG_VERSION, 2)
-        self.assertEqual(Config().config_version, 2)
+        self.assertEqual(CURRENT_CONFIG_VERSION, 3)
+        self.assertEqual(Config().config_version, 3)
         self.assertEqual(Config().checks, expected)
         self.assertEqual(load_config().checks, expected)
         self.assertEqual(DEFAULT_CHECKS, tuple(tuple(command) for command in expected))
@@ -92,7 +114,7 @@ class ConfigTests(unittest.TestCase):
             '["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"] ]'
         )
         custom = '[["custom runner", "argument with spaces", "--test", "a"], ["true"]]'
-        for version_line in ("", "config_version = 1", "config_version = 2"):
+        for version_line in ("", "config_version = 1", "config_version = 2", "config_version = 3"):
             for checks in (historical_template, custom):
                 text = "\n".join(
                     version_line
@@ -129,10 +151,10 @@ class ConfigTests(unittest.TestCase):
                         )
 
     def test_config_version_rejects_unsupported_versions_and_invalid_types(self):
-        for value in ("0", "-1", "3", "99", "true", "false", "2.0", '"2"', "[]", "{}"):
+        for value in ("0", "-1", "4", "99", "true", "false", "2.0", '"2"', "[]", "{}"):
             with self.subTest(value=value), self.assertRaisesRegex(ConfigError, "config_version"):
                 self.write(
-                    default_text().replace("config_version = 2", "config_version = " + value)
+                    default_text().replace("config_version = 3", "config_version = " + value)
                 )
 
     def test_default_check_commands_are_isolated_between_configurations(self):
@@ -142,9 +164,9 @@ class ConfigTests(unittest.TestCase):
         first.checks.append(["extra"])
         self.assertEqual(second.checks, [list(command) for command in DEFAULT_CHECKS])
         self.assertEqual(Config().checks, second.checks)
-        for version in (1, 2):
+        for version in (1, 2, 3):
             text = "\n".join(
-                line.replace("config_version = 2", f"config_version = {version}")
+                line.replace("config_version = 3", f"config_version = {version}")
                 for line in default_text().splitlines()
                 if not line.startswith("checks =")
             )

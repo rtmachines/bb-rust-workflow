@@ -12,10 +12,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bb_workflow.backends import BackendResult
-from bb_workflow.config import load_config
+from bb_workflow.config import (
+    VerificationConfig,
+    VerificationProfile,
+    VerificationVariant,
+    load_config,
+)
 from bb_workflow.engine import Workflow
 from bb_workflow.process import run_process
-from bb_workflow.workspace import manifest, snapshot_id
+from bb_workflow.requirements import Criterion, Requirements
+from bb_workflow.verification import execute_checks, plan_verification, verify_repository
+from bb_workflow.workspace import WorkspaceError, apply_run, manifest, snapshot_id
 
 
 class RustChecksTests(unittest.TestCase):
@@ -64,7 +71,9 @@ class RustChecksTests(unittest.TestCase):
         )
         environment.start()
         self.addCleanup(environment.stop)
-        self.config = replace(load_config(), max_cycles=0, timeout_seconds=60, max_seconds=240)
+        self.config = replace(
+            load_config(), config_version=2, max_cycles=0, timeout_seconds=60, max_seconds=240
+        )
         self.original = manifest(self.repo, self.config.exclude)
         self.calls = []
         self.implement = lambda directory: None
@@ -98,6 +107,285 @@ class RustChecksTests(unittest.TestCase):
         self.assertFalse((self.repo / "Cargo.lock").exists())
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         return flow, state
+
+    def test_acceptance_rejects_real_zero_filter_and_proves_exact_passing_named_test(self):
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + "\n#[test]\nfn exact_regression() { assert_eq!(value(), 1); }\n"
+            + '\n#[test]\n#[should_panic]\nfn rejects_invalid_input() { panic!("invalid"); }\n'
+        )
+
+        def provider(**call):
+            payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+            return BackendResult(
+                {
+                    "status": "completed",
+                    "summary": "Offline fixture",
+                    "findings": [],
+                    "decisions": [],
+                    "schema_version": 2,
+                    "binding": payload["acceptance"]["binding"],
+                    "criterion_evidence": [],
+                    "criterion_assessments": [],
+                    "criterion_decisions": [],
+                },
+                0.0,
+                {},
+                call["selection"].model,
+            )
+
+        for test_filter, test_name, expected in (
+            ("missing_filter", "exact_regression", "limit_exhausted"),
+            ("exact_regression", "exact_regression", "succeeded"),
+            ("rejects_invalid_input", "rejects_invalid_input", "succeeded"),
+            ("rejects_invalid_input", "exact_regression", "limit_exhausted"),
+        ):
+            with self.subTest(test_filter=test_filter, test_name=test_name):
+                config = replace(
+                    self.config,
+                    config_version=3,
+                    prepare=[["cargo", "generate-lockfile", "--offline"]],
+                    checks=[
+                        [
+                            "cargo",
+                            "test",
+                            "--workspace",
+                            "--lib",
+                            "--offline",
+                            test_filter,
+                            "--",
+                            "--exact",
+                        ]
+                    ],
+                )
+                requirements = Requirements(
+                    criteria=(
+                        Criterion(
+                            "regression",
+                            "Exact regression passes",
+                            "mechanical",
+                            "Run the exact named test",
+                            "0",
+                            test_name,
+                        ),
+                    )
+                )
+                flow = Workflow(
+                    self.repo,
+                    "Validate regression",
+                    config,
+                    requirements=requirements,
+                    invoke_fn=provider,
+                    progress=lambda text: None,
+                )
+                flow.run()
+                self.assertEqual(flow.state["status"], expected, flow.state["reason"])
+                assessment = flow.state["acceptance"]["rounds"][0]["mechanical"][0]
+                self.assertEqual(
+                    assessment["verdict"], "satisfied" if expected == "succeeded" else "unmet"
+                )
+                self.assertEqual(flow.state["checks"][-1]["returncode"], 0)
+                self.assertFalse((self.repo / "Cargo.lock").exists())
+                if expected != "succeeded":
+                    self.assertFalse((flow.run_dir / "acceptance.json").exists())
+                    with self.assertRaises(WorkspaceError):
+                        apply_run(flow.run_dir)
+
+    def test_real_workspace_feature_gate_report_authorizes_explicit_local_apply(self):
+        package = self.repo / "selected/Cargo.toml"
+        package.write_text(package.read_text() + "\n[features]\nextra = []\n", encoding="utf-8")
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[cfg(all(test, feature = "extra"))]\n#[test]\n'
+            + "fn extra_enabled() {\n    assert_eq!(value(), 1);\n}\n",
+            encoding="utf-8",
+        )
+        original = manifest(self.repo)
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(
+            features=("extra",), no_default_features=True
+        )
+        config = replace(self.config, config_version=3, verification=verification)
+        requirements = Requirements(
+            criteria=(
+                Criterion(
+                    "feature",
+                    "Feature test passes",
+                    "mechanical",
+                    "Run extra_enabled",
+                    "7",
+                    "extra_enabled",
+                ),
+                Criterion("api", "Retain value API", "semantic", "Inspect public signature"),
+            )
+        )
+
+        def implement(directory):
+            source = directory / "selected/src/lib.rs"
+            source.write_text(
+                "// Reviewed implementation.\n" + source.read_text(), encoding="utf-8"
+            )
+
+        self.implement = implement
+
+        def provider(**call):
+            result = self.invoke(**call)
+            payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+            result.payload.update(
+                schema_version=2,
+                binding=payload["acceptance"]["binding"],
+                criterion_evidence=[],
+                criterion_assessments=[
+                    {
+                        "criterion_id": "api",
+                        "verdict": "satisfied",
+                        "evidence": "Signature retained",
+                    }
+                ]
+                if call["role"] in {"reviewer_a", "reviewer_b"}
+                else [],
+                criterion_decisions=[],
+            )
+            return result
+
+        flow = Workflow(
+            self.repo,
+            "Retain API with feature coverage",
+            config,
+            requirements=requirements,
+            invoke_fn=provider,
+            progress=lambda text: None,
+        )
+        flow.run()
+        self.assertEqual(flow.state["status"], "succeeded", flow.state["reason"])
+        self.assertEqual(manifest(self.repo), original)
+        self.assertEqual(
+            [c["role"] for c in self.calls], ["implementation", "reviewer_a", "reviewer_b"]
+        )
+        report_path = flow.run_dir / "acceptance.json"
+        self.assertTrue(report_path.is_file())
+        report = json.loads(report_path.read_text())
+        self.assertEqual(flow.state["version"], 2)
+        self.assertEqual(flow.state["report_contract"], 1)
+        self.assertEqual(
+            report["binding"],
+            {
+                "candidate_id": snapshot_id(manifest(flow.work)),
+                "requirements_id": flow.state["acceptance"]["requirements_id"],
+                "verification_plan_id": flow.state["acceptance"]["verification_plan_id"],
+            },
+        )
+        self.assertEqual(report["gate"]["variants"], ["default", "feature"])
+        self.assertIsNone(report["gate"]["package"])
+        self.assertIsNone(report["gate"]["test_filter"])
+        planned = report["gate"]["planned_checks"]
+        results = report["gate"]["results"]
+        self.assertEqual(len(results), 10)
+        self.assertEqual([r["command"] for r in results], [c["argv"] for c in planned])
+        self.assertEqual([r["variant"] for r in results], ["default"] * 5 + ["feature"] * 5)
+        self.assertTrue(all(r["passed"] and r["source_unchanged"] for r in results))
+        self.assertTrue(all(r["snapshot_id"] == report["binding"]["candidate_id"] for r in results))
+        self.assertIn("extra_enabled ... ok", results[7]["stdout_tail"])
+        for index in (3, 8):
+            self.assertIn("--workspace", results[index]["command"])
+            self.assertIn("--doc", results[index]["command"])
+            self.assertIn(
+                "Doc-tests extra",
+                (flow.run_dir / results[index]["artifacts"] / "stderr.txt").read_text(),
+            )
+        self.assertEqual(
+            [(c["criterion_id"], c["verdict"]) for c in report["criteria"]],
+            [("feature", "satisfied"), ("api", "satisfied")],
+        )
+        self.assertEqual([p["role"] for p in report["provenance"]], ["reviewer_a", "reviewer_b"])
+        markdown = (flow.run_dir / "report.md").read_text()
+        for evidence in (
+            "Planned variants: default, feature",
+            "Executed variants: default, feature",
+            "feature: **satisfied**",
+            "extra_enabled",
+            "final approved evidence",
+        ):
+            self.assertIn(evidence, markdown)
+        saved = report_path.read_bytes()
+        report_path.unlink()
+        calls_before_apply = len(self.calls)
+        with (
+            patch(
+                "bb_workflow.backends.invoke", side_effect=AssertionError("Apply called a provider")
+            ),
+            patch.object(
+                flow, "invoke", side_effect=AssertionError("Apply called workflow provider")
+            ),
+        ):
+            with self.assertRaises(WorkspaceError):
+                apply_run(flow.run_dir)
+            self.assertEqual(manifest(self.repo), original)
+            self.assertFalse((flow.run_dir / "apply-backup").exists())
+            report_path.write_bytes(saved)
+            self.assertEqual(apply_run(flow.run_dir), ["Cargo.lock", "selected/src/lib.rs"])
+        self.assertEqual(len(self.calls), calls_before_apply)
+        self.assertEqual(manifest(self.repo), manifest(flow.work))
+        self.assertEqual(
+            (self.repo / "Cargo.lock").read_bytes(), (flow.work / "Cargo.lock").read_bytes()
+        )
+        self.assertTrue(
+            (self.repo / "selected/src/lib.rs")
+            .read_text()
+            .startswith("// Reviewed implementation.")
+        )
+        self.assertEqual(json.loads((flow.run_dir / "state.json").read_text())["status"], "applied")
+
+    def test_standalone_gate_executes_real_offline_feature_variants(self):
+        package = self.repo / "selected/Cargo.toml"
+        package.write_text(package.read_text() + "\n[features]\nextra = []\n", encoding="utf-8")
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[cfg(all(test, feature = "extra"))]\n#[test]\nfn extra_enabled() { assert_eq!(value(), 1); }\n',
+            encoding="utf-8",
+        )
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(
+            features=("extra",), no_default_features=True
+        )
+        config = replace(
+            self.config,
+            verification=verification,
+            checks=[["cargo", "test", "--workspace", "--all-targets", "--locked"]],
+        )
+        _, report = verify_repository(self.repo, config, "gate")
+        self.assertEqual(report["status"], "passed", report["reason"])
+        self.assertEqual([r["variant"] for r in report["results"]], ["default", "feature"])
+        self.assertNotIn("extra_enabled", report["results"][0]["stdout_tail"])
+        self.assertIn("extra_enabled ... ok", report["results"][1]["stdout_tail"])
+        self.assertTrue(report["source_unchanged"])
+
+    def test_standalone_focused_limits_real_package_and_test_filter(self):
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[test]\nfn needle_case() { assert_eq!(value(), 1); }\n#[test]\nfn unrelated_case() { panic!("must be filtered"); }\n',
+            encoding="utf-8",
+        )
+        (self.repo / "extra/src/lib.rs").write_text(
+            'compile_error!("outside chosen package");\n', encoding="utf-8"
+        )
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        _, report = verify_repository(
+            self.repo, self.config, "focused", package="selected", test_filter="needle"
+        )
+        self.assertEqual(report["status"], "passed", report["reason"])
+        self.assertIn("needle_case ... ok", report["results"][1]["stdout_tail"])
+        self.assertIn("1 filtered out", report["results"][1]["stdout_tail"])
+        self.assertTrue(report["source_unchanged"])
 
     def test_error_outside_default_members_blocks_success(self):
         # Isolate validation coverage; the healthy control exercises the default prepare.
@@ -193,6 +481,80 @@ class RustChecksTests(unittest.TestCase):
         self.assertEqual(state["candidate_id"], snapshot_id(manifest(flow.work)))
         self.assertEqual(self.calls[1]["snapshot"], self.calls[2]["snapshot"])
         self.assertEqual(self.calls[1]["snapshot"], manifest(flow.work))
+
+    def test_diagnostics_offline_test_failure_compile_failure_and_explicit_pass(self):
+        # A single crate gives Cargo's human Running header a unique suite identity.
+        crate = self.repo / "selected"
+        source = crate / "src/lib.rs"
+        source.write_text("#[test]\nfn regression() { assert_eq!(1, 2); }\n")
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        config = replace(
+            self.config, checks=[["cargo", "test", "--lib", "--offline", "-p", "selected"]]
+        )
+        plan = plan_verification(config)
+        artifacts = self.repo / ".bb-workflow/diagnostics-test"
+
+        def checks(label, baseline=None):
+            return execute_checks(
+                plan.checks,
+                cwd=self.repo,
+                artifact_root=artifacts,
+                command_root=artifacts / label,
+                config=config,
+                timeout=lambda: 60,
+                baseline_records=baseline,
+                process_fn=run_process,
+            )
+
+        baseline = checks("baseline")
+        self.assertFalse(baseline[0]["passed"])
+        source.write_text('#[test]\nfn regression() { let _: u32 = "bad"; }\n')
+        broken = checks("compile-failure", baseline)
+        self.assertFalse(broken[0]["passed"])
+        self.assertEqual(broken[0]["diagnostics"]["counts"]["resolved"], 0)
+        self.assertEqual(broken[0]["diagnostics"]["counts"]["unobserved_previous"], 1)
+        source.write_text("#[test]\nfn regression() { assert_eq!(1, 1); }\n")
+        passing = checks("passing", baseline)
+        self.assertTrue(passing[0]["passed"])
+        self.assertEqual(passing[0]["diagnostics"]["counts"]["resolved"], 1)
+        self.assertEqual(baseline[0]["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_real_json_compiler_diagnostic_matches_distinct_roots_and_moved_lines(self):
+        artifacts = self.repo / ".bb-workflow/diagnostics-json"
+        config = replace(
+            self.config, checks=[["cargo", "check", "--offline", "--message-format=json"]]
+        )
+        plan = plan_verification(config)
+        with tempfile.TemporaryDirectory() as temporary:
+            roots = [Path(temporary) / "baseline", Path(temporary) / "candidate"]
+            previous = None
+            for index, root in enumerate(roots):
+                (root / "src").mkdir(parents=True)
+                (root / "Cargo.toml").write_text(
+                    '[package]\nname="demo"\nversion="0.1.0"\nedition="2021"\n'
+                )
+                (root / "src/lib.rs").write_text(
+                    "\n" * index + "pub fn demo() { let unused = 1; }\n"
+                )
+                lock = run_process(
+                    ["cargo", "generate-lockfile", "--offline"], cwd=root, timeout=30
+                )
+                self.assertEqual(lock.returncode, 0, lock.stderr)
+                result = execute_checks(
+                    plan.checks,
+                    cwd=root,
+                    artifact_root=artifacts,
+                    command_root=artifacts / str(index),
+                    config=config,
+                    timeout=lambda: 60,
+                    baseline_records=previous,
+                    process_fn=run_process,
+                )
+                self.assertTrue(result[0]["passed"])
+                if previous is not None:
+                    self.assertEqual(result[0]["diagnostics"]["counts"]["persistent"], 1)
+                previous = result
 
 
 if __name__ == "__main__":

@@ -28,10 +28,29 @@ Z katalogu repozytorium Rust:
 bb-workflow init
 bb-workflow doctor --repo .
 bb-workflow plan "Dodaj obsługę błędu odczytu konfiguracji" --repo .
-bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo .
+bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml
 ```
 
 Na Windows te same polecenia działają w PowerShell, o ile instalator dodał `bb-workflow` do `PATH`; w przeciwnym razie użyj `python -m bb_workflow`. `init` tworzy edytowalny `workflow.toml` (lub ścieżkę podaną przez `--config`). `plan` pokazuje wersję konfiguracji, tryb zgodności, zakres kontroli, dokładne komendy i przypisanie modeli bez uruchamiania agentów. `doctor` pozwala sprawdzić zależności przed kosztownym `run`. Dla `plan` i `run` można podać `--complexity auto|low|medium|high`; `auto` jest prostą heurystyką słów w zadaniu, więc w razie potrzeby wybierz poziom jawnie. `--repo` wskazuje projekt Rust, a `--config` pozwala podać inny plik; bez niego program szuka `workflow.toml` w repozytorium.
+
+Nowy szablon i `Config()` używają `config_version = 3`: `run` wymaga niepustego pliku kryteriów
+`--requirements task.toml`. Przygotuj go dla zadania przed uruchomieniem. `plan` bez pliku nadal
+działa i pokazuje `requirements_needed`; `doctor` i `verify` nie wymagają kryteriów.
+Przykład minimalnego kryterium semantycznego:
+
+```toml
+requirements_version = 1
+[[criteria]]
+id = "error-handling"
+description = "Błąd odczytu konfiguracji jest zwracany wywołującemu bez paniki"
+kind = "semantic"
+verification = "Obaj recenzenci sprawdzają ścieżkę błędu, wywołania i testy"
+```
+
+Pełny przykład mechaniczny i semantyczny jest w
+[`examples/task-requirements.toml`](examples/task-requirements.toml).
+`bb-workflow plan "Zadanie" --requirements task.toml` sprawdza powiązanie z pełnym gate,
+bez wywołań modeli. Ścieżka pliku wymagań jest względem katalogu polecenia; `--repo` jej nie zmienia.
 
 Po `run` zanotuj wypisaną ścieżkę katalogu przebiegu. Obejrzyj wynik, logi i zmiany:
 
@@ -73,9 +92,19 @@ skills = [".agents/skills/rust-review/SKILL.md"] # Plik musi istnieć w projekci
 
 Program nie przełącza modelu ani backendu po błędzie. Identyfikatory i effort sprawdzono w [dokumentacji Claude Code](https://code.claude.com/docs/en/model-config) oraz lokalnym katalogu modeli Codex. Zgodność katalogu nie gwarantuje dostępu na koncie. Jeżeli backend zgłosi inny model, przebieg kończy się błędem; jeżeli nie zwróci identyfikatora, raport zapisze `observed_model: null`.
 
+### Diagnostyka względem stanu bazowego
+
+Każda kontrola zapisuje pełne `diagnostics.json` obok stdout/stderr. Implementer, Fixer i niezależni recenzenci otrzymują skrót do 20 ustaleń i odsyłacze do pełnych dowodów. Każdy kandydat jest porównywany z oryginalnym baseline: `new`, `persistent`, `resolved`, `unclassified` lub `unobserved_previous`. Podsumowanie całej fazy uwzględnia także kontrole pominięte po błędzie krytycznym. Nie zmienia to wyniku wykonania ani wymogu zaliczenia gate.
+
+`resolved` wymaga udanej, porównywalnej kontroli; dla wcześniejszego błędu testu potrzebny jest jawny wynik `ok` tego samego testu w jednoznacznie rozpoznanym, kompletnym zestawie. Błąd kompilacji, timeout, przekroczenie limitu wyjścia, zmieniony zakres i niepełny wynik pozostawiają poprzednie problemy jako `unobserved_previous`. Samodzielne `verify` nie wybiera automatycznie baseline: znalezione problemy są `unclassified`.
+
+Metadane obejmują dokładne argv, profil, wariant, zakres, wersje Cargo/rustc i odpowiednio Clippy/rustfmt/rustdoc oraz skróty manifestów, lockfile, konfiguracji Cargo/Clippy i wyboru toolchain. Uwzględniana jest konfiguracja z katalogów nadrzędnych, `CARGO_HOME`, `CLIPPY_CONF_DIR` i istotne środowisko; wartości zmiennych są hashowane. Każde `cargo test` zachowawczo przechwytuje także wersję rustdoc (z uwzględnieniem `RUSTDOC`), również bez `--doc`. Próby wersji mają te same limity procesu i budżet czasu, własne logi oraz kontrolę niezmienności źródeł. Ich cache obowiązuje tylko w jednej fazie.
+
+Nieznane lub nieudane próby wersji oraz niejednoznaczne nadpisania kompilatora, wrappery, dołączane konfiguracje i `cargo --config` pozostawiają porównanie niepewne. Manifest wskazany przez `--manifest-path` musi należeć do przechwyconego zestawu. Zewnętrzny workspace, odziedziczony lockfile, odwołania do nieprzechwyconych zależności lokalnych, źródeł celów i skryptów budowania oraz nierozstrzygnięte wzorce manifestów pozostawiają konfigurację nieznaną; kompletne workspace wewnątrz projektu pozostają porównywalne. Lokalne nadpisania zależności przez `paths` lub `patch` w konfiguracji Cargo również pozostawiają konfigurację nieznaną. Własne reguły `exclude` są zachowywane bez przeglądania wykluczonych katalogów; ponieważ mogą ukrywać efektywne manifesty lub konfigurację, skrót konfiguracji pozostaje wtedy nieznany. Własne polecenia opakowujące Cargo nie wywołują zgadywanych prób narzędzi. Nieprawidłowa tożsamość celu Cargo oraz niepoprawne lub nadmiernie długie liczby w wyjściu zwiększają niepewność; nie zmieniają zapisanego wyniku wykonania. Parser zachowawczo obsługuje Cargo/rustc JSON, typowe komunikaty kompilatora oraz zwykły libtest; niestandardowe wyjście, powtarzające się nazwy zestawów i nieobsługiwane formaty nie dowodzą naprawienia problemu. `cargo fmt` i bezpośredni rustdoc nie należą do obsługiwanej domeny diagnostyki kompilatora.
+
 ### Oszczędzanie kontekstu Claude Code i Codex
 
-Domyślnie prompt zawiera krótkie wyniki udanych kontroli, końcówki błędów i ograniczony fragment diffu. Pełne logi pozostają w `checks/`; agent dostaje ścieżkę do nich. Schemat odpowiedzi jest przekazywany natywnie przez CLI, bez ponownego wklejania do promptu. Dwa niezależne przeglądy i obowiązkowe kontrole pozostają częścią każdego przebiegu. Triage nadal uruchamia się tylko wtedy, gdy recenzenci zgłoszą ustalenia.
+Domyślnie prompt zawiera krótkie wyniki udanych kontroli, końcówki błędów i ograniczony fragment diffu. Pełne logi pozostają w `checks/`; agent dostaje ścieżkę do nich. Schemat odpowiedzi jest przekazywany natywnie przez CLI, bez ponownego wklejania do promptu. Dwa niezależne przeglądy i obowiązkowe kontrole pozostają częścią każdego przebiegu. Triage uruchamia się przy ustaleniach recenzentów lub gdy którekolwiek kryterium semantyczne nie uzyska potwierdzenia obu recenzentów.
 
 Nowe i starsze konfiguracje bez sekcji `[context]` korzystają z tych ustawień:
 
@@ -102,9 +131,92 @@ Dotyczy to również zagnieżdżonego komunikatu Codex `model rerouted`. Plik `a
 
 Pole `prepare` zawiera polecenia, które mogą zmieniać pliki przed kontrolami. Szablon tworzony przez `init` zawiera `cargo check --workspace --all-targets`: przygotowuje `Cargo.lock` i pliki generowane przez budowanie przed zamrożeniem źródeł. Etap działa przed kontrolami bazowymi i po każdej implementacji lub naprawie. Pole pominięte w dowolnej konfiguracji oznacza pustą listę; tak samo `Config()` zachowuje pustą listę, aby utrzymać dotychczasowe zachowanie API. Można też jawnie ustawić `prepare = []`.
 
-Po `prepare` program zapamiętuje identyfikator źródeł. Dla v2 brak `checks` oznacza domyślnie `cargo fmt --all -- --check`, `cargo check --workspace --all-targets --locked`, `cargo test --workspace --all-targets --locked`, osobne `cargo test --workspace --doc --locked` oraz `cargo clippy --workspace --all-targets --locked -- -D warnings`. Plik bez `config_version` oznacza v1; jawna wersja 1 także jest obsługiwana. W v1 brak `checks` zachowuje fallback API `Config().checks`: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne polecenia `checks` z szablonu zawierają `--locked` i pozostają niezmienione. Jawnie podane `checks` pozostają bez zmian niezależnie od wersji; nieznana wersja konfiguracji jest odrzucana.
+Po `prepare` program zapamiętuje identyfikator źródeł. Dla v2 i v3 brak `checks` oznacza domyślnie `cargo fmt --all -- --check`, `cargo check --workspace --all-targets --locked`, `cargo test --workspace --all-targets --locked`, osobne `cargo test --workspace --doc --locked` oraz `cargo clippy --workspace --all-targets --locked -- -D warnings`. Plik bez `config_version` oznacza v1; jawna wersja 1 także jest obsługiwana. W v1 brak `checks` zachowuje dawny fallback: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne polecenia `checks` z szablonu zawierają `--locked` i pozostają niezmienione. Jawnie podane `checks` pozostają bez zmian niezależnie od wersji; nieznana wersja konfiguracji jest odrzucana.
 
-Aby przejść na pełny zakres v2, ustaw `config_version = 2` i świadomie zastąp albo usuń własne `checks`. Samo podbicie wersji zachowuje jawne polecenia. Nie włączaj automatycznie `--all-features`; wybierz konfiguracje features zgodnie ze wspieranymi wariantami projektu. Wyniki oraz recenzje odnoszą się do tej samej wersji plików. **Zmiana źródeł podczas kontroli unieważnia wyniki i zatrzymuje przebieg przed recenzjami**; generatory i formatowanie zapisujące pliki należy przenieść do `prepare`. Wykluczone artefakty budowania mogą się zmieniać. Polecenia w `prepare` i `checks` to listy argumentów, bez składni powłoki. Kontrole bazowe pokazują zastane problemy; **przejście kandydata przez kontrole jest obowiązkowe**. Zaufaj tylko komendom z własnego `workflow.toml`: są uruchamiane z uprawnieniami użytkownika.
+Aby przejść na v3 z kryteriami, ustaw `config_version = 3` i podaj plik przez `--requirements`. Aby jednocześnie przyjąć pełne domyślne kontrole, świadomie zastąp albo usuń własne `checks`. Samo podbicie wersji zachowuje jawne polecenia. Nie włączaj automatycznie `--all-features`; wybierz konfiguracje features zgodnie ze wspieranymi wariantami projektu. Wyniki oraz recenzje odnoszą się do tej samej wersji plików. **Zmiana źródeł podczas kontroli unieważnia wyniki i zatrzymuje przebieg przed recenzjami**; generatory i formatowanie zapisujące pliki należy przenieść do `prepare`. Wykluczone artefakty budowania mogą się zmieniać. Polecenia w `prepare` i `checks` to listy argumentów, bez składni powłoki. Kontrole bazowe pokazują zastane problemy; **przejście kandydata przez kontrole jest obowiązkowe**. Zaufaj tylko komendom z własnego `workflow.toml`: są uruchamiane z uprawnieniami użytkownika.
+
+### Kryteria odbioru i zgodność
+
+Pliki v1/v2 bez `--requirements` zachowują dotychczasowy protokół i jawny tryb `legacy`.
+Nie zapewniają odbioru kryteriów. Podanie pliku wymagań w v1/v2 włącza ten sam protokół v2
+co v3; błędny plik, odpowiedź lub powiązanie zatrzymuje przebieg bez powrotu do trybu zgodności.
+Jawne `checks` pozostają niezmienione we wszystkich trzech wersjach. Brak wersji oznacza v1.
+
+Każde kryterium ma unikalne `id`, `description`, `kind` i niepusty opis `verification`.
+Mechaniczne wymaga `check_id` z `verification.gate_plan.checks` w `plan`; opcjonalne `test_name`
+wskazuje dokładną nazwę testu Cargo. Semantyczne nie przyjmuje `check_id` ani `test_name`.
+Kontrola mechaniczna nie zawęża gate. Dla bezpośredniego `cargo test` także kryterium bez nazwy
+wymaga co najmniej jednego rzeczywiście zaliczonego, nieignorowanego testu. Zero przypadków,
+`--no-run` i `--list` nie stanowią dowodu; nieznany format wyniku blokuje odbiór. Dla własnych
+poleceń nietestowych dowodem jest poprawne, niezmieniające źródeł zakończenie zaufanej komendy.
+Pełne stdout/stderr są zachowane i służą do oceny testów, nawet gdy kontekst pokazuje tylko skrót.
+
+Program zapisuje znormalizowane `requirements.json` i `verification_plan.json` przed implementacją.
+Zamraża konfigurację oraz pełny plan; edycja pliku kryteriów lub konfiguracji w trakcie przebiegu
+nie zmienia przyjętego kontraktu. Każdy wynik ma powiązanie `candidate_id`, `requirements_id`,
+`verification_plan_id`. Implementer i Fixer podają wyłącznie propozycje dowodów dla wejściowej
+migawki. Obaj niezależni recenzenci oceniają wszystkie kryteria semantyczne. Każda ocena inna niż
+obustronne `satisfied` trafia do triage, również bez ustaleń kodowych. Nierozstrzygnięte kryterium
+blokuje sukces, a potwierdzone niespełnienie kieruje do ograniczonego Fixera niezależnie od
+`blocking_severities`. Po naprawie cały gate i oba review powtarzają się dla nowego kandydata.
+Triage nie może nadpisać mechanicznej porażki.
+
+`state.json` zawiera `acceptance.mode`, hashe i `acceptance.rounds` z wynikami mechanicznymi,
+niezależnymi ocenami i triage. `report.md` pokazuje planowany zakres gate, wykonane warianty,
+porównania diagnostyki, dowody kryteriów oraz decyzje recenzentów i triage. Wcześniejsze rundy
+i niepełne przebiegi są jawnie oznaczone; ich dowody nie zatwierdzają bieżącego kandydata.
+`status --summary` zachowuje skrót trybu i hashy, bez pełnych rund.
+
+Nowy udany przebieg zapisuje `acceptance.json` w wersji 1: `mode`, `cycle`, powiązanie `binding`
+(`candidate_id`, `requirements_id`, `verification_plan_id`), `gate` (profil, warianty, brak zawężenia
+pakietu/filtra, planowane kontrole i wyniki), `criteria`, `review` i `provenance` recenzji/triage.
+Stan ma osobną wersję 2, `report_contract = 1` i `acceptance_report` z wersją, nazwą
+`acceptance.json`, skrótem `digest` i powiązaniem. Wersja stanu nie jest wersją konfiguracji
+ani schematu odpowiedzi. Także nowe przebiegi `legacy` wymagają raportu; nie deklarują spełnienia
+kryteriów, których nie podano.
+
+`apply` pod blokadą sprawdza raport, skrót, zamrożone wymagania/plan, aktualne dowody pełnego gate
+i recenzji oraz dotychczasową zgodność całego oryginału i kandydata. Brak, uszkodzenie lub
+nieaktualność nowego raportu zatrzymuje operację przed backupem i zmianą źródeł. Nie wywołuje
+dostawców ani nie uruchamia ponownie kontroli. Historyczny stan bez wersji lub z wersją 1,
+bez oznak nowego kontraktu, zachowuje dawną kontrolę manifestów; usunięcie samej wersji/znacznika
+z nowego przebiegu nie włącza tego fallbacku, gdy pozostały nowe artefakty lub pochodzenie dowodów.
+Sukces oznacza odbiór skonfigurowanego zakresu i zadeklarowanych kryteriów, nie dowód kompletności
+wymagań. Lokalne skróty wykrywają niespójność, ale nie skoordynowane przepisanie wszystkich artefaktów.
+
+### Weryfikacja bez agentów
+
+Polecenie `verify` uruchamia kontrole bez `prepare`, wyboru modeli ani wywołań dostawców. Działa w podanym repozytorium źródłowym, pod blokadą projektu, i sprawdza manifest źródeł przed oraz po kontrolach. Zmianę źródeł wykrywa i raportuje, ale jej nie wycofuje. Weryfikacja nie tworzy migawek kandydata i nigdy nie uprawnia do `apply`.
+
+```sh
+bb-workflow verify fast --repo .
+bb-workflow verify focused --repo . --package recipe-core --test-filter upper_boundary
+bb-workflow verify lint --repo . --config workflow.toml --package recipe-core
+bb-workflow verify gate --repo .
+```
+
+Każdy profil przyjmuje `--repo` i opcjonalne `--config`. Szybkie profile `fast`, `focused` i `lint` przyjmują opcjonalne `--package`; tylko `focused` obsługuje `--test-filter`. `gate` odrzuca oba zawężenia i wykonuje wszystkie skonfigurowane warianty, zachowując kolejność poleceń z głównego `checks`. Nie ma nadpisania `checks` wewnątrz profilu `gate`.
+
+Profile weryfikacji znajdują się w `[verification.profiles.*]`, niezależnie od `[profiles.low|medium|high]`, które nadal wybierają modele. Bez dodatkowej konfiguracji `fast` wykonuje formatowanie i `cargo check`, `focused` — `cargo check` i testy, `lint` — Clippy, a `gate` — główny zestaw `checks`. Można skonfigurować warianty macierzy gate:
+
+```toml
+checks = [["cargo", "check", "--workspace", "--locked"]]
+
+[verification.profiles.gate]
+variants = ["default", "no-defaults-linux"]
+
+[verification.variants.default]
+
+[verification.variants.no-defaults-linux]
+features = ["serde"]
+no_default_features = true
+target = "x86_64-unknown-linux-gnu" # Opcjonalnie.
+toolchain = "stable" # Opcjonalnie.
+```
+
+`checks` na poziomie głównym pozostaje jedynym źródłem poleceń gate; każdy wariant stosuje się do wszystkich tych poleceń. Wariant domyślny nie zmienia argumentów. `features`, `all_features`, `no_default_features`, `target` i `toolchain` są jawne; program nie włącza automatycznie wszystkich features. Jeśli zawężenie lub wariant wymagałby niejednoznacznej transformacji własnego `argv` — na przykład polecenia powłoki albo sprzecznych flag Cargo — konfiguracja jest odrzucana z błędem zamiast po cichu zmieniać zakres.
+
+`verify` używa istniejącego `Cargo.lock`; nie tworzy go ani nie przygotowuje źródeł. Przy `--locked` przygotuj wcześniej pliki źródłowe i lockfile, np. przez `prepare` w zwykłym przebiegu albo ręcznie. Wyniki są zapisywane w `.bb-workflow/verifications/<id>/report.json` i `report.md`, razem z logami poleceń. Poprawny wynik ma status `passed` oraz `apply_eligible = false`. Kody wyjścia: `0` — wszystkie kontrole zaliczone, `1` — kontrola nieudana, zablokowana lub wyczerpany budżet, `130` — przerwanie, `2` — błędna konfiguracja lub użycie. Zwykłe `run` nadal przeprowadza pełny gate przed recenzjami każdego kandydata.
 
 Domyślne limity to `max_cycles = 3` (dokładnie maksymalna liczba wywołań Fixera), `max_agent_calls = 20`, `timeout_seconds = 900` na proces i `max_seconds = 3600` jako budżet uruchamiania etapów. Pozostały czas ogranicza timeout kolejnego procesu. Kopiowanie i hashowanie plików oraz sprzątanie procesów nie są przerywane w środku operacji, więc czas zakończenia może przekroczyć ten budżet. `max_retries` dotyczy tylko odczytowych ról recenzentów/triage; zapisy implementera i Fixera nie są automatycznie ponawiane. Nierozstrzygnięte ustalenie blokuje sukces. Koszt raportowany przez Claude jest sumowany, lecz Codex może nie zwracać kwoty USD; łączny koszt może być **nieznany**. Limity czasu i wywołań nie są limitem pieniężnym.
 
@@ -126,7 +238,7 @@ Przerwanego przebiegu nie da się automatycznie wznowić. Zachowaj jego `state.j
 
 Jeśli projekt zawiera dowiązania w `.claude/skills`, można dodać `exclude = [".claude/skills"]` i wskazać rzeczywiste pliki z `.agents/skills` w konfiguracji ról. Katalogi wykluczone nie są przenoszone do kopii ani objęte porównaniem przy `apply`; wymagane do budowania zasoby muszą znaleźć się w migawce. Nazwy plików i katalogów zawierające `:` lub `\` są odrzucane już podczas tworzenia migawki, także na Linux/macOS. Zmień takie nazwy albo jawnie wyklucz zbędne zasoby, zanim uruchomisz workflow. MVP nie obsługuje zmiany pliku w katalog lub odwrotnie podczas `apply`. Kopie zachowują puste katalogi, lecz `apply` synchronizuje wyłącznie pliki; zmiany samych pustych katalogów nie są przenoszone.
 
-Przerwanie procesu przez Ctrl+C zachowuje zebrane do tego momentu stdout i stderr w katalogu jego artefaktów. Dotyczy to dostawców oraz poleceń przygotowania i kontroli; przebieg nadal kończy się jako `interrupted`. Audyt wywołania dostawcy zapisuje status przerwania i dostępne pomiary, które mogą być częściowe.
+Przerwanie procesu przez Ctrl+C zachowuje zebrane do tego momentu stdout i stderr w katalogu jego artefaktów. Dotyczy to dostawców, poleceń przygotowania i kontroli oraz odczytów wersji narzędzi w `run` i samodzielnym `verify`; przebieg nadal kończy się jako `interrupted`. Logi przerwanego odczytu wersji pozostają przy tej próbie, a niewykonana kontrola nie otrzymuje jej wyjścia. Audyt wywołania dostawcy zapisuje status przerwania i dostępne pomiary, które mogą być częściowe.
 
 ## Testy i przykład
 
@@ -141,6 +253,11 @@ PYTHONPATH=src python3 examples/demo.py
 ```
 
 W PowerShell ustaw najpierw `$env:PYTHONPATH = "src"`, a następnie użyj `python -m unittest ...`. Po instalacji edytowalnej `PYTHONPATH` nie jest potrzebne. Testy integracji używają atrap dostawców; testy procesów i snapshotów mogą uruchamiać lokalne programy, np. Python i Git. Nie wymagają kont Claude Code ani Codex. Test naprawionego zachowania dodaj w odpowiadającym module `tests/test_<module>.py`, wraz z istotnym przypadkiem błędu.
+
+Rzeczywiste testy Cargo używają workspace bez zewnętrznych zależności i trybu offline. Wymagają
+Git, Cargo, rustc, rustdoc oraz komponentów rustfmt i Clippy; lokalnie brak narzędzi daje jawne
+pominięcie klasy testów. CI instaluje komponenty i obowiązkowo sprawdza narzędzia przed testami,
+więc brak Cargo nie może tam po cichu pominąć tej części odbioru.
 
 Zakres odczytu dobieraj według zmiany: `backends.py` odpowiada za wywołania CLI i format wyników, `process.py` za limity i sprzątanie procesów, `engine.py` za etapy, prompty i audyt, `protocol.py` za walidację odpowiedzi oraz triage, `workspace.py` za snapshoty i `apply`. Konfiguracja i routing są w `config.py`, pomiary w `usage.py`, polecenia w `cli.py`. Zmiany promptów wymagają także sprawdzenia `src/bb_workflow/prompts/` i testów kontekstu w `test_engine.py`. Przy zmianach etapów, snapshotów lub `apply` przeczytaj `docs/architecture.md`.
 

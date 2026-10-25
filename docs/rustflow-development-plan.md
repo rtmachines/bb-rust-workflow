@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etap 1 zakończony i zweryfikowany; etapy 2–5 do realizacji
+Status: etapy 1–5 zaimplementowane; lokalna weryfikacja i niezależne przeglądy zakończone 2026-10-25
 
 ## Cel i zachowane gwarancje
 
@@ -23,7 +23,7 @@ Najpierw uzupełniamy domyślny zestaw:
 
 Szablon tworzony przez `init` zawiera `prepare = [["cargo", "check", "--workspace", "--all-targets"]]`, uruchamiane przed zamrożeniem źródeł. Pominięte pole `prepare` oznacza pustą listę we wszystkich wersjach konfiguracji, podobnie jak `Config()` zachowuje pustą listę dla zgodności API. Każda późniejsza zmiana źródeł unieważnia kontrolę.
 
-Konfiguracja szablonu ma `config_version = 2`. Brak pola oznacza wersję 1; jawna wersja 1 jest również obsługiwana, a inne nieznane wersje są odrzucane. Jeśli `checks` nie podano, v2 używa powyższego pełnego zestawu, a v1 zachowuje dotychczasowy fallback `Config().checks`: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne komendy z szablonu zawierają `--locked` i pozostają bez zmian. W obu wersjach jawne `checks` pozostają dokładnie takie, jak skonfigurował użytkownik.
+Etap 1 wprowadził `config_version = 2`; od etapu 4 szablon i `Config()` mają wersję 3. Brak pola oznacza wersję 1; jawna wersja 1 jest również obsługiwana, a inne nieznane wersje są odrzucane. Jeśli `checks` nie podano, v2 i v3 używają powyższego pełnego zestawu, a v1 zachowuje dawny fallback: `cargo fmt --check`, `cargo check --all-targets`, `cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings` (bez `--locked`). Historyczne jawne komendy z szablonu zawierają `--locked` i pozostają bez zmian. We wszystkich obsługiwanych wersjach jawne `checks` pozostają dokładnie takie, jak skonfigurował użytkownik.
 
 Migracja do pełnego zakresu v2 wymaga ustawienia `config_version = 2` oraz świadomego zastąpienia lub usunięcia jawnego `checks`; samo podbicie wersji nie zmienia tych poleceń. Nie włączamy automatycznie `--all-features`. `plan` pokazuje wersję, tryb zgodności, zakres i dokładne komendy. Zmiany obejmują [szablon konfiguracji](../src/bb_workflow/default.toml) i [wartości domyślne w kodzie](../src/bb_workflow/config.py).
 
@@ -33,7 +33,9 @@ Migracja do pełnego zakresu v2 wymaga ustawienia `config_version = 2` oraz świ
 
 ## 2. Wspólne wykonywanie kontroli, szybkie profile i warianty
 
-Wydzielamy wykonywanie kontroli z `engine.py` do niewielkiego modułu `verification.py`. Korzystają z niego zarówno orkiestrator, jak i nowe polecenie `verify`. Obecny `process.py` pozostaje odpowiedzialny za procesy, timeouty i sprzątanie.
+**Status: implementacja, weryfikacja i przeglądy zakończone 2026-10-25.**
+
+Wykonanie kontroli jest wydzielone z `engine.py` do niewielkiego modułu `verification.py`. Korzystają z niego zarówno orkiestrator, jak i polecenie `verify`. `process.py` nadal odpowiada za procesy, timeouty i sprzątanie.
 
 Profile kontroli umieszczamy w **`[verification.profiles.*]`**. Obecne `[profiles.low|medium|high]` nadal oznaczają dobór modeli.
 
@@ -44,9 +46,9 @@ Profile kontroli umieszczamy w **`[verification.profiles.*]`**. Obecne `[profile
 | `lint` | Clippy | Celowana analiza kodu |
 | `gate` | Pełny zestaw z etapu 1 | Obowiązkowa weryfikacja końcowa |
 
-Dodajemy jawne warianty features, targetu i toolchainu w `[verification.variants.*]`. Gate wykonuje wszystkie przypisane mu warianty. Nie włączamy automatycznie `--all-features`; macierz ma odzwierciedlać wspierane konfiguracje projektu.
+Dodaliśmy jawne warianty features, targetu i toolchainu w `[verification.variants.*]`. Gate wykonuje wszystkie przypisane mu warianty, w kolejności konfiguracji, dla poleceń z głównego `checks`. Główne `checks` pozostaje jedynym źródłem komend gate; profil `gate` nie może definiować własnych komend. Szybkie profile mogą mieć własne listy poleceń. Profile weryfikacji są odrębne od modelowych `[profiles.low|medium|high]`. Nie włączamy automatycznie `--all-features`; macierz ma odzwierciedlać wspierane konfiguracje projektu.
 
-Proponowany przyszły interfejs:
+Interfejs polecenia:
 
 ```text
 bb-workflow verify fast --repo . --package recipe-core
@@ -54,13 +56,21 @@ bb-workflow verify focused --repo . --package recipe-core --test-filter upper_bo
 bb-workflow verify gate --repo .
 ```
 
-`verify` działa bez modeli, w bieżącym katalogu projektu, z kontrolą niezmienności źródeł. Nie uruchamia automatycznie operacji przygotowawczych zapisujących źródła. Raporty trafiają do `.bb-workflow/verifications/`.
+Profile `fast`, `focused` i `lint` przyjmują opcjonalne `--package`; `--test-filter` jest dostępne wyłącznie dla `focused`. `gate` odrzuca zawężanie i uruchamia wszystkie skonfigurowane warianty. `verify` działa w rzeczywistym repozytorium źródłowym, pod blokadą, bez agentów i bez `prepare`; używa istniejących źródeł i lockfile. Raporty `report.json` i `report.md` wraz z pełnymi logami trafiają do `.bb-workflow/verifications/<id>/`. Sukces ma status `passed` i `apply_eligible = false`. Manifest źródeł jest sprawdzany przed oraz po kontrolach; zmiany zostają zgłoszone, ale nie są cofane. Przy `--locked` źródła oraz `Cargo.lock` muszą być już przygotowane.
+
+Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` — `cargo check` oraz testy; `lint` — Clippy; `gate` — główne `checks`. Własne komendy zachowują argv bez zmian, gdy nie zażądano transformacji. Niejednoznaczne zawężanie lub flagi wariantu powodują czytelny błąd konfiguracji. Kody wyjścia `verify`: `0` dla zaliczenia, `1` dla niepowodzenia/zablokowania/wyczerpania budżetu, `130` dla przerwania i `2` dla błędu konfiguracji lub użycia.
 
 **Odbiór etapu:** szybki profil nie może nadać wynikowi statusu uprawniającego do `apply`. Gate odrzuca zawężanie pakietu lub filtra testów. W `run` pełny gate nadal poprzedza recenzje każdego kandydata.
 
+**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd implementacji oraz końcowy przegląd całej gałęzi zatwierdziły zmiany bez krytycznych, ważnych ani drobnych usterek do poprawienia. Kontrole uruchomiono na Linux; testy Windows pominięto, a dostawców modeli zastąpiły atrapy. Transformacje własnych komend Cargo celowo obsługują zachowawczy podzbiór argumentów. Obsługa częściowych wyników po przerwaniu procesu pozostała bez zmian. Etapy 3–5 opisano poniżej.
+
 ## 3. Klasyfikacja diagnostyki względem baseline
 
-Dodajemy `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie.
+**Status: implementacja, weryfikacja i niezależne przeglądy zakończone 2026-10-25.**
+
+Wdrożono `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie. Każda kontrola i faza mają pełne `diagnostics.json`, a stan i prompty otrzymują ograniczony skrót oraz odsyłacze. Kandydaci porównują się z niezmiennym oryginalnym baseline; kończenie po błędzie uwzględnia także kontrole niewykonane.
+
+Metadane przechwytują rzeczywiste wersje narzędzi, wybór toolchain, manifesty/lockfile, konfigurację Cargo/Clippy projektu, przodków, `CARGO_HOME`, `CLIPPY_CONF_DIR` oraz hashowane istotne środowisko. Próby wersji mają wspólny budżet i limity wykonawcy, pełne artefakty i kontrolę źródeł; cache obowiązuje tylko w obrębie fazy. Nieznane próby, niejednoznaczne nadpisania, własne wykluczenia źródeł oraz nieprzechwycone manifesty, zależności i nierozstrzygnięte globy pozostawiają metadane niepewne. Każde polecenie Cargo test wymaga znanej wersji rustdoc do porównania diagnostyki, także gdy wybrany zakres nie uruchamia doctestów; brak tej informacji nie zmienia wyniku wykonania kontroli. Zmiana zewnętrznej konfiguracji podczas próby lub kontroli również unieważnia porównanie. Nierozpoznane polecenia pomijają zgadywane próby i odczyt konfiguracji. Samodzielny `verify` nie wybiera baseline i oznacza znalezione problemy jako `unclassified`.
 
 Rozdzielamy **wynik wykonania polecenia** od **wyniku parsowania diagnostyki**. Pusta lista znalezionych błędów nie oznacza zaliczonej kontroli.
 
@@ -78,7 +88,11 @@ Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego fo
 
 **Odbiór etapu:** błąd kompilacji uniemożliwiający wykonanie testów nie oznacza naprawienia wcześniejszych błędów testowych. Timeout, ucięte wyjście i zmieniony zakres również nie dają `resolved`. Czerwony baseline nadal nie zwalnia z zielonego gate.
 
+**Weryfikacja etapu 3:** końcowy pełny przebieg obejmuje 305 testów: 303 zaliczone, 2 natywne testy Windows pominięte na Linux (46,258 s). Moduł diagnostyki ma 43 testy, wykonawca weryfikacji 38, silnik 55, a zestaw Cargo 7 rzeczywistych testów offline. Regresje obejmują błąd testu bazowego → błąd kompilacji kandydata → jawne przejście tego samego testu, diagnostykę JSON w różnych katalogach i po przesunięciu linii, niepełne komunikaty, skrajnie długie liczby, zmiany narzędzi i konfiguracji oraz nieprzechwycone zależności. Ruff, formatowanie 34 plików, lokalny reviewdog z surowym Ruff i kontrola diffu zakończyły się pomyślnie. Przeglądy modułu, integracji i całej gałęzi wykryły przypadki brzegowe; po poprawkach ponowny przegląd potwierdził zamknięcie wszystkich ustaleń bez nowych istotnych regresji. Dostawców modeli w testach zastąpiły atrapy; nie uruchamiano płatnych sesji dostawców workflow. Zmiana bazuje na ukończonym etapie 2, commit `30612b4`. Etapy 4 i 5 opisano poniżej.
+
 ## 4. Jawne kryteria odbioru powiązane z dowodami
+
+**Status: implementacja, weryfikacja i niezależne przeglądy etapu 4 zakończone 2026-10-25. Etap 3 jest również obecny po integracji z main.**
 
 Dodajemy plik wymagań przekazywany do `run`, np.:
 
@@ -109,7 +123,52 @@ Rozszerzenie wymaga wersjonowanego schematu odpowiedzi — obecny [protokół](.
 
 **Odbiór etapu:** brak oceny kryterium, nieznany identyfikator, nieaktualny dowód lub pozytywna deklaracja implementera nie pozwalają zakończyć zadania sukcesem.
 
+**Implementacja:** plik TOML `requirements_version = 1` zawiera niepuste `criteria` z unikalnym
+`id`, `description`, `kind` i wymaganym opisem `verification`. Mechaniczne kryterium wiąże
+`check_id` i opcjonalne dokładne `test_name` z całym, niezwężanym gate. Program wymaga aktualnego
+wyniku komendy; bezpośredni Cargo test zawsze wymaga dodatniej liczby zaliczonych nieignorowanych
+testów, a nazwany test również własnej zakończonej linii sukcesu. Nieznany harness pozostaje
+nierozstrzygnięty. Własne komendy nietestowe opierają się na zaufaniu do poprawnego zakończenia.
+
+V3 wymaga kryteriów w `run`. V1/v2 bez pliku zachowują jawny `legacy`; podanie pliku włącza
+protokół v2. `plan` obsługuje plik i raportuje brak wymaganych kryteriów; `verify` i `doctor`
+działają bez niego. Zamrożone kopie konfiguracji, wymagań i planu zapobiegają zmianie kontraktu
+w trakcie przebiegu. Znormalizowane pliki i hashe trafiają do katalogu audytu przed implementacją.
+Implementer/Fixer dostają powiązanie wejściowej migawki i mogą jedynie proponować dowody.
+Obaj recenzenci oceniają każdy semantyczny ID; każde inne zestawienie niż dwa `satisfied`
+uruchamia triage, także bez ustaleń kodowych. Brak oceny/ID/powiązania odrzuca odpowiedź.
+`unmet` kieruje do Fixera bez względu na `blocking_severities`, `unresolved` blokuje;
+nowy kandydat przechodzi cały gate i oba niezależne review od początku.
+
+Podstawowy stan i raport ujawniają tryb oraz hashe; szczegóły rund są w `acceptance.rounds`.
+Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` dodaje etap 5 opisany poniżej.
+Przykład: [`task-requirements.toml`](../examples/task-requirements.toml); demo offline używa
+rzeczywistych kontroli Cargo i jawnie oznaczonych atrap ocen semantycznych.
+
+**Weryfikacja lokalna etapu 4 (2026-10-25):** końcowy pełny zestaw na Python 3.11 wykonał
+307 testów: 305 zaliczonych, 2 testy natywnych junctions Windows pominięte na Linux.
+Wcześniejszy pełny zestaw na Python 3.14 oraz celowane zestawy po poprawkach również przeszły.
+Sześć regresji Cargo używa rzeczywistych poleceń offline; nowa porównuje poprawne zakończenie
+z zerem dopasowanych przypadków (kryterium `unmet`), dokładny zaliczony test (`satisfied`),
+standardowy test `#[should_panic]` oraz niedopasowaną nazwę mimo zaliczenia innego testu.
+Demo z plikiem kryteriów przeszło pełny gate offline. Ruff przez lokalny reviewdog, formatowanie
+i kontrola diffu są poprawne. Niezależne przeglądy obu części i całej gałęzi zakończono;
+wszystkie zgłoszone usterki poprawiono i zatwierdzono w ponownych przeglądach. Regresje obejmują
+różne sposoby wywołania Cargo oraz odrzucenie zmiany kandydata podczas triage przed Fixerem.
+Nie uruchamiano płatnych sesji dostawców.
+
+**Kontrole po integracji etapów 3 i 4 z aktualnym `main` (2026-10-25):** pełny zestaw na
+Python 3.11 wykonał 386 testów: 384 zaliczone, 2 natywne testy junctions Windows pominięte na
+Linux (69,944 s). Celowane zestawy obejmują 26 testów odbioru, 57 silnika i 8 rzeczywistych
+regresji Cargo offline. Dodana regresja potwierdza wspólny aktualny kontekst diagnostyki i kryteriów
+w obu niezależnych review; naprawy mechaniczne zachowują także skrót diagnostyki i pełne odsyłacze.
+Demo offline przeszło pełny gate, a Ruff przez lokalny reviewdog, formatowanie 37 plików i kontrola
+diffu są poprawne. Etap 5 pozostaje poza zakresem.
+
 ## 5. Raportowanie, integracja z apply i odbiór całości
+
+**Status: implementacja, lokalna weryfikacja i niezależne przeglądy zakończone 2026-10-25.
+Wyniki oraz granice sprawdzenia platform są zapisane w [raporcie walidacji](validation.md).**
 
 Raport końcowy pokazuje osobno zakres gate, wykonane warianty, zmiany diagnostyki, dowody dla kryteriów oraz decyzje recenzentów i triage.
 
@@ -124,6 +183,31 @@ Końcowa weryfikacja obejmuje:
 - Ruff, lokalny reviewdog oraz testy platform, dla których deklarujemy wsparcie.
 
 Sesje modeli pozostają zastąpione atrapami w testach automatycznych.
+
+**Zrealizowane:** `report.md` oddziela finalne dowody od historycznych i częściowych; końcowy
+`acceptance.json` wersji 1 wiąże kandydata, wymagania, pełny plan, kontrole i kryteria z recenzjami
+oraz triage. Nowy stan wersji 2 ma `report_contract = 1` i metadane `acceptance_report`.
+`apply` lokalnie odtwarza i porównuje kontrakt przed backupem; dotyczy to także nowych przebiegów
+legacy. Historyczny stan bez wersji lub v1, bez oznak nowego kontraktu, zachowuje dawne zasady.
+Usunięcie pojedynczego znacznika z nowego przebiegu nie obchodzi walidacji przy zachowanym
+nowym pochodzeniu dowodów. Lokalne skróty nie chronią przed wspólnym przepisaniem całego audytu.
+
+Nowa regresja przechodzi rzeczywisty workspace offline od implementacji przez pełny gate
+z doctestami i wariantami default/feature do raportu oraz jawnego apply. Sprawdza przeniesienie
+zmienionego źródła i przygotowanego `Cargo.lock`, odmowę przy brakującym raporcie przed backupem
+i brak nowych wywołań dostawców przy apply. Zachowano odrzucenie zerowego filtra mimo kodu zero,
+dodając brak końcowego raportu i odmowę apply. Istniejące testy pokrywają awarie, przerwania,
+limity, zmianę źródeł, niezależność recenzji oraz migracje konfiguracji i odpowiedzi.
+CI instaluje rustfmt/Clippy oraz obowiązkowo sprawdza narzędzia przed unittest na skonfigurowanej
+macierzy Ubuntu/Windows × Python 3.11/3.13. Nie jest to dowód uruchomienia zdalnego CI ani
+natywnego Windows/macOS w lokalnej sesji Linux.
+
+**Weryfikacja końcowa:** Python 3.11.17, 3.13.17 i 3.14.8 na Linux: po 407 testów,
+405 zaliczonych i 2 pominięte natywne testy Windows; w tym 9 rzeczywistych testów Cargo offline.
+Ruff, formatowanie oraz lokalny reviewdog przeszły. Niezależne przeglądy obu zadań i całej gałęzi
+zakończono; poprawiono wykrywanie zachowanych śladów nowego kontraktu przy próbie downgrade
+oraz widoczność decyzji zablokowanego triage. Regresje i ponowne przeglądy potwierdziły poprawki.
+Sesje dostawców workflow zastępowały atrapy.
 
 ## Kolejność realizacji
 

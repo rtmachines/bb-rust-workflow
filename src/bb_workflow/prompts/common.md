@@ -10,5 +10,16 @@ editing or concluding. Use exposed Rust LSP for semantic questions; otherwise in
 source/tests and disclose that fallback. The orchestrator runs build/lint/tests; do not
 bypass tool restrictions to run them. Never claim unperformed checks.
 Return JSON matching the CLI-supplied schema. Keep summary concise with evidence and
-limitations; omit progress narration. Conflicting instructions or unmet requirements mean
-status=blocked, never completed.
+limitations; omit progress narration. If conflicts prevent performing the assigned stage,
+return status=blocked. A completed review may report unmet or unresolved criterion verdicts;
+status describes whether the assigned review was performed, not whether the candidate passed.
+When acceptance.schema_version=2, use the supplied immutable requirements and full verification
+plan. Echo the exact three-way binding in every response; never substitute edited files or
+post-edit hashes. The orchestrator alone evaluates mechanical proof. Return all required arrays,
+including empty role-inappropriate arrays. Unknown, missing or stale acceptance evidence cannot
+approve the candidate. Without acceptance criteria retain the legacy response contract.
+Diagnostic classifications are evidence, not gate authority. Inspect bounded diagnostics,
+uncertainty and full-report/log paths when needed. `persistent` failures still block the
+gate; `unobserved_previous` means a previous finding was not assessed, never resolved.
+Only an explicit corresponding test pass in a complete comparable suite can resolve a
+previous test failure. Standalone verification has no automatic baseline.

@@ -204,6 +204,7 @@ def run_process(
 
     Both pipes are drained without blocking, sharing one raw-byte output cap.
     Crossing the cap stops the process and marks the retained prefix incomplete.
+    Output is decoded as UTF-8 with replacement; captured newlines are preserved.
     Capture never waits for inherited handles to reach EOF. ``env``, when set,
     is the complete child environment, as with ``subprocess.Popen``. On POSIX,
     remaining group members are terminated even after successful completion.

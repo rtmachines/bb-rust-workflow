@@ -14,20 +14,24 @@ flowchart TD
     Q -->|błąd| F
     G --> E[Kontrole kandydata: bez zmian źródeł]
     E -->|błąd| F{Limit Fixera?}
-    E -->|sukces| H[Reviewer A: osobna kopia i proces]
-    E -->|sukces| I[Reviewer B: osobna kopia i proces]
+    E -->|sukces i dowód mechaniczny| H[Reviewer A: osobna kopia i proces]
+    E -->|sukces i dowód mechaniczny| I[Reviewer B: osobna kopia i proces]
+    E -->|niespełnione kryterium mechaniczne| F
+    E -->|nierozstrzygnięty dowód mechaniczny| M
     E -->|zmiana źródeł| R[Wyniki unieważnione: failed]
     H --> J[Scalenie dokładnych duplikatów]
     I --> J
-    J -->|ustalenia| K[Triage na osobnej kopii]
-    J -->|brak ustaleń| L[Wynik succeeded]
+    J -->|ustalenia lub sporne kryteria| K[Triage na osobnej kopii]
+    J -->|brak ustaleń i spełnione kryteria| S[Zapis i walidacja acceptance.json]
     K -->|nierozstrzygnięte| M[Wynik blocked]
-    K -->|potwierdzone blokujące| F
-    K -->|bez blokujących| L
+    K -->|blokujące ustalenia lub niespełnione kryteria| F
+    K -->|bez blokujących ustaleń i spełnione kryteria| S
     F -->|limit wyczerpany| N[Wynik limit_exhausted]
     F -->|dostępny| O[Fixer]
     O --> Q
-    L --> P[Jawne apply z kontrolą całej migawki]
+    S -->|sukces| L[Wynik succeeded]
+    S -->|błąd| T[Wynik failed]
+    L --> P[Jawne apply z kontrolą odbioru i całej migawki]
 ```
 
 Recenzje są **niezależne co do procesu i kopii**: obaj recenzenci widzą tę samą zamrożoną migawkę, wymagania, wyniki kontroli i diff, ale nie wyniki drugiego recenzenta. Wywołania są sekwencyjne, co utrzymuje przewidywalny budżet. Po recenzjach program porównuje manifest źródła z migawką; zmiana w trakcie przeglądu kończy przebieg błędem. Triage musi rozstrzygnąć każde ustalenie dokładnie raz jako `confirmed`, `rejected`, `duplicate` lub `unresolved`, z uzasadnieniem. Dokładne duplikaty są scalane z zachowaniem pochodzenia; inne pozornie podobne uwagi rozstrzyga triage. Poziom kanonicznego ustalenia zachowuje najwyższą wagę w grupie duplikatów, aby scalanie nie usunęło blokady. Potwierdzone ustalenie zawiera też `duplicates` z pełnymi dowodami i pochodzeniem pozostałych uwag w grupie; Fixer otrzymuje je razem, aby naprawa nie zgubiła odmiennego scenariusza błędu. Ustalenia dotyczące usuniętych plików mogą wskazywać ścieżkę i linię z migawki bazowej. Kontekst Fixera wskazuje również `baseline_directory`, co pozwala odtworzyć dowody z usuniętych źródeł. `unresolved` blokuje sukces. Potwierdzone ustalenia o poziomach wymienionych w `blocking_severities` kierują do Fixera; domyślnie blokują `critical`, `high`, `medium`.
@@ -42,20 +46,91 @@ Przed kontrolami i pierwszym wywołaniem dostawcy program sprawdza istnienie zas
 
 `BackendError.retryable` rozróżnia błędy dopuszczające ograniczone ponowienie od błędów konfiguracji adaptera, uruchomienia procesu, zmiany modelu i przekroczenia limitu wyjścia. Te ostatnie zatrzymują rolę bez ponowień. Pozostałe błędy dostawcy mogą być ponawiane tylko dla odczytowych ról, po ponownym sprawdzeniu niezmienności kopii i w ramach istniejących limitów.
 
+## Kryteria odbioru (etap 4)
+
+`Workflow(..., *, requirements: Requirements | None = None)` kopiuje konfigurację i jednorazowo
+rozwiązuje niezmienny pełny gate. V3 bez kryteriów blokuje `run` przed kontrolami i dostawcami;
+v1/v2 bez kryteriów mają jawny tryb `legacy` i schemat odpowiedzi v1. Podane kryteria w każdej
+wersji konfiguracji włączają schemat v2. Niepoprawne nowe wejście nigdy nie uruchamia fallbacku.
+`plan` bez kryteriów, `doctor` i samodzielne `verify` nadal są dostępne.
+
+Przed implementacją zapisuje się wymagania i plan. Powiązanie każdej odpowiedzi obejmuje
+`candidate_id`, `requirements_id`, `verification_plan_id`. Dla roli zapisującej kandydat oznacza
+migawkę przed wywołaniem; `criterion_evidence` są propozycjami, bez prawa zatwierdzenia. Recenzenci
+otrzymują powiązanie rzeczywistego przygotowanego i sprawdzonego kandydata oraz identyczne kryteria
+i dowody mechaniczne. Nie otrzymują wzajemnych ocen. Każdy ocenia wszystkie kryteria semantyczne.
+
+Po pełnym gate program zapisuje `acceptance.rounds[].mechanical`. Brak testu lub zero wykonanych
+przypadków kieruje do ograniczonego Fixera; nieznany wynik blokuje. Każde kryterium bezpośredniego
+Cargo test wymaga dodatniej liczby zaliczonych testów w zakończonym udanym wyniku libtest,
+a nazwane wymaga dokładnej zaliczonej nazwy. Sprawdzane są pełne logi, oba identyfikatory źródeł,
+komenda, profil, wariant i brak błędów/limitów. Kryterium własnej nietestowej komendy ufa jej
+poprawnemu zakończeniu. Fatalna zmiana źródeł, przerwanie lub budżet zachowuje swój status;
+dostępny częściowy dowód jest audytowany bez kierowania do semantycznego override.
+
+Obustronne `satisfied` rozstrzyga kryterium semantyczne. Każde inne zestawienie trafia do triage,
+nawet przy pustych `findings`; `criterion_decisions` rozstrzyga dokładnie sporne ID, oddzielnie od
+oryginalnych `decisions` ustaleń kodowych. `unresolved` blokuje; `unmet` wymaga naprawy niezależnie
+od wagi ustaleń. Cały gate i obie recenzje powtarzają się po każdej naprawie. Status odpowiedzi
+`completed` oznacza wykonanie przydzielonego review/triage i może zawierać niespełnione kryteria.
+Sukces wymaga aktualnego dowodu dla każdego kryterium oraz wszystkich poprzednich gwarancji.
+
+`acceptance` w stanie zawiera tryb, hashe i pełne rundy. `status --summary` pomija pełne rundy.
+
+## Końcowy odbiór i raport (etap 5)
+
+Przed nadaniem `succeeded` silnik buduje i zapisuje `acceptance.json`, po czym sprawdza go
+wobec trwałych dowodów. Błąd zapisu lub walidacji nie pozostawia sukcesu uprawniającego do apply.
+Raport wersji 1 zawiera `version`, `mode`, `cycle`, `binding`, `gate`, `criteria`, `review`
+i `provenance`. Powiązanie identyfikuje finalnego kandydata, zamrożone wymagania i cały plan.
+`gate` zachowuje `profile`, `variants`, `package`, `test_filter`, `planned_checks`, `results`;
+końcowy gate nie dopuszcza zawężenia pakietu ani filtra. `criteria` zawiera opis, werdykt i dowód
+każdego kryterium; `review` obejmuje obie niezależne recenzje i ewentualny triage, a `provenance`
+wiąże je z ukończonymi wywołaniami i zapisanymi zwalidowanymi odpowiedziami.
+
+`state.json` ma wersję 2 i `report_contract = 1`. Jego `acceptance_report` zawiera `version`,
+`file` (dokładnie `acceptance.json`), kanoniczny SHA-256 `digest` i `binding`. Wersje konfiguracji
+1/2/3 i schematów odpowiedzi 1/2 są od tego niezależne. Nowy tryb `legacy` również zapisuje
+i wymaga końcowego raportu, z pustymi kryteriami i jawnym brakiem gwarancji wymagań.
+
+`acceptance.py` odtwarza kontrakt z zapisanych wymagań, planu, kontroli i recenzji, ponownie
+ocenia mechaniczne dowody z pełnych logów i porównuje wynik z raportem oraz metadanymi stanu.
+Sprawdza kompletność i kolejność gate, niezmienność źródeł, powiązania, aktualne werdykty,
+protokół odpowiedzi i odrębne pochodzenie recenzji. `apply` wykonuje tę kontrolę lokalnie pod
+istniejącą blokadą, przed backupem; nie wywołuje modeli ani Cargo. Następnie obowiązują wszystkie
+dotychczasowe kontrole manifestów i odzyskiwanie po błędach.
+
+Historyczne stany bez wersji lub z wersją 1 zachowują dawny kontrakt tylko bez oznak nowego
+formatu. Znacznik, metadane raportu, sam raport lub nowe pochodzenie odpowiedzi/recenzji
+uniemożliwiają taki fallback po obniżeniu wersji. Nieznane wersje i niekompletne nowe raporty
+są odrzucane. Skróty i odtworzenie chronią przed przypadkową nieaktualnością lub niespójnością;
+nie stanowią podpisu ani ochrony przed skoordynowaną zmianą wszystkich lokalnych dowodów.
+
+`reporting.py` tworzy czytelny `report.md`: zakres planu i wykonane warianty, klasyfikację
+diagnostyki, kryteria z dowodami i powiązaniami, recenzje, triage i pomiary. Rundy historyczne
+i częściowe są odróżnione od zatwierdzonej końcowej rundy. Niepełny przebieg nie publikuje
+końcowego zatwierdzenia. Sukces poświadcza skonfigurowany zakres, nie kompletność wymagań.
+
 ## Odpowiedzialności modułów
 
 | Moduł | Odpowiedzialność |
 | --- | --- |
-| `cli.py` | Polecenia `init`, `plan`, `doctor`, `run`, `status`, `apply`; wejście konsolowe i raportowanie wyników. |
-| `config.py`, `default.toml` | Parsowanie TOML, walidacja limitów/modeli/narzędzi, heurystyka złożoności oraz wybór pięciu ról. |
-| `engine.py` | Maszyna stanów: migawka, implementacja, kontrole, recenzje, triage, Fixer, limity, artefakty i raport. |
+| `cli.py` | Polecenia `init`, `plan`, `doctor`, `verify`, `run`, `status`, `apply`; wejście konsolowe i raportowanie wyników. |
+| `config.py`, `default.toml` | Parsowanie TOML, walidacja limitów/modeli/narzędzi i profili weryfikacji, heurystyka złożoności oraz wybór pięciu ról. |
+| `engine.py` | Orkiestracja maszyny stanów: migawka, implementacja, kontrole, recenzje, triage, Fixer, limity, artefakty i raport. Pełny gate nadal poprzedza recenzje każdego kandydata. |
+| `verification.py`, `verification_metadata.py` | Planowanie profili i wariantów, wykonanie kontroli, ograniczone próby wersji, skróty konfiguracji i raporty samodzielnego `verify`. |
+| `diagnostics.py` | Czyste parsowanie pełnych strumieni, zachowawcze porównanie diagnostyki i skróty dowodów; bez uprawnień do zmiany wyniku wykonania. |
 | `backends.py` | Jedna świeża sesja CLI dla roli, jawny model i format strukturalny, zapis surowego wyjścia, sprawdzenie zakończenia i zgłoszonego modelu. |
 | `usage.py` | Normalizacja liczników Claude/Codex, cache bez podwójnego liczenia, sumy zmierzonych tokenów i jawne braki danych. |
 | `process.py` | Uruchomienie argv bez powłoki, przechwycenie stdout/stderr, timeout i próba zatrzymania drzewa procesów na Linux/macOS/Windows. |
 | `_windows_job.py` | Nadzorca Windows: przed uruchomieniem polecenia dołącza do Job Object z kończeniem członków przy zamknięciu; przekazuje kod zakończenia i błędy przez prywatny plik wyniku. |
+| `requirements.py` | Ścisły niezmienny kontrakt wymagań, hashe pełnego planu i ocena mechanicznego dowodu z audytowanych kontroli i pełnych logów. |
+| `acceptance.py`, `reporting.py` | Budowa i lokalna walidacja końcowego kontraktu odbioru; czytelny raport pełnych, historycznych i częściowych dowodów. |
 | `protocol.py` | Wspólny schemat JSON odpowiedzi, walidacja ścieżek/linii ustaleń, deduplikacja oraz pełne rozstrzygnięcie triage. |
 | `workspace.py` | Manifesty hashujące treść i prawa plików, zweryfikowane kopie, blokada projektu oraz `apply` z kontrolą konfliktu i próbą wycofania. |
 | `prompts/*.md` | Instrukcje poszczególnych ról; nie są mechanizmem egzekwowania limitów ani kolejności. |
+
+Samodzielne `verify` korzysta ze wspólnego wykonawcy kontroli, ale działa bezpośrednio na wskazanym repozytorium, pod jego blokadą. Nie wykonuje `prepare`, nie tworzy migawek ani workspace kandydata i nie wywołuje agentów. Zamraża manifest źródeł, porównuje go przed i po poleceniach oraz zapisuje pełne logi i raporty `report.json`/`report.md` w `.bb-workflow/verifications/<id>/`. Zmiany źródeł są wykrywane i powodują unieważnienie wyników; nie są automatycznie cofane. Nawet status `passed` ma `apply_eligible = false` i nie może autoryzować `apply`.
 
 Claude dostaje minimalny zestaw narzędzi odpowiedni dla roli; zapis ma tylko implementer i Fixer. Opcjonalny `LSP` i `mcp_config` dotyczą Claude. Codex używa odczytowego lub zapisywalnego trybu pracy odpowiednio do roli, pomija odziedziczoną konfigurację użytkownika i w tym MVP nie przyjmuje konfiguracji MCP. Kontrole Rust (`cargo`) uruchamia sam orkiestrator z konfiguracji, a nie agent. Dostępność LSP nie jest warunkiem przebiegu: agent ma ujawnić fallback do źródeł, testów i `cargo`.
 
@@ -66,16 +141,24 @@ Jeden `run` tworzy `.bb-workflow/runs/<id>/` wewnątrz oryginalnego projektu:
 - `workspace/`: kandydat edytowany przez implementera i Fixera;
 - `baseline/`, `baseline_manifest.json`: kopia i manifest stanu początkowego;
 - `checks/`: komendy, stdout i stderr każdej kontroli;
+- `requirements.json`, `verification_plan.json`: znormalizowane wejścia zamrożone przed implementacją;
 - `round-*-reviewer_a/`, `round-*-reviewer_b/`, `round-*-triage/`: odczytowe kopie danej rundy;
 - `agents/`: prompty, wywołania, schematy, odpowiedzi oraz surowe logi agentów;
 - `state.json`: bieżący stan, routing, limity, przebieg kontroli, recenzje, triage i koszty;
 - `candidate_manifest.json`: manifest wyniku `succeeded`;
-- `report.md`: krótkie podsumowanie dla człowieka;
+- `acceptance.json`: końcowy kontrakt odbioru udanego przebiegu;
+- `report.md`: czytelny raport dowodów, także po błędzie lub przerwaniu;
 - `apply-backup/` i `apply.json`: kopie i wynik jawnego zastosowania, jeśli je rozpoczęto.
+
+Każda kontrola walidacyjna ma `diagnostics.json` z pełnym wynikiem parsera i porównaniem oraz `metadata.json` z hashami konfiguracji/środowiska i odsyłaczami do prób wersji. Próby w `checks/<faza>/metadata/` używają tego samego wykonawcy, środowiska migawki, limitu wyjścia i wspólnego budżetu czasu. Źródła są sprawdzane po każdej próbie; zmiana unieważnia kontrolę. Niepewne lub nieudane próby nie dają znanej tożsamości narzędzia. Wszystkie polecenia `cargo test` przechwytują i wymagają wersji rustdoc, także bez `--doc`; jawny `RUSTDOC` wskazuje próbowany program. Cache nie przekracza granicy fazy. Konfiguracja obejmuje manifesty/lockfile, toolchain i Cargo/Clippy projektu, przodków, `CARGO_HOME`, `CLIPPY_CONF_DIR` oraz hashowane istotne zmienne środowiska. Niejednoznacznych nadpisań kompilatora, wrapperów, dołączanych konfiguracji i `--config` nie rozstrzygamy uniwersalnym resolverem: wersja pozostaje nieznana. Przechwycenie manifestów uwzględnia oba zapisy `--manifest-path`; wybrany manifest poza inwentarzem, zewnętrzne odwołania zależności/workspace, nieprzechwycony workspace/lockfile przodka i nierozstrzygnięte wzorce pozostawiają skrót nieznany. Kompletne lokalne workspace nadal porównują znane inwentarze. Własne reguły `exclude` nadal ograniczają odczyt; skrót konfiguracji jest wtedy nieznany, gdyż wykluczenia mogą ukrywać istotne pliki. Własne nierozpoznane polecenia pomijają przechwytywanie konfiguracji i próby wersji.
+
+Parser odrzuca niekompletną tożsamość celu Cargo jako niepewną i ogranicza każdą konwersję liczb tekstowych przed utworzeniem integera. Nadmiernie długie/niepoprawne liczby nie przerywają zapisania rzeczywistego wyniku kontroli.
+
+Pełne porównanie fazy trafia do `checks/<faza>/diagnostics.json`, a stan i prompty zawierają ograniczony skrót z odsyłaczem. Rekordy bazowe i ich pliki pozostają niezmienione; wszystkie rundy kandydata porównują się z oryginalnym baseline. Agregacja działa także w kończeniu po błędzie, obejmując `unobserved_previous` dla niewykonanych kontroli. `persistent` nie zwalnia z zaliczenia gate. Nieznana konfiguracja/wersja/zakres uniemożliwia porównanie, a brak pełnego udanego wykonania uniemożliwia `resolved`. Wcześniejszy błąd testowy wymaga jawnego przejścia tego samego testu w kompletnym jednoznacznym zestawie. Samodzielny `verify` zachowuje te same artefakty i ograniczenia, lecz bez automatycznej bazy klasyfikuje znalezione problemy jako `unclassified`.
 
 `state.json` jest zapisywany atomowo po ważnych etapach. `phase` opisuje bieżącą czynność, a `status` wynik całego przebiegu. Stany końcowe obejmują `succeeded`, `blocked`, `limit_exhausted`, `budget_exhausted`, `no_progress`, `failed` i `interrupted`. Po skutecznym `apply` stan przyjmuje `applied`. Katalog przerwanego lub nieudanego przebiegu pozostaje do inspekcji; automatycznego `resume` nie ma.
 
-Przerwanie procesu przekazuje przechwycone stdout/stderr wraz z wyjątkiem zgodnym z `KeyboardInterrupt`, po zatrzymaniu procesu i zamknięciu potoków. Adapter dostawcy oraz wykonawca poleceń zapisują te logi przed ponownym zgłoszeniem przerwania. Przerwane polecenie nie uruchamia ponownego skanowania potencjalnie niekompletnych źródeł; jego `result_snapshot_id` i `source_unchanged` pozostają nieznane (`null`). `invocation.json` dostawcy otrzymuje status `interrupted` i pomiary możliwe do odzyskania z wyjścia; przerwanie nie staje się sukcesem ani powodem do ponowienia.
+Przerwanie procesu przekazuje przechwycone stdout/stderr wraz z wyjątkiem zgodnym z `KeyboardInterrupt`, po zatrzymaniu procesu i zamknięciu potoków. Adapter dostawcy oraz wspólny wykonawca poleceń w `verification.py` zapisują te logi przed ponownym zgłoszeniem przerwania. Dotyczy to zarówno `run`, jak i samodzielnego `verify`. Przerwane polecenie nie uruchamia ponownego skanowania potencjalnie niekompletnych źródeł; jego `result_snapshot_id` i `source_unchanged` pozostają nieznane (`null`). `verification_metadata.py` zachowuje wyjście przerwanych prób wersji w ich własnych artefaktach, bez przypisywania go niewykonanej kontroli i bez uznawania wersji za potwierdzoną. Przerwanie ma pierwszeństwo także przy osiągniętym limicie wyjścia; ograniczony zapisany prefiks nadal zachowuje znacznik przekroczenia limitu. `invocation.json` dostawcy otrzymuje status `interrupted` i pomiary możliwe do odzyskania z wyjścia; przerwanie nie staje się sukcesem ani powodem do ponowienia.
 
 Kontekst agentów jest osobnym, skróconym widokiem dowodów: udane kontrole bez logów, błędy z ograniczonymi końcówkami i ścieżkami pełnych logów, diff z jawnym oznaczeniem pominięcia. Widok nie modyfikuje rekordów audytu. Limity `[context]` dotyczą fragmentów tekstu, nie całego kontekstu CLI ani budżetu tokenów. Schemat odpowiedzi trafia do natywnych flag CLI; `validate_response` nadal sprawdza wynik. Wybrane umiejętności są domyślnie wymaganymi odczytami plików, opcjonalnie wklejanymi przez `skill_mode = "inline"`.
 

@@ -1,16 +1,20 @@
 """Filesystem integration tests: capture, conflict guards, and recovery."""
 
+import hashlib
 import json
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from bb_workflow.config import load_config
 from bb_workflow.engine import Workflow
 from bb_workflow.workspace import (
     WorkspaceError,
+    _file_hash,
     apply_run,
     changed_paths,
     copy_snapshot,
@@ -25,7 +29,7 @@ class WorkspaceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.repo = Path(self.temporary.name) / "repo"
+        self.repo = Path(self.temporary.name).resolve() / "repo"
         self.repo.mkdir()
         (self.repo / "dirty.txt").write_text("user's existing uncommitted edit")
         (self.repo / "old.txt").write_text("remove me")
@@ -123,8 +127,9 @@ class WorkspaceTests(unittest.TestCase):
             raise RuntimeError("provider invoked")
 
         config = load_config()
+        config.config_version = 2
         config.prepare = []
-        config.checks = []
+        config.checks = [["fixture", "check"]]
         flow = Workflow(
             self.repo,
             "implement a value function",
@@ -136,8 +141,102 @@ class WorkspaceTests(unittest.TestCase):
         run_dir = flow.run()
         state = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
         self.assertEqual(state["status"], "failed")
+        self.assertIn("unsupported or excluded relative path", state["reason"])
+        self.assertIn("notes:old.txt", state["reason"])
         self.assertEqual(calls, [])
         self.assertFalse((self.repo / ".bb-workflow" / "lock").exists())
+
+    def test_unknown_or_contradictory_report_contract_rejects_before_backup(self):
+        self.make_run()
+        path = self.run / "state.json"
+        original = json.loads(path.read_text())
+        for changes in (
+            {"version": 7},
+            {"version": True},
+            {"version": "1"},
+            {"version": None},
+            {"version": 2},
+            {"report_contract": 1},
+            {"version": 1, "acceptance_report": None},
+        ):
+            with self.subTest(changes=changes):
+                write_json(path, {**original, **changes})
+                with self.assertRaises(WorkspaceError):
+                    apply_run(self.run)
+                self.assertFalse((self.run / "apply-backup").exists())
+                self.assertEqual((self.repo / "old.txt").read_text(), "remove me")
+        write_json(path, original)
+        write_json(self.run / "acceptance.json", {})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+
+    def test_surviving_agent_cycle_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "agents": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_agent_response_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1, "agents": [{"response": {}}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_review_cycle_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "reviews": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_response_file_without_agent_state_rejects_historical_fallback(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "validated_response.json").write_text("{}")
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_historical_agent_artifacts_keep_original_apply_contract(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "response.json").write_text("{}")
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(
+            path,
+            {
+                **state,
+                "agents": [{"role": "implementation", "artifacts": "agents/001-implementation"}],
+            },
+        )
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
+
+    def test_historical_fallback_does_not_follow_agent_directory_symlinks(self):
+        self.make_run()
+        external = Path(self.temporary.name) / "outside-audit"
+        external.mkdir()
+        self.create_symlink(self.run / "agents", external, target_is_directory=True)
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_explicit_historical_version1_still_applies_without_new_indicators(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1})
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
 
     def test_copy_manifest_preserves_initial_dirty_contents_and_permissions(self):
         (self.repo / "dirty.txt").chmod(0o755)
@@ -593,6 +692,145 @@ class WorkspaceTests(unittest.TestCase):
     def test_ids_and_changes_are_deterministic(self):
         self.assertEqual(snapshot_id({"b": "2", "a": "1"}), snapshot_id({"a": "1", "b": "2"}))
         self.assertEqual(changed_paths({"a": "1", "b": "2"}, {"a": "3", "c": "4"}), ["a", "b", "c"])
+
+
+class FileHashTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name).resolve() / "source.txt"
+        self.path.write_bytes(b"unchanged source")
+
+    @staticmethod
+    def stat_with(info, **changes):
+        return SimpleNamespace(
+            **{name: getattr(info, name) for name in dir(info) if name.startswith("st_")} | changes
+        )
+
+    def test_stable_file_allows_different_path_and_handle_ctime(self):
+        # Windows lstat reports creation time while fstat can report change time.
+        expected = hashlib.sha256(
+            f"mode:{stat.S_IMODE(self.path.stat().st_mode):o}\0".encode("ascii")
+            + b"unchanged source"
+        ).hexdigest()
+        original_fstat = os.fstat
+
+        def handle_stat(descriptor):
+            info = original_fstat(descriptor)
+            return self.stat_with(info, st_ctime_ns=info.st_ctime_ns + 1_000_000_000)
+
+        with patch("bb_workflow.workspace.os.fstat", side_effect=handle_stat):
+            self.assertEqual(_file_hash(self.path), expected)
+
+    def test_handle_ctime_change_is_rejected_even_when_path_metadata_is_stable(self):
+        opened = self.path.stat()
+        changed = self.stat_with(opened, st_ctime_ns=opened.st_ctime_ns + 1)
+        with patch("bb_workflow.workspace.os.fstat", side_effect=[opened, changed]):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    def test_path_and_handle_content_metadata_must_agree(self):
+        before = self.path.stat()
+        for field in ("st_size", "st_mtime_ns"):
+            with self.subTest(field=field):
+                different = self.stat_with(before, **{field: getattr(before, field) + 1})
+                with patch("bb_workflow.workspace.os.fstat", return_value=different):
+                    with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                        _file_hash(self.path)
+
+    def test_path_and_handle_permissions_must_agree(self):
+        before = self.path.stat()
+        different = self.stat_with(before, st_mode=before.st_mode & ~stat.S_IWUSR)
+        with patch("bb_workflow.workspace.os.fstat", return_value=different):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    def test_windows_path_inferred_execute_bits_allow_stable_executable(self):
+        executable = self.path.with_suffix(".exe")
+        self.path.rename(executable)
+        info = executable.stat()
+        by_path = self.stat_with(info, st_mode=stat.S_IFREG | 0o755)
+        by_handle = self.stat_with(info, st_mode=stat.S_IFREG | 0o644)
+        expected = hashlib.sha256(b"mode:755\0unchanged source").hexdigest()
+        with (
+            patch("bb_workflow.workspace.os.name", "nt"),
+            patch("pathlib.Path.lstat", return_value=by_path),
+            patch("bb_workflow.workspace.os.fstat", return_value=by_handle),
+        ):
+            self.assertEqual(_file_hash(executable), expected)
+
+    def test_path_ctime_change_is_rejected_even_when_handle_metadata_is_stable(self):
+        before = self.path.stat()
+        changed = self.stat_with(before, st_ctime_ns=before.st_ctime_ns + 1)
+        with (
+            patch("pathlib.Path.lstat", side_effect=[before, changed]),
+            patch("bb_workflow.workspace.os.fstat", return_value=before),
+        ):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    def test_file_replaced_between_path_check_and_open_is_rejected(self):
+        replacement = self.path.with_name("replacement.txt")
+        replacement.write_bytes(b"unchanged source")
+        original_open = os.open
+
+        def replace_before_open(path, flags):
+            replacement.replace(path)
+            return original_open(path, flags)
+
+        with patch("bb_workflow.workspace.os.open", side_effect=replace_before_open):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    def test_file_replaced_after_read_with_identical_contents_is_rejected(self):
+        replacement = self.path.with_name("replacement.txt")
+        replacement.write_bytes(b"unchanged source")
+        original_lstat = Path.lstat
+        calls = 0
+
+        def replace_after_read(path):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                replacement.replace(path)
+            return original_lstat(path)
+
+        with patch("pathlib.Path.lstat", new=replace_after_read):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    def test_content_changed_during_read_is_rejected(self):
+        original_fstat = os.fstat
+        calls = 0
+
+        def change_content(descriptor):
+            nonlocal calls
+            info = original_fstat(descriptor)
+            calls += 1
+            if calls == 1:
+                self.path.write_bytes(b"concurrent source edit")
+            return info
+
+        with patch("bb_workflow.workspace.os.fstat", side_effect=change_content):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions")
+    def test_permission_changed_during_read_is_rejected(self):
+        original_fstat = os.fstat
+        calls = 0
+
+        def change_permissions(descriptor):
+            nonlocal calls
+            info = original_fstat(descriptor)
+            calls += 1
+            if calls == 1:
+                self.path.chmod(0o755)
+            return info
+
+        with patch("bb_workflow.workspace.os.fstat", side_effect=change_permissions):
+            with self.assertRaisesRegex(WorkspaceError, "file changed while reading"):
+                _file_hash(self.path)
 
 
 if __name__ == "__main__":
