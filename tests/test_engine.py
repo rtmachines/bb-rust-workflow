@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import threading
@@ -232,6 +235,47 @@ class EngineTests(unittest.TestCase):
         self.assertIn("heartbeat disk full", state["reason"])
         self.assertIn("failed", (flow.run_dir / "report.md").read_text())
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX termination")
+    def test_sigterm_during_final_state_persistence_reconciles_report_and_cli_result(self):
+        # An unhandled final-write interruption leaves an orphaned running state.
+        from bb_workflow.cli import main
+        from bb_workflow.workspace import write_json
+
+        flow = self.workflow()
+        interrupted = False
+        output = io.StringIO()
+        previous = signal.getsignal(signal.SIGTERM)
+
+        def terminate_final_write(path, value):
+            nonlocal interrupted
+            if Path(path).name == "state.json" and value["phase"] == "finished" and not interrupted:
+                interrupted = True
+                signal.raise_signal(signal.SIGTERM)
+            write_json(path, value)
+
+        with (
+            patch("bb_workflow.cli.Workflow", return_value=flow),
+            patch("bb_workflow.engine.write_json", side_effect=terminate_final_write),
+            contextlib.redirect_stdout(output),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            code = main(["run", "fixture task", "--repo", str(self.repo)])
+        self.assertTrue(interrupted)
+        self.assertEqual(code, 130)
+        state = json.loads((flow.run_dir / "state.json").read_text())
+        self.assertEqual(state["status"], "interrupted")
+        self.assertEqual(state["phase"], "finished")
+        self.assertEqual(flow.state["status"], "interrupted")
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "interrupted")
+        self.assertEqual(payload["run_dir"], str(flow.run_dir))
+        self.assertIn("interrupted", (flow.run_dir / "report.md").read_text())
+        self.assertTrue((flow.run_dir / "acceptance.json").is_file())
+        with self.assertRaisesRegex(WorkspaceError, "succeeded"):
+            apply_run(flow.run_dir)
+        self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_sidecar_failure_never_leaves_successful_state(self):
         with patch("bb_workflow.lifecycle.write_json", side_effect=OSError("disk full")):

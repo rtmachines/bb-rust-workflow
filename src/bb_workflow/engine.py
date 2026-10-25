@@ -177,26 +177,33 @@ class Workflow:
             except Exception as exc:
                 self.state.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
             finally:
-                self._tracker = None
-                for record in self.state["agents"]:
-                    if record["status"] in {"running", "returned"}:
-                        record.update(status=self.state["status"], error=self.state["reason"])
-                self.state["finished_at"] = datetime.now(timezone.utc).isoformat()
-                # Keep durable state non-successful until both report artifacts exist.
                 try:
-                    self._report()
+                    self._tracker = None
+                    self._finish()
                 except KeyboardInterrupt:
+                    self._tracker = None
                     self.state.update(
-                        status="interrupted", reason="Interrupted while writing report"
+                        status="interrupted", reason="Interrupted during finalization"
                     )
-                except Exception as exc:
-                    self.state.update(
-                        status="failed",
-                        reason=f"Report persistence failed: {type(exc).__name__}: {exc}",
-                    )
-                self._save("finished")
-                self._emit("finish", status=self.state["status"])
+                    # CLI ignores further SIGTERM while reconciling terminal artifacts.
+                    self._finish()
         return self.run_dir
+
+    def _finish(self) -> None:
+        for record in self.state["agents"]:
+            if record["status"] in {"running", "returned"}:
+                record.update(status=self.state["status"], error=self.state["reason"])
+        self.state["finished_at"] = datetime.now(timezone.utc).isoformat()
+        # Keep durable state non-successful until both report artifacts exist.
+        try:
+            self._report()
+        except Exception as exc:
+            self.state.update(
+                status="failed",
+                reason=f"Report persistence failed: {type(exc).__name__}: {exc}",
+            )
+        self._save("finished")
+        self._emit("finish", status=self.state["status"])
 
     def _execute(self) -> None:
         self._timeout()
