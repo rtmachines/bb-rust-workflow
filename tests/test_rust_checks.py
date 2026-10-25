@@ -22,7 +22,7 @@ from bb_workflow.engine import Workflow
 from bb_workflow.process import run_process
 from bb_workflow.requirements import Criterion, Requirements
 from bb_workflow.verification import execute_checks, plan_verification, verify_repository
-from bb_workflow.workspace import manifest, snapshot_id
+from bb_workflow.workspace import WorkspaceError, apply_run, manifest, snapshot_id
 
 
 class RustChecksTests(unittest.TestCase):
@@ -187,6 +187,157 @@ class RustChecksTests(unittest.TestCase):
                 )
                 self.assertEqual(flow.state["checks"][-1]["returncode"], 0)
                 self.assertFalse((self.repo / "Cargo.lock").exists())
+                if expected != "succeeded":
+                    self.assertFalse((flow.run_dir / "acceptance.json").exists())
+                    with self.assertRaises(WorkspaceError):
+                        apply_run(flow.run_dir)
+
+    def test_real_workspace_feature_gate_report_authorizes_explicit_local_apply(self):
+        package = self.repo / "selected/Cargo.toml"
+        package.write_text(package.read_text() + "\n[features]\nextra = []\n", encoding="utf-8")
+        library = self.repo / "selected/src/lib.rs"
+        library.write_text(
+            library.read_text()
+            + '\n#[cfg(all(test, feature = "extra"))]\n#[test]\n'
+            + "fn extra_enabled() {\n    assert_eq!(value(), 1);\n}\n",
+            encoding="utf-8",
+        )
+        original = manifest(self.repo)
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(
+            features=("extra",), no_default_features=True
+        )
+        config = replace(self.config, config_version=3, verification=verification)
+        requirements = Requirements(
+            criteria=(
+                Criterion(
+                    "feature",
+                    "Feature test passes",
+                    "mechanical",
+                    "Run extra_enabled",
+                    "7",
+                    "extra_enabled",
+                ),
+                Criterion("api", "Retain value API", "semantic", "Inspect public signature"),
+            )
+        )
+
+        def implement(directory):
+            source = directory / "selected/src/lib.rs"
+            source.write_text(
+                "// Reviewed implementation.\n" + source.read_text(), encoding="utf-8"
+            )
+
+        self.implement = implement
+
+        def provider(**call):
+            result = self.invoke(**call)
+            payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+            result.payload.update(
+                schema_version=2,
+                binding=payload["acceptance"]["binding"],
+                criterion_evidence=[],
+                criterion_assessments=[
+                    {
+                        "criterion_id": "api",
+                        "verdict": "satisfied",
+                        "evidence": "Signature retained",
+                    }
+                ]
+                if call["role"] in {"reviewer_a", "reviewer_b"}
+                else [],
+                criterion_decisions=[],
+            )
+            return result
+
+        flow = Workflow(
+            self.repo,
+            "Retain API with feature coverage",
+            config,
+            requirements=requirements,
+            invoke_fn=provider,
+            progress=lambda text: None,
+        )
+        flow.run()
+        self.assertEqual(flow.state["status"], "succeeded", flow.state["reason"])
+        self.assertEqual(manifest(self.repo), original)
+        self.assertEqual(
+            [c["role"] for c in self.calls], ["implementation", "reviewer_a", "reviewer_b"]
+        )
+        report_path = flow.run_dir / "acceptance.json"
+        self.assertTrue(report_path.is_file())
+        report = json.loads(report_path.read_text())
+        self.assertEqual(flow.state["version"], 2)
+        self.assertEqual(flow.state["report_contract"], 1)
+        self.assertEqual(
+            report["binding"],
+            {
+                "candidate_id": snapshot_id(manifest(flow.work)),
+                "requirements_id": flow.state["acceptance"]["requirements_id"],
+                "verification_plan_id": flow.state["acceptance"]["verification_plan_id"],
+            },
+        )
+        self.assertEqual(report["gate"]["variants"], ["default", "feature"])
+        self.assertIsNone(report["gate"]["package"])
+        self.assertIsNone(report["gate"]["test_filter"])
+        planned = report["gate"]["planned_checks"]
+        results = report["gate"]["results"]
+        self.assertEqual(len(results), 10)
+        self.assertEqual([r["command"] for r in results], [c["argv"] for c in planned])
+        self.assertEqual([r["variant"] for r in results], ["default"] * 5 + ["feature"] * 5)
+        self.assertTrue(all(r["passed"] and r["source_unchanged"] for r in results))
+        self.assertTrue(all(r["snapshot_id"] == report["binding"]["candidate_id"] for r in results))
+        self.assertIn("extra_enabled ... ok", results[7]["stdout_tail"])
+        for index in (3, 8):
+            self.assertIn("--workspace", results[index]["command"])
+            self.assertIn("--doc", results[index]["command"])
+            self.assertIn(
+                "Doc-tests extra",
+                (flow.run_dir / results[index]["artifacts"] / "stderr.txt").read_text(),
+            )
+        self.assertEqual(
+            [(c["criterion_id"], c["verdict"]) for c in report["criteria"]],
+            [("feature", "satisfied"), ("api", "satisfied")],
+        )
+        self.assertEqual([p["role"] for p in report["provenance"]], ["reviewer_a", "reviewer_b"])
+        markdown = (flow.run_dir / "report.md").read_text()
+        for evidence in (
+            "Planned variants: default, feature",
+            "Executed variants: default, feature",
+            "feature: **satisfied**",
+            "extra_enabled",
+            "final approved evidence",
+        ):
+            self.assertIn(evidence, markdown)
+        saved = report_path.read_bytes()
+        report_path.unlink()
+        calls_before_apply = len(self.calls)
+        with (
+            patch(
+                "bb_workflow.backends.invoke", side_effect=AssertionError("Apply called a provider")
+            ),
+            patch.object(
+                flow, "invoke", side_effect=AssertionError("Apply called workflow provider")
+            ),
+        ):
+            with self.assertRaises(WorkspaceError):
+                apply_run(flow.run_dir)
+            self.assertEqual(manifest(self.repo), original)
+            self.assertFalse((flow.run_dir / "apply-backup").exists())
+            report_path.write_bytes(saved)
+            self.assertEqual(apply_run(flow.run_dir), ["Cargo.lock", "selected/src/lib.rs"])
+        self.assertEqual(len(self.calls), calls_before_apply)
+        self.assertEqual(manifest(self.repo), manifest(flow.work))
+        self.assertEqual(
+            (self.repo / "Cargo.lock").read_bytes(), (flow.work / "Cargo.lock").read_bytes()
+        )
+        self.assertTrue(
+            (self.repo / "selected/src/lib.rs")
+            .read_text()
+            .startswith("// Reviewed implementation.")
+        )
+        self.assertEqual(json.loads((flow.run_dir / "state.json").read_text())["status"], "applied")
 
     def test_standalone_gate_executes_real_offline_feature_variants(self):
         package = self.repo / "selected/Cargo.toml"

@@ -22,14 +22,16 @@ flowchart TD
     H --> J[Scalenie dokładnych duplikatów]
     I --> J
     J -->|ustalenia lub sporne kryteria| K[Triage na osobnej kopii]
-    J -->|brak ustaleń i spełnione kryteria| L[Wynik succeeded]
+    J -->|brak ustaleń i spełnione kryteria| S[Zapis i walidacja acceptance.json]
     K -->|nierozstrzygnięte| M[Wynik blocked]
     K -->|blokujące ustalenia lub niespełnione kryteria| F
-    K -->|bez blokujących ustaleń i spełnione kryteria| L
+    K -->|bez blokujących ustaleń i spełnione kryteria| S
     F -->|limit wyczerpany| N[Wynik limit_exhausted]
     F -->|dostępny| O[Fixer]
     O --> Q
-    L --> P[Jawne apply z kontrolą całej migawki]
+    S -->|sukces| L[Wynik succeeded]
+    S -->|błąd| T[Wynik failed]
+    L --> P[Jawne apply z kontrolą odbioru i całej migawki]
 ```
 
 Recenzje są **niezależne co do procesu i kopii**: obaj recenzenci widzą tę samą zamrożoną migawkę, wymagania, wyniki kontroli i diff, ale nie wyniki drugiego recenzenta. Wywołania są sekwencyjne, co utrzymuje przewidywalny budżet. Po recenzjach program porównuje manifest źródła z migawką; zmiana w trakcie przeglądu kończy przebieg błędem. Triage musi rozstrzygnąć każde ustalenie dokładnie raz jako `confirmed`, `rejected`, `duplicate` lub `unresolved`, z uzasadnieniem. Dokładne duplikaty są scalane z zachowaniem pochodzenia; inne pozornie podobne uwagi rozstrzyga triage. Poziom kanonicznego ustalenia zachowuje najwyższą wagę w grupie duplikatów, aby scalanie nie usunęło blokady. Potwierdzone ustalenie zawiera też `duplicates` z pełnymi dowodami i pochodzeniem pozostałych uwag w grupie; Fixer otrzymuje je razem, aby naprawa nie zgubiła odmiennego scenariusza błędu. Ustalenia dotyczące usuniętych plików mogą wskazywać ścieżkę i linię z migawki bazowej. Kontekst Fixera wskazuje również `baseline_directory`, co pozwala odtworzyć dowody z usuniętych źródeł. `unresolved` blokuje sukces. Potwierdzone ustalenia o poziomach wymienionych w `blocking_severities` kierują do Fixera; domyślnie blokują `critical`, `high`, `medium`.
@@ -73,8 +75,41 @@ od wagi ustaleń. Cały gate i obie recenzje powtarzają się po każdej naprawi
 `completed` oznacza wykonanie przydzielonego review/triage i może zawierać niespełnione kryteria.
 Sukces wymaga aktualnego dowodu dla każdego kryterium oraz wszystkich poprzednich gwarancji.
 
-`acceptance` w stanie zawiera tryb, hashe i pełne rundy. Raport pokazuje podstawowy tryb i hashe;
-`status --summary` pomija rundy. Bogatszy raport i dodatkowe powiązanie przy `apply` są etapem 5.
+`acceptance` w stanie zawiera tryb, hashe i pełne rundy. `status --summary` pomija pełne rundy.
+
+## Końcowy odbiór i raport (etap 5)
+
+Przed nadaniem `succeeded` silnik buduje i zapisuje `acceptance.json`, po czym sprawdza go
+wobec trwałych dowodów. Błąd zapisu lub walidacji nie pozostawia sukcesu uprawniającego do apply.
+Raport wersji 1 zawiera `version`, `mode`, `cycle`, `binding`, `gate`, `criteria`, `review`
+i `provenance`. Powiązanie identyfikuje finalnego kandydata, zamrożone wymagania i cały plan.
+`gate` zachowuje `profile`, `variants`, `package`, `test_filter`, `planned_checks`, `results`;
+końcowy gate nie dopuszcza zawężenia pakietu ani filtra. `criteria` zawiera opis, werdykt i dowód
+każdego kryterium; `review` obejmuje obie niezależne recenzje i ewentualny triage, a `provenance`
+wiąże je z ukończonymi wywołaniami i zapisanymi zwalidowanymi odpowiedziami.
+
+`state.json` ma wersję 2 i `report_contract = 1`. Jego `acceptance_report` zawiera `version`,
+`file` (dokładnie `acceptance.json`), kanoniczny SHA-256 `digest` i `binding`. Wersje konfiguracji
+1/2/3 i schematów odpowiedzi 1/2 są od tego niezależne. Nowy tryb `legacy` również zapisuje
+i wymaga końcowego raportu, z pustymi kryteriami i jawnym brakiem gwarancji wymagań.
+
+`acceptance.py` odtwarza kontrakt z zapisanych wymagań, planu, kontroli i recenzji, ponownie
+ocenia mechaniczne dowody z pełnych logów i porównuje wynik z raportem oraz metadanymi stanu.
+Sprawdza kompletność i kolejność gate, niezmienność źródeł, powiązania, aktualne werdykty,
+protokół odpowiedzi i odrębne pochodzenie recenzji. `apply` wykonuje tę kontrolę lokalnie pod
+istniejącą blokadą, przed backupem; nie wywołuje modeli ani Cargo. Następnie obowiązują wszystkie
+dotychczasowe kontrole manifestów i odzyskiwanie po błędach.
+
+Historyczne stany bez wersji lub z wersją 1 zachowują dawny kontrakt tylko bez oznak nowego
+formatu. Znacznik, metadane raportu, sam raport lub nowe pochodzenie odpowiedzi/recenzji
+uniemożliwiają taki fallback po obniżeniu wersji. Nieznane wersje i niekompletne nowe raporty
+są odrzucane. Skróty i odtworzenie chronią przed przypadkową nieaktualnością lub niespójnością;
+nie stanowią podpisu ani ochrony przed skoordynowaną zmianą wszystkich lokalnych dowodów.
+
+`reporting.py` tworzy czytelny `report.md`: zakres planu i wykonane warianty, klasyfikację
+diagnostyki, kryteria z dowodami i powiązaniami, recenzje, triage i pomiary. Rundy historyczne
+i częściowe są odróżnione od zatwierdzonej końcowej rundy. Niepełny przebieg nie publikuje
+końcowego zatwierdzenia. Sukces poświadcza skonfigurowany zakres, nie kompletność wymagań.
 
 ## Odpowiedzialności modułów
 
@@ -90,6 +125,7 @@ Sukces wymaga aktualnego dowodu dla każdego kryterium oraz wszystkich poprzedni
 | `process.py` | Uruchomienie argv bez powłoki, przechwycenie stdout/stderr, timeout i próba zatrzymania drzewa procesów na Linux/macOS/Windows. |
 | `_windows_job.py` | Nadzorca Windows: przed uruchomieniem polecenia dołącza do Job Object z kończeniem członków przy zamknięciu; przekazuje kod zakończenia i błędy przez prywatny plik wyniku. |
 | `requirements.py` | Ścisły niezmienny kontrakt wymagań, hashe pełnego planu i ocena mechanicznego dowodu z audytowanych kontroli i pełnych logów. |
+| `acceptance.py`, `reporting.py` | Budowa i lokalna walidacja końcowego kontraktu odbioru; czytelny raport pełnych, historycznych i częściowych dowodów. |
 | `protocol.py` | Wspólny schemat JSON odpowiedzi, walidacja ścieżek/linii ustaleń, deduplikacja oraz pełne rozstrzygnięcie triage. |
 | `workspace.py` | Manifesty hashujące treść i prawa plików, zweryfikowane kopie, blokada projektu oraz `apply` z kontrolą konfliktu i próbą wycofania. |
 | `prompts/*.md` | Instrukcje poszczególnych ról; nie są mechanizmem egzekwowania limitów ani kolejności. |
@@ -110,7 +146,8 @@ Jeden `run` tworzy `.bb-workflow/runs/<id>/` wewnątrz oryginalnego projektu:
 - `agents/`: prompty, wywołania, schematy, odpowiedzi oraz surowe logi agentów;
 - `state.json`: bieżący stan, routing, limity, przebieg kontroli, recenzje, triage i koszty;
 - `candidate_manifest.json`: manifest wyniku `succeeded`;
-- `report.md`: krótkie podsumowanie dla człowieka;
+- `acceptance.json`: końcowy kontrakt odbioru udanego przebiegu;
+- `report.md`: czytelny raport dowodów, także po błędzie lub przerwaniu;
 - `apply-backup/` i `apply.json`: kopie i wynik jawnego zastosowania, jeśli je rozpoczęto.
 
 Każda kontrola walidacyjna ma `diagnostics.json` z pełnym wynikiem parsera i porównaniem oraz `metadata.json` z hashami konfiguracji/środowiska i odsyłaczami do prób wersji. Próby w `checks/<faza>/metadata/` używają tego samego wykonawcy, środowiska migawki, limitu wyjścia i wspólnego budżetu czasu. Źródła są sprawdzane po każdej próbie; zmiana unieważnia kontrolę. Niepewne lub nieudane próby nie dają znanej tożsamości narzędzia. Wszystkie polecenia `cargo test` przechwytują i wymagają wersji rustdoc, także bez `--doc`; jawny `RUSTDOC` wskazuje próbowany program. Cache nie przekracza granicy fazy. Konfiguracja obejmuje manifesty/lockfile, toolchain i Cargo/Clippy projektu, przodków, `CARGO_HOME`, `CLIPPY_CONF_DIR` oraz hashowane istotne zmienne środowiska. Niejednoznacznych nadpisań kompilatora, wrapperów, dołączanych konfiguracji i `--config` nie rozstrzygamy uniwersalnym resolverem: wersja pozostaje nieznana. Przechwycenie manifestów uwzględnia oba zapisy `--manifest-path`; wybrany manifest poza inwentarzem, zewnętrzne odwołania zależności/workspace, nieprzechwycony workspace/lockfile przodka i nierozstrzygnięte wzorce pozostawiają skrót nieznany. Kompletne lokalne workspace nadal porównują znane inwentarze. Własne reguły `exclude` nadal ograniczają odczyt; skrót konfiguracji jest wtedy nieznany, gdyż wykluczenia mogą ukrywać istotne pliki. Własne nierozpoznane polecenia pomijają przechwytywanie konfiguracji i próby wersji.

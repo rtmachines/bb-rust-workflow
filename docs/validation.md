@@ -1,6 +1,8 @@
 # Weryfikacja MVP — 2026-10-25
 
-Poniższe wyniki opisują wcześniejszy etap MVP. Późniejszą optymalizację kontekstu Claude/Codex i jej oddzielne pomiary opisuje [raport zużycia kontekstu](token-efficiency.md); nie należy traktować wcześniejszych sesji modeli jako walidacji nowych promptów.
+Poniższe wyniki opisują wcześniejszy etap MVP. Aktualny odbiór raportowania opisuje osobny
+[zapis etapu 5](#etap-5--lokalna-weryfikacja-2026-10-25) na końcu dokumentu.
+Późniejszą optymalizację kontekstu Claude/Codex i jej oddzielne pomiary opisuje [raport zużycia kontekstu](token-efficiency.md); nie należy traktować wcześniejszych sesji modeli jako walidacji nowych promptów.
 
 Raport po wdrożeniu trzech etapów poprawek: ochrona `apply`, spójność kontroli i kopii roboczych, odporność adapterów oraz procesów.
 
@@ -77,3 +79,63 @@ bb-workflow run "Make increment saturate at u32::MAX and add a regression test" 
 - Przenośne sprawdzenie zawartości i późniejsze zastąpienie pliku nie są jedną atomową operacją. Należy unikać zewnętrznych edycji podczas `apply`; nagłe zakończenie procesu może wymagać ręcznego odzyskania z kopii.
 - Limity stdout/stderr ograniczają przechwytywane dane, nie wszystkie pliki tworzone przez uruchomione programy. Kopie robocze nie izolują hosta; na POSIX potomkowie mogą opuścić własną grupę procesów przez utworzenie osobnej sesji.
 - Budżet czasu pozostaje kooperatywny, koszt może być częściowy, a automatycznego wznowienia przebiegu nie dodano.
+
+## Etap 5 — lokalna weryfikacja 2026-10-25
+
+Zapis dotyczy implementacji końcowego raportu i walidacji apply oraz testu integracyjnego
+na gałęzi `codex/reporting-stage-5`, po bazie zadania integracyjnego `a0e7ffb`.
+Implementacja i lokalne kontrole są zakończone; niezależny przegląd zadania integracyjnego
+i całej gałęzi pozostaje do wykonania. Poniższe wyniki nie zastępują tego przeglądu.
+
+| Wykonana kontrola na Linux | Wynik |
+| --- | --- |
+| `PYTHONPATH=src python3.11 -m unittest discover -s tests -q` (3.11.17) | 406 testów: 404 zaliczone, 2 pominięte; 80,126 s; exit 0 |
+| `PYTHONPATH=src python3.13 -m unittest discover -s tests -q` (3.13.17) | 406 testów: 404 zaliczone, 2 pominięte; 80,793 s; exit 0 |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -q` (3.14.8) | 406 testów: 404 zaliczone, 2 pominięte; 80,850 s; exit 0 |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_rust_checks.py' -q` | 9 rzeczywistych testów Cargo offline; bez pominięć; 14,991 s; exit 0 |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_acceptance.py' -q` | 34 zaliczone; 23,524 s; exit 0 |
+| `PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_reporting.py' -q` | 2 zaliczone; 0,000 s; exit 0 |
+| `ruff check src tests examples` | Brak ustaleń; exit 0 |
+| `ruff format --check src tests examples` | 40 plików zgodnych; exit 0 |
+| Surowy Ruff przez lokalny reviewdog (polecenie poniżej) | Brak diagnostyk; oba programy exit 0 |
+| `git diff --check` | Bez błędów; exit 0 |
+| Lokalnie wykonany blok próby narzędzi z CI | Wszystkie narzędzia obecne, rustfmt/Clippy działają; exit 0 |
+
+Pełne zestawy uruchomiono równolegle w trzech interpreterach. Logi sesji zachowano lokalnie
+w `/tmp/bb-stage5-task2-validation/` (`python311.log`, `python313.log`, `python314.log`,
+`ruff-raw.log`, `reviewdog.log`); katalog tymczasowy nie jest częścią dystrybucji.
+
+```sh
+set -o pipefail
+NO_COLOR=1 rtk bypass ruff check src tests examples --output-format=concise 2>&1 | reviewdog -f=flake8 -reporter=local -filter-mode=nofilter -fail-level=warning
+```
+
+Nowy test `test_real_workspace_feature_gate_report_authorizes_explicit_local_apply` używa
+rzeczywistych poleceń Cargo z `CARGO_NET_OFFLINE=true`, dwóch lokalnych pakietów, doctestów
+także poza `default-members` oraz pełnego gate dla wariantów default i feature. Provider jest
+atrapą, która dodaje drobną zmianę źródła i jawne oceny semantyczne. Test sprawdza finalny
+raport, powiązanie kandydata/planów/wymagań, 10 zaplanowanych i wykonanych kontroli, rzeczywiste
+wykonanie testu feature, dowody kryteriów i pochodzenie obu recenzji. Usunięcie raportu blokuje
+apply przed backupem i zapisem; po przywróceniu apply przenosi źródło oraz przygotowany lockfile
+bez nowych wywołań providerów. Istniejąca regresja filtra nadal odrzuca zero przypadków mimo
+kodu zero i dodatkowo potwierdza brak finalnego raportu oraz odmowę apply.
+
+Test dodano do już zaimplementowanego kontraktu, dlatego poprawna produkcja od razu go zaliczała.
+Dwie kontrolowane mutacje w osobnych procesach potwierdziły czułość bez edycji produkcji:
+pominięcie zapisu `acceptance.json` dało błąd oczekiwanego sukcesu, a wyłączenie walidatora apply
+dało `WorkspaceError not raised` dla brakującego raportu. Oba przebiegi zakończyły się dokładnie
+jednym oczekiwanym niepowodzeniem testu, bez błędów wykonania; logi to `mutation-report.log`
+i `mutation-apply.log`. Nie były to usterki poprawnej implementacji ani nieudane pełne zestawy.
+
+Wcześniejsze regresje awarii uruchomienia, przerwań, timeoutu/wyjścia/budżetu, zmian źródeł,
+niezależności review, migracji konfiguracji i schematów odpowiedzi pozostają w pełnym zestawie;
+audyt pokrycia nie wykazał potrzeby ich powielania dla etapu 5.
+
+Nie uruchamiano sesji modeli ani płatnych providerów. Historyczne sesje opisane wyżej nie
+walidują obecnego kontraktu. Dwa pominięte testy nadal dotyczą natywnych junctions Windows;
+atrapy API Windows działające na Linux nie potwierdzają natywnej zgodności. Nie wykonano
+natywnych testów Windows/macOS ani zdalnego CI. Skonfigurowana macierz pozostaje Ubuntu/Windows
+× Python 3.11/3.13; teraz instaluje rustfmt/Clippy i obowiązkowo sprawdza Git, Cargo, rustc,
+rustdoc, rustfmt, cargo-clippy oraz działanie `cargo fmt --version` i `cargo clippy --version`
+przed unittest. Lokalny brak narzędzi nadal daje jawne pominięcie klasy Cargo; CI ma zakończyć
+się błędem już podczas próby narzędzi. Nie powtarzano w tym zadaniu historycznej budowy paczek.

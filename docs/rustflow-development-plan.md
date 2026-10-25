@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etapy 1–4 zaimplementowane i zweryfikowane; integracja etapów 3 i 4 w tej gałęzi; etap 5 do realizacji
+Status: etapy 1–4 zaimplementowane i zweryfikowane; etap 5 zaimplementowany, końcowy niezależny przegląd oczekuje
 
 ## Cel i zachowane gwarancje
 
@@ -141,7 +141,7 @@ uruchamia triage, także bez ustaleń kodowych. Brak oceny/ID/powiązania odrzuc
 nowy kandydat przechodzi cały gate i oba niezależne review od początku.
 
 Podstawowy stan i raport ujawniają tryb oraz hashe; szczegóły rund są w `acceptance.rounds`.
-Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` pozostają etapem 5.
+Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` dodaje etap 5 opisany poniżej.
 Przykład: [`task-requirements.toml`](../examples/task-requirements.toml); demo offline używa
 rzeczywistych kontroli Cargo i jawnie oznaczonych atrap ocen semantycznych.
 
@@ -167,6 +167,9 @@ diffu są poprawne. Etap 5 pozostaje poza zakresem.
 
 ## 5. Raportowanie, integracja z apply i odbiór całości
 
+**Status: implementacja zakończona; niezależny przegląd zadania integracyjnego i całej gałęzi
+oczekuje. Lokalne wyniki kontroli są zapisane oddzielnie w [raporcie walidacji](validation.md).**
+
 Raport końcowy pokazuje osobno zakres gate, wykonane warianty, zmiany diagnostyki, dowody dla kryteriów oraz decyzje recenzentów i triage.
 
 `apply` zachowuje obecną kontrolę całego oryginału, kandydata, backup i obsługę błędów. Dla nowych przebiegów dodatkowo sprawdza powiązanie końcowego raportu odbioru z kandydatem. Nie uruchamia ponownie modeli. Stare przebiegi pozostają obsługiwane według dotychczasowego kontraktu; niekompletny nowy przebieg nie może automatycznie przejść do trybu zgodności.
@@ -180,6 +183,24 @@ Końcowa weryfikacja obejmuje:
 - Ruff, lokalny reviewdog oraz testy platform, dla których deklarujemy wsparcie.
 
 Sesje modeli pozostają zastąpione atrapami w testach automatycznych.
+
+**Zrealizowane:** `report.md` oddziela finalne dowody od historycznych i częściowych; końcowy
+`acceptance.json` wersji 1 wiąże kandydata, wymagania, pełny plan, kontrole i kryteria z recenzjami
+oraz triage. Nowy stan wersji 2 ma `report_contract = 1` i metadane `acceptance_report`.
+`apply` lokalnie odtwarza i porównuje kontrakt przed backupem; dotyczy to także nowych przebiegów
+legacy. Historyczny stan bez wersji lub v1, bez oznak nowego kontraktu, zachowuje dawne zasady.
+Usunięcie pojedynczego znacznika z nowego przebiegu nie obchodzi walidacji przy zachowanym
+nowym pochodzeniu dowodów. Lokalne skróty nie chronią przed wspólnym przepisaniem całego audytu.
+
+Nowa regresja przechodzi rzeczywisty workspace offline od implementacji przez pełny gate
+z doctestami i wariantami default/feature do raportu oraz jawnego apply. Sprawdza przeniesienie
+zmienionego źródła i przygotowanego `Cargo.lock`, odmowę przy brakującym raporcie przed backupem
+i brak nowych wywołań dostawców przy apply. Zachowano odrzucenie zerowego filtra mimo kodu zero,
+dodając brak końcowego raportu i odmowę apply. Istniejące testy pokrywają awarie, przerwania,
+limity, zmianę źródeł, niezależność recenzji oraz migracje konfiguracji i odpowiedzi.
+CI instaluje rustfmt/Clippy oraz obowiązkowo sprawdza narzędzia przed unittest na skonfigurowanej
+macierzy Ubuntu/Windows × Python 3.11/3.13. Nie jest to dowód uruchomienia zdalnego CI ani
+natywnego Windows/macOS w lokalnej sesji Linux.
 
 ## Kolejność realizacji
 

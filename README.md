@@ -162,9 +162,27 @@ blokuje sukces, a potwierdzone niespełnienie kieruje do ograniczonego Fixera ni
 Triage nie może nadpisać mechanicznej porażki.
 
 `state.json` zawiera `acceptance.mode`, hashe i `acceptance.rounds` z wynikami mechanicznymi,
-niezależnymi ocenami i triage. Raport i `status --summary` ujawniają tryb oraz hashe. Rozbudowany
-raport końcowy i dodatkowa kontrola powiązania odbioru przez `apply` należą do etapu 5;
-obecne jawne `apply` zachowuje dotychczasowe kontrole manifestów.
+niezależnymi ocenami i triage. `report.md` pokazuje planowany zakres gate, wykonane warianty,
+porównania diagnostyki, dowody kryteriów oraz decyzje recenzentów i triage. Wcześniejsze rundy
+i niepełne przebiegi są jawnie oznaczone; ich dowody nie zatwierdzają bieżącego kandydata.
+`status --summary` zachowuje skrót trybu i hashy, bez pełnych rund.
+
+Nowy udany przebieg zapisuje `acceptance.json` w wersji 1: `mode`, `cycle`, powiązanie `binding`
+(`candidate_id`, `requirements_id`, `verification_plan_id`), `gate` (profil, warianty, brak zawężenia
+pakietu/filtra, planowane kontrole i wyniki), `criteria`, `review` i `provenance` recenzji/triage.
+Stan ma osobną wersję 2, `report_contract = 1` i `acceptance_report` z wersją, nazwą
+`acceptance.json`, skrótem `digest` i powiązaniem. Wersja stanu nie jest wersją konfiguracji
+ani schematu odpowiedzi. Także nowe przebiegi `legacy` wymagają raportu; nie deklarują spełnienia
+kryteriów, których nie podano.
+
+`apply` pod blokadą sprawdza raport, skrót, zamrożone wymagania/plan, aktualne dowody pełnego gate
+i recenzji oraz dotychczasową zgodność całego oryginału i kandydata. Brak, uszkodzenie lub
+nieaktualność nowego raportu zatrzymuje operację przed backupem i zmianą źródeł. Nie wywołuje
+dostawców ani nie uruchamia ponownie kontroli. Historyczny stan bez wersji lub z wersją 1,
+bez oznak nowego kontraktu, zachowuje dawną kontrolę manifestów; usunięcie samej wersji/znacznika
+z nowego przebiegu nie włącza tego fallbacku, gdy pozostały nowe artefakty lub pochodzenie dowodów.
+Sukces oznacza odbiór skonfigurowanego zakresu i zadeklarowanych kryteriów, nie dowód kompletności
+wymagań. Lokalne skróty wykrywają niespójność, ale nie skoordynowane przepisanie wszystkich artefaktów.
 
 ### Weryfikacja bez agentów
 
@@ -233,6 +251,11 @@ PYTHONPATH=src python3 examples/demo.py
 ```
 
 W PowerShell ustaw najpierw `$env:PYTHONPATH = "src"`, a następnie użyj `python -m unittest ...`. Po instalacji edytowalnej `PYTHONPATH` nie jest potrzebne. Testy integracji używają atrap dostawców; testy procesów i snapshotów mogą uruchamiać lokalne programy, np. Python i Git. Nie wymagają kont Claude Code ani Codex. Test naprawionego zachowania dodaj w odpowiadającym module `tests/test_<module>.py`, wraz z istotnym przypadkiem błędu.
+
+Rzeczywiste testy Cargo używają workspace bez zewnętrznych zależności i trybu offline. Wymagają
+Git, Cargo, rustc, rustdoc oraz komponentów rustfmt i Clippy; lokalnie brak narzędzi daje jawne
+pominięcie klasy testów. CI instaluje komponenty i obowiązkowo sprawdza narzędzia przed testami,
+więc brak Cargo nie może tam po cichu pominąć tej części odbioru.
 
 Zakres odczytu dobieraj według zmiany: `backends.py` odpowiada za wywołania CLI i format wyników, `process.py` za limity i sprzątanie procesów, `engine.py` za etapy, prompty i audyt, `protocol.py` za walidację odpowiedzi oraz triage, `workspace.py` za snapshoty i `apply`. Konfiguracja i routing są w `config.py`, pomiary w `usage.py`, polecenia w `cli.py`. Zmiany promptów wymagają także sprawdzenia `src/bb_workflow/prompts/` i testów kontekstu w `test_engine.py`. Przy zmianach etapów, snapshotów lub `apply` przeczytaj `docs/architecture.md`.
 
