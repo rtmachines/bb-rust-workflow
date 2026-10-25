@@ -395,3 +395,342 @@ class ExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiagnosticsIntegrationTests(unittest.TestCase):
+    setUp = ExecutionTests.setUp
+    execute = ExecutionTests.execute
+
+    def cargo(self, output="", *, stderr="", code=0, **flags):
+        self.config = replace(self.config, checks=[["cargo", "check", "--offline"]])
+        self.plan = verification.plan_verification(self.config)
+        calls = []
+
+        def process(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[-1] == "--version":
+                name = "rustfmt" if "fmt" in argv else "clippy" if "clippy" in argv else argv[0]
+                return ProcessResult(0, f"{name} 1.90.0 (fixture)\n", "", 0)
+            return ProcessResult(code, output, stderr, 0, **flags)
+
+        return process, calls
+
+    def report(self, record):
+        return json.loads((self.artifacts / record["diagnostics_file"]).read_text())
+
+    def test_full_stream_diagnostic_is_saved_beyond_check_tail(self):
+        process, calls = self.cargo(
+            stderr="warning[unused_variables]: unused variable: `x`\n"
+            " --> src/lib.rs:4:5\n4 | let x = 1;\n" + " " * 18000
+        )
+        record = self.execute(process_fn=process)[0]
+        report = self.report(record)
+        self.assertEqual(report["findings"][0]["code"], "unused_variables")
+        self.assertNotIn("unused_variables", record["stderr_tail"])
+        self.assertEqual(record["diagnostics"]["counts"]["unclassified"], 1)
+        self.assertEqual(
+            [c[0] for c in calls],
+            [["cargo", "--version"], ["rustc", "--version"], ["cargo", "check", "--offline"]],
+        )
+        metadata = json.loads((self.artifacts / record["metadata_file"]).read_text())
+        self.assertEqual(metadata["tool_versions"]["rustc"], "rustc 1.90.0 (fixture)")
+        self.assertTrue(
+            (self.artifacts / metadata["probes"][0]["artifacts"] / "stdout.txt").is_file()
+        )
+
+    def test_fatal_output_retains_diagnostics_before_propagation(self):
+        process, _ = self.cargo(
+            stderr="error[E0001]: broken\n --> src/lib.rs:1:1\n1 | broken\n",
+            output_limit_exceeded=True,
+        )
+        with self.assertRaises(verification.VerificationStop):
+            self.execute(process_fn=process)
+        self.assertEqual(self.report(self.records[-1])["findings"][0]["code"], "E0001")
+        self.assertFalse(self.records[-1]["passed"])
+
+    def test_baseline_comparison_tracks_config_tool_scope_and_unknown_probes(self):
+        diagnostic = (
+            "warning[unused_variables]: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = 1;\n"
+        )
+        process, _ = self.cargo(stderr=diagnostic)
+        baseline = self.execute(process_fn=process)
+        # The artifact root is stable for baseline lookup; use another command directory.
+        baseline_root = self.artifacts
+
+        def run(**kwargs):
+            return verification.execute_checks(
+                self.plan.checks,
+                cwd=self.repo,
+                artifact_root=baseline_root,
+                command_root=baseline_root / f"candidate-{len(self.records)}",
+                config=self.config,
+                timeout=lambda: 10,
+                record=self.records.append,
+                baseline_records=baseline,
+                process_fn=kwargs.pop("process_fn", process),
+                **kwargs,
+            )[0]
+
+        self.assertEqual(run()["diagnostics"]["counts"]["persistent"], 1)
+        (self.repo / "Cargo.toml").write_text('[package]\nname="changed"\n')
+        self.assertEqual(run()["diagnostics"]["counts"]["unclassified"], 1)
+        (self.repo / "Cargo.toml").unlink()
+        self.assertEqual(
+            run(scope={"package": "other", "test_filter": None})["diagnostics"]["counts"][
+                "unclassified"
+            ],
+            1,
+        )
+
+        def unknown(argv, **kwargs):
+            if argv[-1] == "--version":
+                return ProcessResult(0, "unknown version text", "", 0)
+            return process(argv, **kwargs)
+
+        self.assertEqual(run(process_fn=unknown)["diagnostics"]["counts"]["unclassified"], 1)
+
+        def newer(argv, **kwargs):
+            result = process(argv, **kwargs)
+            return replace(result, stdout=result.stdout.replace("1.90", "1.91"))
+
+        self.assertEqual(run(process_fn=newer)["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_probe_source_mutation_interrupt_and_budget_are_audited(self):
+        for mode in ("mutation", "interrupt", "budget"):
+            with self.subTest(mode=mode):
+                (self.repo / "source.txt").write_text("original")
+                process, calls = self.cargo()
+
+                def probe(argv, **kwargs):
+                    if argv[-1] == "--version":
+                        if mode == "mutation":
+                            (self.repo / "source.txt").write_text("mutated")
+                        elif mode == "interrupt":
+                            raise KeyboardInterrupt()
+                        else:
+                            raise verification.VerificationStop("budget_exhausted", "budget")
+                    return process(argv, **kwargs)
+
+                expected = (
+                    KeyboardInterrupt if mode == "interrupt" else verification.VerificationStop
+                )
+                with self.assertRaises(expected):
+                    self.execute(process_fn=probe)
+                self.assertFalse(self.records[-1]["passed"])
+                self.assertTrue((self.artifacts / self.records[-1]["metadata_file"]).exists())
+                self.assertFalse(any(c[0] == ["cargo", "check", "--offline"] for c in calls))
+
+    def test_metadata_hashes_inherited_config_and_environment_without_secret_values(self):
+        from unittest.mock import patch
+
+        process, _ = self.cargo()
+        cargo_home = self.repo.parent / (self.repo.name + "-cargo-home")
+        cargo_home.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(cargo_home))
+        (cargo_home / "config.toml").write_text("[build]\njobs=1\n")
+        with patch.dict(os.environ, {"CARGO_HOME": str(cargo_home), "RUSTFLAGS": "secret-marker"}):
+            first = self.execute(process_fn=process)[0]
+            metadata = (self.artifacts / first["metadata_file"]).read_text()
+            digest = self.report(first)["context"]["configuration_digest"]
+            self.assertNotIn("secret-marker", metadata)
+            (cargo_home / "config.toml").write_text("[build]\njobs=2\n")
+            second = self.execute(process_fn=process)[0]
+            self.assertNotEqual(digest, self.report(second)["context"]["configuration_digest"])
+
+    def test_selector_probes_are_bounded_and_cached_only_within_one_phase(self):
+        process, calls = self.cargo()
+        self.config = replace(
+            self.config, checks=[["cargo", "+stable", "clippy"], ["cargo", "+stable", "check"]]
+        )
+        self.plan = verification.plan_verification(self.config)
+        self.execute(process_fn=process)
+        commands = [call[0] for call in calls]
+        self.assertEqual(
+            commands,
+            [
+                ["cargo", "+stable", "--version"],
+                ["rustc", "+stable", "--version"],
+                ["cargo", "+stable", "clippy", "--version"],
+                ["cargo", "+stable", "clippy"],
+                ["cargo", "+stable", "check"],
+            ],
+        )
+        self.assertTrue(
+            all(call[1]["max_output_bytes"] == self.config.max_output_bytes for call in calls)
+        )
+        self.assertTrue(all(call[1]["timeout"] <= 10 for call in calls))
+        self.execute(process_fn=process)
+        self.assertEqual(
+            sum(command == ["cargo", "+stable", "--version"] for command, _ in calls), 2
+        )
+
+    def test_unknown_wrappers_never_trigger_guessed_tool_probes(self):
+        self.config = replace(self.config, checks=[["wrapper", "cargo", "check"]])
+        self.plan = verification.plan_verification(self.config)
+        calls = []
+
+        def custom(argv, **kwargs):
+            calls.append(argv)
+            return ProcessResult(
+                0, "", "warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n", 0
+            )
+
+        records = self.execute(process_fn=custom)
+        self.assertEqual(calls, [["wrapper", "cargo", "check"]])
+        self.assertEqual(records[0]["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_probe_failures_unknown_override_and_cli_config_cannot_resolve(self):
+        from unittest.mock import patch
+
+        diagnostic = "warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+        process, _ = self.cargo(stderr=diagnostic)
+        baseline = self.execute(process_fn=process)
+        root = self.artifacts
+        for index, mode in enumerate(
+            ("failed", "empty", "timeout", "overflow", "wrapper", "cli-config")
+        ):
+            with self.subTest(mode=mode):
+
+                def probe(argv, **kwargs):
+                    if argv[-1] == "--version":
+                        if mode == "failed":
+                            raise FileNotFoundError("missing")
+                        if mode in {"empty", "timeout", "overflow"}:
+                            return ProcessResult(
+                                0,
+                                "",
+                                "",
+                                0,
+                                timed_out=mode == "timeout",
+                                output_limit_exceeded=mode == "overflow",
+                            )
+                    return process(argv, **kwargs)
+
+                command = ("cargo", "check", "--offline")
+                if mode == "cli-config":
+                    # Even the same CLI config argv cannot establish which effective tool it selects.
+                    command += ("--config", 'build.rustc="custom"')
+                check = replace(self.plan.checks[0], argv=command)
+                with patch.dict(
+                    os.environ, {"RUSTC_WRAPPER": "custom-wrapper"} if mode == "wrapper" else {}
+                ):
+                    records = verification.execute_checks(
+                        (check,),
+                        cwd=self.repo,
+                        artifact_root=root,
+                        command_root=root / f"probe-failure-{index}",
+                        config=self.config,
+                        timeout=lambda: 10,
+                        baseline_records=baseline,
+                        process_fn=probe,
+                    )
+                self.assertEqual(records[0]["diagnostics"]["counts"]["resolved"], 0)
+                self.assertEqual(records[0]["diagnostics"]["counts"]["unobserved_previous"], 1)
+                if mode in {"wrapper", "cli-config"}:
+                    full = json.loads((root / records[0]["metadata_file"]).read_text())
+                    self.assertIn(None, full["tool_versions"].values())
+
+    def test_empty_scope_remains_unknown_and_clippy_config_contents_change_identity(self):
+        from unittest.mock import patch
+
+        process, _ = self.cargo()
+        directory = self.repo.parent / (self.repo.name + "-lint-config")
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory))
+        directory.mkdir()
+        config_file = directory / "clippy.toml"
+        config_file.write_text('msrv="1.80"\n')
+        with patch.dict(os.environ, {"CLIPPY_CONF_DIR": str(directory)}):
+            first = self.execute(process_fn=process, scope={})[0]
+            first_report = self.report(first)
+            self.assertEqual(first_report["context"]["scope"], {})
+            config_file.write_text('msrv="1.81"\n')
+            second = self.execute(process_fn=process)[0]
+            self.assertNotEqual(
+                first_report["context"]["configuration_digest"],
+                self.report(second)["context"]["configuration_digest"],
+            )
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires Windows privileges")
+    def test_probe_invalid_source_manifest_still_retains_failed_check_evidence(self):
+        process, _ = self.cargo()
+
+        def invalid(argv, **kwargs):
+            if argv[-1] == "--version":
+                source = self.repo / "source.txt"
+                source.unlink()
+                source.symlink_to("missing")
+            return process(argv, **kwargs)
+
+        with self.assertRaises(verification.VerificationStop):
+            self.execute(process_fn=invalid)
+        self.assertEqual(len(self.records), 1)
+        self.assertFalse(self.records[0]["passed"])
+        self.assertTrue((self.artifacts / self.records[0]["diagnostics_file"]).exists())
+
+    def test_external_configuration_changed_during_probe_or_check_is_not_resolution(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            config_file = Path(temporary) / "config.toml"
+            process, _ = self.cargo(
+                stderr="warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+            )
+            with patch.dict(os.environ, {"CARGO_HOME": temporary}):
+                for mode in ("probe", "check"):
+                    with self.subTest(mode=mode):
+                        config_file.write_text("[build]\njobs=1\n")
+                        baseline = self.execute(process_fn=process)
+                        root = self.artifacts
+                        changed = False
+
+                        def mutate(argv, **kwargs):
+                            nonlocal changed
+                            if (
+                                (mode == "probe" and argv[-1] == "--version")
+                                or (mode == "check" and argv[-1] != "--version")
+                            ) and not changed:
+                                config_file.write_text("[build]\njobs=2\n")
+                                changed = True
+                            if argv[-1] == "--version":
+                                return process(argv, **kwargs)
+                            return ProcessResult(0, "", "", 0)
+
+                        result = verification.execute_checks(
+                            self.plan.checks,
+                            cwd=self.repo,
+                            artifact_root=root,
+                            command_root=root / "changed",
+                            config=self.config,
+                            timeout=lambda: 10,
+                            baseline_records=baseline,
+                            process_fn=mutate,
+                        )[0]
+                        self.assertTrue(result["passed"])
+                        self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+                        self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+
+    @unittest.skipIf(os.name == "nt", "symlink creation requires Windows privileges")
+    def test_configured_excluded_symlink_does_not_break_metadata_or_custom_execution(self):
+        ignored = self.repo / "ignored-link"
+        ignored.symlink_to("missing-target")
+        process, _ = self.cargo()
+        self.config = replace(self.config, exclude=(*self.config.exclude, "ignored-link"))
+        for commands, runner in (
+            ([[sys.executable, "-c", "pass"]], None),
+            ([["cargo", "check", "--offline"]], process),
+        ):
+            with self.subTest(commands=commands):
+                config = replace(self.config, checks=commands)
+                kwargs = {"process_fn": runner} if runner is not None else {}
+                _, report = verification.verify_repository(self.repo, config, "gate", **kwargs)
+                self.assertEqual(report["status"], "passed", report["reason"])
+                self.assertTrue(report["source_unchanged"])
+
+    def test_environment_root_normalization_does_not_conflate_external_prefix_paths(self):
+        from bb_workflow.verification_metadata import configuration
+
+        other_root = self.repo / "other-root"
+        other_root.mkdir()
+        left = configuration(self.repo, self.config, {"RUSTFLAGS": str(self.repo) + "-external"})
+        right = configuration(other_root, self.config, {"RUSTFLAGS": str(other_root) + "-external"})
+        self.assertNotEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])

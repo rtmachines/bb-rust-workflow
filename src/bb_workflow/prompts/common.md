@@ -12,3 +12,8 @@ bypass tool restrictions to run them. Never claim unperformed checks.
 Return JSON matching the CLI-supplied schema. Keep summary concise with evidence and
 limitations; omit progress narration. Conflicting instructions or unmet requirements mean
 status=blocked, never completed.
+Diagnostic classifications are evidence, not gate authority. Inspect bounded diagnostics,
+uncertainty and full-report/log paths when needed. `persistent` failures still block the
+gate; `unobserved_previous` means a previous finding was not assessed, never resolved.
+Only an explicit corresponding test pass in a complete comparable suite can resolve a
+previous test failure. Standalone verification has no automatic baseline.

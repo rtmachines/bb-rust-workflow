@@ -73,6 +73,16 @@ skills = [".agents/skills/rust-review/SKILL.md"] # Plik musi istnieć w projekci
 
 Program nie przełącza modelu ani backendu po błędzie. Identyfikatory i effort sprawdzono w [dokumentacji Claude Code](https://code.claude.com/docs/en/model-config) oraz lokalnym katalogu modeli Codex. Zgodność katalogu nie gwarantuje dostępu na koncie. Jeżeli backend zgłosi inny model, przebieg kończy się błędem; jeżeli nie zwróci identyfikatora, raport zapisze `observed_model: null`.
 
+### Diagnostyka względem stanu bazowego
+
+Każda kontrola zapisuje pełne `diagnostics.json` obok stdout/stderr. Implementer, Fixer i niezależni recenzenci otrzymują skrót do 20 ustaleń i odsyłacze do pełnych dowodów. Każdy kandydat jest porównywany z oryginalnym baseline: `new`, `persistent`, `resolved`, `unclassified` lub `unobserved_previous`. Podsumowanie całej fazy uwzględnia także kontrole pominięte po błędzie krytycznym. Nie zmienia to wyniku wykonania ani wymogu zaliczenia gate.
+
+`resolved` wymaga udanej, porównywalnej kontroli; dla wcześniejszego błędu testu potrzebny jest jawny wynik `ok` tego samego testu w jednoznacznie rozpoznanym, kompletnym zestawie. Błąd kompilacji, timeout, przekroczenie limitu wyjścia, zmieniony zakres i niepełny wynik pozostawiają poprzednie problemy jako `unobserved_previous`. Samodzielne `verify` nie wybiera automatycznie baseline: znalezione problemy są `unclassified`.
+
+Metadane obejmują dokładne argv, profil, wariant, zakres, wersje Cargo/rustc i odpowiednio Clippy/rustfmt/rustdoc oraz skróty manifestów, lockfile, konfiguracji Cargo/Clippy i wyboru toolchain. Uwzględniana jest konfiguracja z katalogów nadrzędnych, `CARGO_HOME`, `CLIPPY_CONF_DIR` i istotne środowisko; wartości zmiennych są hashowane. Próby wersji mają te same limity procesu i budżet czasu, własne logi oraz kontrolę niezmienności źródeł. Ich cache obowiązuje tylko w jednej fazie.
+
+Nieznane lub nieudane próby wersji oraz niejednoznaczne nadpisania kompilatora, wrappery, dołączane konfiguracje i `cargo --config` pozostawiają porównanie niepewne. Własne reguły `exclude` są zachowywane bez przeglądania wykluczonych katalogów; ponieważ mogą ukrywać efektywne manifesty lub konfigurację, skrót konfiguracji pozostaje wtedy nieznany. Własne polecenia opakowujące Cargo nie wywołują zgadywanych prób narzędzi. Parser zachowawczo obsługuje Cargo/rustc JSON, typowe komunikaty kompilatora oraz zwykły libtest; niestandardowe wyjście, powtarzające się nazwy zestawów i nieobsługiwane formaty nie dowodzą naprawienia problemu. `cargo fmt` i bezpośredni rustdoc nie należą do obsługiwanej domeny diagnostyki kompilatora.
+
 ### Oszczędzanie kontekstu Claude Code i Codex
 
 Domyślnie prompt zawiera krótkie wyniki udanych kontroli, końcówki błędów i ograniczony fragment diffu. Pełne logi pozostają w `checks/`; agent dostaje ścieżkę do nich. Schemat odpowiedzi jest przekazywany natywnie przez CLI, bez ponownego wklejania do promptu. Dwa niezależne przeglądy i obowiązkowe kontrole pozostają częścią każdego przebiegu. Triage nadal uruchamia się tylko wtedy, gdy recenzenci zgłoszą ustalenia.

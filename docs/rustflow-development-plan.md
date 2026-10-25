@@ -66,7 +66,11 @@ Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` 
 
 ## 3. Klasyfikacja diagnostyki względem baseline
 
-Dodajemy `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie.
+**Stan:** implementacja ukończona i zweryfikowana lokalnie; niezależny przegląd integracji pozostaje warunkiem odbioru całego etapu.
+
+Wdrożono `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie. Każda kontrola i faza mają pełne `diagnostics.json`, a stan i prompty otrzymują ograniczony skrót oraz odsyłacze. Kandydaci porównują się z niezmiennym oryginalnym baseline; kończenie po błędzie uwzględnia także kontrole niewykonane.
+
+Metadane przechwytują rzeczywiste wersje narzędzi, wybór toolchain, manifesty/lockfile, konfigurację Cargo/Clippy projektu, przodków, `CARGO_HOME`, `CLIPPY_CONF_DIR` oraz hashowane istotne środowisko. Próby wersji mają wspólny budżet i limity wykonawcy, pełne artefakty i kontrolę źródeł; cache obowiązuje tylko w obrębie fazy. Nieznane próby, niejednoznaczne nadpisania i własne wykluczenia źródeł pozostawiają metadane niepewne. Zmiana zewnętrznej konfiguracji podczas próby lub kontroli również unieważnia porównanie. Nierozpoznane polecenia pomijają zgadywane próby i odczyt konfiguracji. Samodzielny `verify` nie wybiera baseline i oznacza znalezione problemy jako `unclassified`.
 
 Rozdzielamy **wynik wykonania polecenia** od **wyniku parsowania diagnostyki**. Pusta lista znalezionych błędów nie oznacza zaliczonej kontroli.
 
@@ -83,6 +87,8 @@ Porównywalność obejmuje zakres pakietów i testów, wariant, polecenia, wersj
 Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego formatu wszystkich rezultatów testów. Nierozpoznany wynik zachowujemy jako niepewny wraz z logiem.
 
 **Odbiór etapu:** błąd kompilacji uniemożliwiający wykonanie testów nie oznacza naprawienia wcześniejszych błędów testowych. Timeout, ucięte wyjście i zmieniony zakres również nie dają `resolved`. Czerwony baseline nadal nie zwalnia z zielonego gate.
+
+**Weryfikacja implementacji etapu 3:** 295 testów uruchomionych: 293 zaliczone, 2 pominięte natywne testy Windows na Linux. `test_verification.py`: 32 testy; `test_engine.py`: 55; `test_rust_checks.py`: 7 rzeczywistych testów Cargo offline. Regresje obejmują błąd testu bazowego → błąd kompilacji kandydata → jawne przejście tego samego testu oraz rzeczywistą diagnostykę JSON w różnych katalogach i po przesunięciu linii. Po tym pełnym przebiegu dodano i zaliczono jeszcze regresję rozróżniającą zewnętrzne ścieżki o wspólnym prefiksie w hashowanym środowisku. Ruff, sprawdzenie formatowania 34 plików, lokalny reviewdog z surowym Ruff i `git diff --check` zakończyły się pomyślnie. Dostawców modeli zastąpiły atrapy; nie uruchamiano płatnych sesji. Etapy 4–5 pozostają do realizacji.
 
 ## 4. Jawne kryteria odbioru powiązane z dowodami
 
