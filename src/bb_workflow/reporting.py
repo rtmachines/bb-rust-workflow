@@ -209,11 +209,21 @@ def render_report(state: dict, plan: dict, requirements: dict | None) -> str:
             + f"audit: {agent.get('artifacts', 'unavailable')}"
         )
         if agent.get("response") and agent["role"] in {"reviewer_a", "reviewer_b", "triage"}:
-            # A budget/error can interrupt the pair before a completed review round exists.
-            complete_round = any(
-                review.get("cycle") == agent.get("cycle") for review in state.get("reviews", [])
+            # A cycle record may predate a blocked response; suppress fallback only when
+            # this exact role response was incorporated into that rendered review.
+            represented = any(
+                review.get("cycle") == agent.get("cycle")
+                and (
+                    review.get("triage") == agent["response"]
+                    if agent["role"] == "triage"
+                    else len(review.get("reviews", []))
+                    > (0 if agent["role"] == "reviewer_a" else 1)
+                    and review["reviews"][0 if agent["role"] == "reviewer_a" else 1]
+                    == agent["response"]
+                )
+                for review in state.get("reviews", [])
             )
-            if not complete_round:
+            if not represented:
                 lines.append(
                     "  Returned historical/partial evidence; no final approval: "
                     + _evidence(agent["response"])

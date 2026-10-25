@@ -408,6 +408,8 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(payload["evidence"]["findings"], [])
         self.assertEqual(payload["evidence"]["disputed_criteria"], ["scope"])
         self.assertEqual(len(payload["evidence"]["criterion_assessments"]), 2)
+        report = (flow.run_dir / "report.md").read_text()
+        self.assertNotIn("Returned historical/partial evidence", report)
 
     def test_unresolved_semantic_triage_blocks(self):
         def unresolved(response, call):
@@ -421,6 +423,29 @@ class AcceptanceTests(unittest.TestCase):
         flow = self.run_flow()
         self.assertEqual(flow.state["status"], "blocked")
         self.assertEqual(self.events[-1], "triage")
+
+    def test_blocked_triage_rationale_is_reported_without_approval(self):
+        def dispute(response, call):
+            response["criterion_assessments"][0]["verdict"] = "unmet"
+
+        def blocked(response, call):
+            response["status"] = "blocked"
+            response["criterion_decisions"][0].update(
+                verdict="unresolved", rationale="Distinctive blocked triage rationale"
+            )
+
+        self.scripts["reviewer_a"] = [dispute]
+        self.scripts["triage"] = [blocked]
+        flow = self.run_flow()
+        report = (flow.run_dir / "report.md").read_text()
+        self.assertEqual(flow.state["status"], "blocked")
+        self.assertIn("scope", report)
+        self.assertIn("Distinctive blocked triage rationale", report)
+        self.assertIn("unresolved", report)
+        self.assertNotIn("Final approval: recorded", report)
+        self.assertNotIn("acceptance_report", flow.state)
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
 
     def test_unmet_semantic_repairs_even_without_blocking_severities_and_repeats_reviews(self):
         self.config.blocking_severities = ()
