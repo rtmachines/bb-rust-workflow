@@ -734,3 +734,183 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
         left = configuration(self.repo, self.config, {"RUSTFLAGS": str(self.repo) + "-external"})
         right = configuration(other_root, self.config, {"RUSTFLAGS": str(other_root) + "-external"})
         self.assertNotEqual(left["environment"]["RUSTFLAGS"], right["environment"]["RUSTFLAGS"])
+
+    def test_external_and_excluded_selected_manifests_cannot_resolve(self):
+        process, _ = self.cargo(stderr="warning[unused]: warning\n --> src/lib.rs:1:1\n1 | code\n")
+        with tempfile.TemporaryDirectory() as external:
+            for index, arguments in enumerate(
+                (
+                    ["--manifest-path", str(Path(external) / "Cargo.toml")],
+                    ["--manifest-path=" + str(Path(external) / "Cargo.toml")],
+                    ["--manifest-path", "target/selected/Cargo.toml"],
+                )
+            ):
+                with self.subTest(arguments=arguments):
+                    selected = (
+                        Path(external) / "Cargo.toml"
+                        if index < 2
+                        else self.repo / "target/selected/Cargo.toml"
+                    )
+                    selected.parent.mkdir(parents=True, exist_ok=True)
+                    selected.write_text('[package]\nname="first"\nversion="0.1.0"\n')
+                    self.plan = verification.plan_verification(
+                        replace(self.config, checks=[["cargo", "check", *arguments, "--offline"]])
+                    )
+                    baseline = self.execute(process_fn=process)
+                    root = self.artifacts
+                    selected.write_text('[package]\nname="second"\nversion="0.2.0"\n')
+
+                    def quiet(argv, **kwargs):
+                        return (
+                            process(argv, **kwargs)
+                            if argv[-1] == "--version"
+                            else ProcessResult(0, "", "", 0)
+                        )
+
+                    result = verification.execute_checks(
+                        self.plan.checks,
+                        cwd=self.repo,
+                        artifact_root=root,
+                        command_root=root / "candidate",
+                        config=self.config,
+                        timeout=lambda: 10,
+                        baseline_records=baseline,
+                        process_fn=quiet,
+                    )[0]
+                    self.assertTrue(result["passed"])
+                    self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+                    self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+                    metadata = json.loads((root / result["metadata_file"]).read_text())
+                    self.assertIsNone(metadata["digest"])
+                    self.assertTrue(metadata["reasons"])
+
+    def test_ancestor_workspace_lock_and_external_path_dependencies_are_uncaptured(self):
+        from bb_workflow.verification_metadata import configuration
+
+        member = self.repo / "member"
+        member.mkdir()
+        manifest_file = member / "Cargo.toml"
+        for case in ("ancestor-workspace", "path-dependency", "explicit-workspace"):
+            with self.subTest(case=case):
+                (self.repo / "Cargo.toml").write_text(
+                    '[workspace]\nmembers=["member"]\n[workspace.package]\nversion="0.1.0"\n'
+                )
+                (self.repo / "Cargo.lock").write_text("version = 4\n")
+                text = '[package]\nname="member"\nversion.workspace=true\n'
+                if case == "path-dependency":
+                    text = '[package]\nname="member"\nversion="0.1.0"\n[workspace]\n[dependencies]\nother={path="../../external"}\n'
+                if case == "explicit-workspace":
+                    text += 'workspace="../../external"\n'
+                manifest_file.write_text(text)
+                first = configuration(member, self.config, {})
+                (self.repo / "Cargo.toml").write_text(
+                    '[workspace]\nmembers=["member"]\n[workspace.package]\nversion="0.2.0"\n'
+                )
+                second = configuration(member, self.config, {})
+                self.assertIsNone(first["digest"])
+                self.assertIsNone(second["digest"])
+                self.assertTrue(first["reasons"])
+        # A complete in-tree workspace/dependency inventory remains comparable.
+        manifest_file.write_text('[package]\nname="member"\nversion.workspace=true\n')
+        captured = configuration(self.repo, self.config, {})
+        self.assertIsNotNone(captured["digest"])
+        self.assertIn("member/Cargo.toml", captured["files"])
+        self.assertIn("Cargo.lock", captured["files"])
+
+    def test_plain_cargo_test_probes_actual_rustdoc_and_changed_version_is_incomparable(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = str(Path(temporary) / "custom-rustdoc")
+            version = "1.90.0"
+            emit_warning = True
+            calls = []
+            self.config = replace(self.config, checks=[["cargo", "test", "--offline", "--locked"]])
+            self.plan = verification.plan_verification(self.config)
+
+            def process(argv, **kwargs):
+                calls.append(argv)
+                if argv[-1] == "--version":
+                    tool = "rustdoc" if argv[0] == executable else argv[0]
+                    return ProcessResult(
+                        0, f"{tool} {version if tool == 'rustdoc' else '1.90.0'}\n", "", 0
+                    )
+                return ProcessResult(
+                    0,
+                    "",
+                    "warning[doc_fixture]: warning\n --> src/lib.rs:1:1\n1 | code\n"
+                    if emit_warning
+                    else "",
+                    0,
+                )
+
+            with patch.dict(os.environ, {"RUSTDOC": executable}):
+                baseline = self.execute(process_fn=process)
+                root = self.artifacts
+                version, emit_warning = "1.91.0", False
+                result = verification.execute_checks(
+                    self.plan.checks,
+                    cwd=self.repo,
+                    artifact_root=root,
+                    command_root=root / "candidate",
+                    config=self.config,
+                    timeout=lambda: 10,
+                    baseline_records=baseline,
+                    process_fn=process,
+                )[0]
+            self.assertIn([executable, "--version"], calls)
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["diagnostics"]["counts"]["resolved"], 0)
+            self.assertEqual(result["diagnostics"]["counts"]["unobserved_previous"], 1)
+            baseline_report = json.loads((root / baseline[0]["diagnostics_file"]).read_text())
+            current_report = json.loads((root / result["diagnostics_file"]).read_text())
+            self.assertEqual(
+                baseline_report["context"]["tool_versions"]["rustdoc"], "rustdoc 1.90.0"
+            )
+            self.assertEqual(
+                current_report["context"]["tool_versions"]["rustdoc"], "rustdoc 1.91.0"
+            )
+
+    def test_malformed_numeric_output_preserves_standalone_execution_and_audit(self):
+        self.config = replace(self.config, checks=[["fixture-check"]])
+        text = "running " + "9" * 5000 + " tests\n"
+        directory, report = verification.verify_repository(
+            self.repo,
+            self.config,
+            "gate",
+            process_fn=lambda *args, **kwargs: ProcessResult(0, text, "", 0),
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(len(report["results"]), 1)
+        self.assertTrue(report["results"][0]["passed"])
+        saved = json.loads((directory / "report.json").read_text())
+        self.assertEqual(saved["status"], "passed")
+        diagnostics = json.loads((directory / saved["results"][0]["diagnostics_file"]).read_text())
+        self.assertTrue(diagnostics["uncertainty"])
+        self.assertTrue(diagnostics["execution"]["successful"])
+
+    def test_unresolvable_manifest_scope_is_unknown_and_preserves_command_audit(self):
+        from bb_workflow.verification_metadata import configuration
+
+        manifest_file = self.repo / "Cargo.toml"
+        manifest_file.write_text(
+            '[package]\nname="fixture"\nversion="0.1.0"\n[dependencies]\nfoo={path="\\u0000"}\n'
+        )
+        metadata = configuration(self.repo, self.config, {}, ("cargo", "check"))
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("unresolved_manifest_scope", metadata["reasons"])
+        process, _ = self.cargo()
+        directory, report = verification.verify_repository(
+            self.repo, self.config, "gate", process_fn=process
+        )
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual(len(report["results"]), 1)
+        self.assertTrue(report["results"][0]["passed"])
+        self.assertTrue((directory / report["results"][0]["diagnostics_file"]).is_file())
+        # Resolve failures for selected argv use the same conservative boundary.
+        manifest_file.write_text('[package]\nname="fixture"\nversion="0.1.0"\n')
+        metadata = configuration(
+            self.repo, self.config, {}, ("cargo", "check", "--manifest-path=\0")
+        )
+        self.assertIsNone(metadata["digest"])
+        self.assertIn("unresolved_manifest_scope", metadata["reasons"])

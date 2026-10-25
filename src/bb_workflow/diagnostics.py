@@ -237,6 +237,14 @@ def _suite(identity: str | None, expected: int | None = None) -> dict:
     }
 
 
+def _text_number(value: str, *, minimum: int = 0) -> int | None:
+    """Bound untrusted decimal text before integer conversion on every Python runtime."""
+    if len(value) > 20 or not value.isascii() or not value.isdecimal():
+        return None
+    number = int(value)
+    return number if minimum <= number < 2**64 else None
+
+
 def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], list[str]]:
     suites = []
     headers = []
@@ -263,15 +271,29 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
                     target = record.get("target")
                     if not isinstance(target, dict):
                         raise ValueError("invalid cargo target")
+                    manifest_path = record.get("manifest_path")
+                    name, kind, source = (
+                        target.get("name"),
+                        target.get("kind"),
+                        target.get("src_path"),
+                    )
+                    if (
+                        not isinstance(manifest_path, str)
+                        or not manifest_path
+                        or not isinstance(name, str)
+                        or not name
+                        or not isinstance(kind, list)
+                        or not kind
+                        or any(not isinstance(item, str) or not item for item in kind)
+                        or not isinstance(source, str)
+                        or not source
+                    ):
+                        raise ValueError("invalid cargo target identity")
                     target_identity = {
-                        "manifest": _path(record["manifest_path"], root)
-                        if isinstance(record.get("manifest_path"), str)
-                        else None,
-                        "name": target.get("name"),
-                        "kind": target.get("kind"),
-                        "source": _path(target["src_path"], root)
-                        if isinstance(target.get("src_path"), str)
-                        else None,
+                        "manifest": _path(manifest_path, root),
+                        "name": name,
+                        "kind": kind,
+                        "source": _path(source, root),
                     }
                     finding = _rustc(record.get("message"), root, target_identity)
                     state["compiler_seen"] = True
@@ -305,7 +327,10 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
         running = _RUNNING.match(line)
         if running:
             flush()
-            suite = _suite(headers[-1] if headers else None, int(running[1]))
+            expected = _text_number(running[1])
+            if expected is None:
+                state["malformed"] += 1
+            suite = _suite(headers[-1] if headers else None, expected)
             suites.append(suite)
             failure_detail = False
             continue
@@ -325,7 +350,16 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
                 suite = _suite(headers[-1] if headers else None)
                 suites.append(suite)
             outcome, passed, failed, ignored, measured, filtered = result.groups()
-            counts = [int(passed), int(failed), int(ignored), int(measured)]
+            numbers = [
+                _text_number(value) for value in (passed, failed, ignored, measured, filtered)
+            ]
+            if None in numbers:
+                state["malformed"] += 1
+                suite["uncertainty"].append("invalid_numeric_suite_results")
+                suite = None
+                failure_detail = False
+                continue
+            counts, filtered_count = numbers[:4], numbers[4]
             names = suite["passed"] + suite["failed"] + suite["ignored"]
             consistent = (
                 counts[:3] == [len(suite[k]) for k in ("passed", "failed", "ignored")]
@@ -334,11 +368,11 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
                 and len(names) == len(set(names))
                 and ((outcome == "ok") == (counts[1] == 0))
             )
-            suite["filtered"] = int(filtered)
-            suite["complete"] = consistent and int(filtered) == 0 and bool(names)
+            suite["filtered"] = filtered_count
+            suite["complete"] = consistent and filtered_count == 0 and bool(names)
             if not consistent:
                 suite["uncertainty"].append("inconsistent_suite_results")
-            if int(filtered):
+            if filtered_count:
                 suite["uncertainty"].append("filtered_tests")
             suite = None
             failure_detail = False
@@ -354,11 +388,16 @@ def _parse_stream(stream: str, root: Path, state: dict) -> tuple[list[dict], lis
             location = _LOCATION.match(line)
             source = _SOURCE.match(line)
             if location:
+                line_number = _text_number(location[2], minimum=1)
+                column_number = _text_number(location[3], minimum=1)
+                if line_number is None or column_number is None:
+                    state["malformed"] += 1
+                    continue
                 pending["locations"].append(
                     {
                         "path": _path(location[1], root),
-                        "line": int(location[2]),
-                        "column": int(location[3]),
+                        "line": line_number,
+                        "column": column_number,
                         "source": "",
                         "label": None,
                     }
@@ -556,7 +595,7 @@ def _comparison_reasons(current: dict, baseline: dict | None) -> list[str]:
         required_tools.add("cargo")
     if command == "clippy":
         required_tools.add("clippy")
-    if command == "test" and "--doc" in current.get("context", {}).get("argv", []):
+    if command == "test":
         required_tools.add("rustdoc")
     for key in (
         "profile",

@@ -30,7 +30,11 @@ EXECUTION = {
     "passed": True,
 }
 FINISHED = json.dumps({"reason": "build-finished", "success": True})
-TEST_CONTEXT = replace(CONTEXT, argv=("cargo", "test"))
+TEST_CONTEXT = replace(
+    CONTEXT,
+    argv=("cargo", "test"),
+    tool_versions={**CONTEXT.tool_versions, "rustdoc": "rustdoc 1.90.0"},
+)
 HEADER = "     Running unittests src/lib.rs (target/debug/deps/demo-deadbeef)\n"
 
 
@@ -548,6 +552,68 @@ class ComparisonTests(unittest.TestCase):
         before = copy.deepcopy((current, baseline))
         compare_diagnostics(current, baseline)
         self.assertEqual((current, baseline), before)
+
+
+class FinalReviewRegressions(unittest.TestCase):
+    def test_malformed_cargo_identity_cannot_authorize_resolution(self):
+        baseline = parse(cargo())
+        for field, value in (
+            ("manifest_path", None),
+            ("manifest_path", []),
+            ("manifest_path", ""),
+            ("target", {}),
+            ("name", None),
+            ("name", []),
+            ("name", ""),
+            ("kind", None),
+            ("kind", {}),
+            ("kind", []),
+            ("kind", [1]),
+            ("src_path", None),
+            ("src_path", []),
+            ("src_path", ""),
+        ):
+            with self.subTest(field=field, value=value):
+                record = json.loads(cargo())
+                owner = record if field in {"manifest_path", "target"} else record["target"]
+                owner[field] = value
+                current = parse(json.dumps(record) + "\n" + FINISHED)
+                comparison = compare_diagnostics(current, baseline)
+                self.assertTrue(current["uncertainty"])
+                self.assertEqual(comparison["counts"]["resolved"], 0)
+                self.assertEqual(comparison["counts"]["unobserved_previous"], 1)
+
+    def test_oversized_text_numbers_are_uncertainty_and_never_resolution(self):
+        huge = "9" * 5000
+        samples = ["running " + huge + " tests\n"]
+        for token in ("1 passed", "0 failed", "0 ignored", "0 measured", "0 filtered out"):
+            samples.append(harness("ok").replace(token, huge + token[1:]))
+        for coordinate in (f"{huge}:1", f"1:{huge}", "0:1", "1:0"):
+            samples.append(
+                "warning[unused_variables]: unused variable: `x`\n"
+                f" --> src/lib.rs:{coordinate}\n4 | let x = 1;\n"
+            )
+        for index, sample in enumerate(samples):
+            with self.subTest(case=index):
+                report = parse(sample, context=TEST_CONTEXT)
+                self.assertTrue(report["uncertainty"])
+                self.assertEqual(
+                    compare_diagnostics(report, parse(cargo(), context=TEST_CONTEXT))["counts"][
+                        "resolved"
+                    ],
+                    0,
+                )
+                self.assertTrue(report["execution"]["successful"])
+
+    def test_plain_cargo_test_requires_rustdoc_identity(self):
+        context = replace(
+            TEST_CONTEXT, tool_versions={"cargo": "cargo 1.90", "rustc": "rustc 1.90"}
+        )
+        baseline = parse(cargo(), context=context)
+        current = parse(FINISHED, context=context)
+        result = compare_diagnostics(current, baseline)
+        self.assertEqual(result["counts"]["resolved"], 0)
+        self.assertEqual(result["counts"]["unobserved_previous"], 1)
 
 
 class SummaryTests(unittest.TestCase):

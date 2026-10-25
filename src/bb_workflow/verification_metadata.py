@@ -49,12 +49,79 @@ def _tools(argv: tuple[str, ...], env: dict[str, str]) -> list[tuple[str, list[s
                 [argv[0], *selector, command, "--version"],
             )
         )
-    if command == "test" and "--doc" in argv:
+    if command == "test":
         tools.append(("rustdoc", [env.get("RUSTDOC") or "rustdoc", *selector, "--version"]))
     return tools
 
 
-def configuration(cwd: Path, config: Config, env: dict[str, str]) -> dict:
+def _manifest_scope(cwd: Path, manifests: dict[Path, dict], argv: tuple[str, ...]) -> list[str]:
+    """Detect uncaptured Cargo scope without resolving external projects or glob trees."""
+    root = cwd.resolve()
+    reasons = []
+
+    def references(value: object):
+        if not isinstance(value, dict):
+            return
+        for key, item in value.items():
+            if key in {"path", "workspace"} and isinstance(item, str):
+                yield item, False
+            elif key in {"members", "default-members"} and isinstance(item, list):
+                for member in item:
+                    if isinstance(member, str):
+                        yield member, True
+            yield from references(item)
+
+    for path, data in manifests.items():
+        for reference, workspace_member in references(data):
+            candidate = (path.parent / reference).resolve()
+            if not candidate.is_relative_to(root):
+                reasons.append("external_manifest_reference")
+            elif any(character in reference for character in "*?["):
+                reasons.append("unresolved_manifest_glob")
+            elif (
+                workspace_member or candidate.suffix != ".rs"
+            ) and candidate / "Cargo.toml" not in manifests:
+                reasons.append("uncaptured_manifest_reference")
+
+    args = list(argv)
+    if "--" in args:
+        args = args[: args.index("--")]
+    selections = []
+    for index, argument in enumerate(args):
+        if argument.startswith("--manifest-path="):
+            selections.append(argument.split("=", 1)[1])
+        elif argument == "--manifest-path":
+            selections.append(args[index + 1] if index + 1 < len(args) else "")
+    selected = (
+        (root / selections[0]).resolve() if selections and selections[0] else root / "Cargo.toml"
+    )
+    if selections and (len(selections) != 1 or selected not in manifests):
+        reasons.append("uncaptured_selected_manifest")
+    # A local workspace owns its manifests/lockfile; outer workspaces do not apply.
+    directory = selected.parent
+    while directory.is_relative_to(root):
+        if isinstance(manifests.get(directory / "Cargo.toml", {}).get("workspace"), dict):
+            return reasons
+        if directory == root:
+            break
+        directory = directory.parent
+    for parent in root.parents:
+        candidate = parent / "Cargo.toml"
+        if candidate.is_file():
+            try:
+                data = tomllib.loads(candidate.read_text(encoding="utf-8"))
+                if "workspace" in data or selected not in manifests:
+                    reasons.append("uncaptured_ancestor_workspace")
+            except (OSError, ValueError, UnicodeError):
+                reasons.append("unknown_ancestor_manifest")
+        if not (root / "Cargo.lock").is_file() and (parent / "Cargo.lock").is_file():
+            reasons.append("uncaptured_ancestor_lockfile")
+    return reasons
+
+
+def configuration(
+    cwd: Path, config: Config, env: dict[str, str], argv: tuple[str, ...] = ()
+) -> dict:
     """Hash relevant contents and environment values; never serialize secret values."""
     names = {
         "Cargo.toml",
@@ -98,7 +165,7 @@ def configuration(cwd: Path, config: Config, env: dict[str, str]) -> dict:
             path = clippy_directory / name
             if path.is_file():
                 paths.setdefault(path, f"clippy_conf_dir/{name}")
-    files, reasons = {}, []
+    files, reasons, manifests = {}, [], {}
     if config.exclude:
         # Excluded directories may contain effective manifests/configuration. Do not
         # walk them or weaken the caller's existing source-exclusion contract.
@@ -107,6 +174,8 @@ def configuration(cwd: Path, config: Config, env: dict[str, str]) -> dict:
         try:
             data = path.read_bytes()
             files[label] = hashlib.sha256(data).hexdigest()
+            if path.name == "Cargo.toml":
+                manifests[path.resolve()] = tomllib.loads(data.decode())
             if (
                 path.name in {"config", "config.toml"}
                 and path.parent.name == ".cargo"
@@ -127,6 +196,11 @@ def configuration(cwd: Path, config: Config, env: dict[str, str]) -> dict:
         except (OSError, ValueError, UnicodeError) as exc:
             files[label] = None
             reasons.append(f"configuration_unreadable:{label}:{type(exc).__name__}")
+    if not argv or Path(argv[0]).name == "cargo":
+        try:
+            reasons.extend(_manifest_scope(cwd, manifests, argv))
+        except (OSError, ValueError, RuntimeError):
+            reasons.append("unresolved_manifest_scope")
     root_pattern = re.compile(r"(?<![\w./-])" + re.escape(str(cwd)) + r"(?=/|[\s\"'`:;,=]|$)")
     relevant = {
         key: _digest(root_pattern.sub(".", value))
@@ -161,6 +235,7 @@ def configuration(cwd: Path, config: Config, env: dict[str, str]) -> dict:
     ):
         reasons.append("environment_tool_override")
     return {
+        "configuration_argv": list(argv),
         "files": files,
         "environment": relevant,
         "reasons": sorted(set(reasons)),
@@ -202,7 +277,7 @@ class MetadataCapture:
             }
             write_json(directory / "metadata.json", metadata)
             return metadata
-        metadata = configuration(self.cwd, self.config, env)
+        metadata = configuration(self.cwd, self.config, env, argv)
         metadata.update(tool_versions={}, probes=[])
         if any(arg == "--config" or arg.startswith("--config=") for arg in argv):
             metadata["reasons"].append("unresolved_cli_configuration_override")
@@ -294,7 +369,9 @@ class MetadataCapture:
         if "unrecognized_command" in metadata["reasons"]:
             return
         try:
-            current = configuration(self.cwd, self.config, env)
+            current = configuration(
+                self.cwd, self.config, env, tuple(metadata.get("configuration_argv", ()))
+            )
             drifted = current["digest"] != metadata["digest"]
         except (OSError, WorkspaceError):
             drifted = True
