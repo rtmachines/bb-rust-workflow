@@ -94,6 +94,67 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             apply_run(self.run)
 
+    def test_surviving_agent_cycle_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "agents": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_agent_response_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1, "agents": [{"response": {}}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_review_cycle_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "reviews": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_response_file_without_agent_state_rejects_historical_fallback(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "validated_response.json").write_text("{}")
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_historical_agent_artifacts_keep_original_apply_contract(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "response.json").write_text("{}")
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(
+            path,
+            {
+                **state,
+                "agents": [{"role": "implementation", "artifacts": "agents/001-implementation"}],
+            },
+        )
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
+
+    def test_historical_fallback_does_not_follow_agent_directory_symlinks(self):
+        self.make_run()
+        external = Path(self.temporary.name) / "outside-audit"
+        external.mkdir()
+        self.create_symlink(self.run / "agents", external, target_is_directory=True)
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
     def test_explicit_historical_version1_still_applies_without_new_indicators(self):
         self.make_run()
         path = self.run / "state.json"

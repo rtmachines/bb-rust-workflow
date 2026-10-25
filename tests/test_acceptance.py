@@ -280,6 +280,19 @@ class AcceptanceTests(unittest.TestCase):
             apply_run(flow.run_dir)
         self.assertFalse((flow.run_dir / "apply-backup").exists())
 
+    def test_downgraded_new_run_with_surviving_provenance_cannot_apply(self):
+        flow = self.run_flow()
+        state = deepcopy(flow.state)
+        state["version"] = 1
+        state.pop("report_contract")
+        state.pop("acceptance_report")
+        (flow.run_dir / "acceptance.json").unlink()
+        write_json(flow.run_dir / "state.json", state)
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+        self.assertFalse((flow.run_dir / "apply-backup").exists())
+        self.assertEqual((self.repo / "lib.rs").read_text(), "pub fn value() -> u32 { 0 }\n")
+
     def test_historical_stage4_criteria_state_keeps_original_apply_contract(self):
         flow = self.run_flow()
         state = deepcopy(flow.state)
@@ -287,6 +300,12 @@ class AcceptanceTests(unittest.TestCase):
         state.pop("report_contract", None)
         state.pop("acceptance_report", None)
         (flow.run_dir / "acceptance.json").unlink(missing_ok=True)
+        for agent in state["agents"]:
+            agent.pop("cycle", None)
+            agent.pop("response", None)
+            (flow.run_dir / agent["artifacts"] / "validated_response.json").unlink(missing_ok=True)
+        for review in state["reviews"]:
+            review.pop("cycle", None)
         write_json(flow.run_dir / "state.json", state)
         self.assertEqual(apply_run(flow.run_dir), ["lib.rs"])
 

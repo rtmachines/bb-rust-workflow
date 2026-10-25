@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 from dataclasses import asdict
 from pathlib import Path
 
@@ -20,7 +22,7 @@ from .requirements import (
     verification_plan_id,
 )
 from .verification import PlannedCheck, VerificationPlan
-from .workspace import WorkspaceError, _read_json
+from .workspace import WorkspaceError, _directory, _read_json, _reparse_point
 
 REPORT_CONTRACT = 1
 
@@ -376,6 +378,44 @@ def build_acceptance(root: Path, state: dict) -> dict:
         ) from exc
 
 
+def _has_new_provenance(root: Path, state: dict) -> bool:
+    """Recognize surviving stage-5 evidence without recursive artifact traversal."""
+    for collection, fields in (("agents", {"cycle", "response"}), ("reviews", {"cycle"})):
+        records = state.get(collection)
+        if type(records) is list and any(
+            type(record) is dict and fields.intersection(record) for record in records
+        ):
+            return True
+    directory = root / "agents"
+    try:
+        try:
+            directory.lstat()
+        except FileNotFoundError:
+            return False
+        _directory(directory)
+        # Stream only immediate invocation directories. Never expand a recursive glob
+        # or follow a symlink/junction into another run or outside the artifact root.
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                info = entry.stat(follow_symlinks=False)
+                _require(
+                    not _reparse_point(info) and not stat.S_ISLNK(info.st_mode),
+                    "agent provenance cannot traverse symlinks or reparse points",
+                )
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                invocation = Path(entry.path)
+                _directory(invocation)
+                try:
+                    (invocation / "validated_response.json").lstat()
+                except FileNotFoundError:
+                    continue
+                return True
+    except OSError as exc:
+        raise WorkspaceError(f"final acceptance: cannot inspect agent provenance: {exc}") from exc
+    return False
+
+
 def validate_acceptance(root: Path, state: dict) -> None:
     """Validate new contracts under apply's existing lock; historical v1 keeps its contract."""
     version = state.get("version", 1)
@@ -383,6 +423,7 @@ def validate_acceptance(root: Path, state: dict) -> None:
         any(key in state for key in ("report_contract", "acceptance_report"))
         or (root / "acceptance.json").exists()
         or (root / "acceptance.json").is_symlink()
+        or _has_new_provenance(root, state)
     )
     _require(type(version) is int and version in {1, 2}, "unknown state version")
     if version == 1 and not indicators:
