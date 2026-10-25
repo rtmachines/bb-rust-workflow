@@ -13,6 +13,7 @@ from typing import Callable
 
 from .backends import BackendError, invoke
 from .config import Config, Selection, route
+from .diagnostics import summarize_diagnostics
 from .process import run_process
 from .protocol import merge_findings, resolve_triage, response_schema, validate_response
 from .requirements import (
@@ -22,7 +23,13 @@ from .requirements import (
     verification_plan_id,
 )
 from .usage import normalize_usage, summarize_usage
-from .verification import PlannedCheck, VerificationStop, execute_checks, plan_verification
+from .verification import (
+    PlannedCheck,
+    VerificationStop,
+    aggregate_diagnostics,
+    execute_checks,
+    plan_verification,
+)
 from .workspace import (
     copy_snapshot,
     initialize_git_snapshot,
@@ -174,6 +181,7 @@ class Workflow:
             {
                 "baseline_checks": self.state["baseline_checks"],
                 "baseline_preparation": self.state["baseline_preparation"],
+                "diagnostics": self.state["diagnostics"]["baseline"],
             },
         )
         while True:
@@ -215,11 +223,17 @@ class Workflow:
                     {
                         "failed_checks": [item for item in checks if not item["passed"]],
                         "mechanical_criteria": mechanical,
+                        "diagnostics": self.state["diagnostics"][label],
                     }
                 )
                 continue
             if any(item["verdict"] == "unmet" for item in mechanical):
-                self._fix({"mechanical_criteria": mechanical})
+                self._fix(
+                    {
+                        "mechanical_criteria": mechanical,
+                        "diagnostics": self.state["diagnostics"][label],
+                    }
+                )
                 continue
             changed = sorted(
                 k
@@ -228,6 +242,7 @@ class Workflow:
             )
             shared = {
                 "checks": checks,
+                "diagnostics": self.state["diagnostics"][f"candidate-{self.state['cycles']}"],
                 "snapshot_id": candidate_id,
                 "baseline_directory": str(self.run_dir / "baseline"),
                 "changed_paths": changed,
@@ -385,7 +400,10 @@ class Workflow:
             return []
         self._save(f"checks:{label}")
 
+        phase_records = []
+
         def record(item: dict) -> None:
+            phase_records.append(item)
             self.state["checks"].append({"phase": label, **item})
             self._save()
 
@@ -401,9 +419,28 @@ class Workflow:
                 expected=expected,
                 preparing=preparing,
                 process_fn=self.process,
+                baseline_records=self.state.get("baseline_checks", [])
+                if label != "baseline"
+                else [],
             )
         except VerificationStop as exc:
             raise WorkflowStop(exc.status, str(exc)) from exc
+        finally:
+            if not preparing:
+                aggregate = aggregate_diagnostics(
+                    phase_records,
+                    self.state.get("baseline_checks", []) if label != "baseline" else [],
+                    checks=checks,
+                    artifact_root=self.run_dir,
+                    project_root=self.work,
+                )
+                path = self.run_dir / "checks" / label / "diagnostics.json"
+                write_json(path, aggregate)
+                self.state.setdefault("diagnostics", {})[label] = {
+                    **summarize_diagnostics({"comparison": aggregate}),
+                    "file": str(path.relative_to(self.run_dir)),
+                }
+                self._save()
 
     def _selection(self, role: str) -> Selection:
         """Resolve and check external MCP assets before dispatching a role."""
@@ -560,6 +597,11 @@ class Workflow:
     def _prompt_context(self, context: dict) -> dict:
         """Project check evidence for agents while retaining full records and raw logs."""
         projected = dict(context)
+        if "diagnostics" in context:
+            projected["diagnostics"] = {
+                **context["diagnostics"],
+                "file": str(self.run_dir / context["diagnostics"]["file"]),
+            }
         for key in (
             "checks",
             "baseline_checks",
@@ -576,6 +618,11 @@ class Workflow:
                     "passed": item["passed"],
                     "logs": str(self.run_dir / item["artifacts"]),
                 }
+                if item.get("diagnostics"):
+                    check["diagnostics"] = {
+                        **item["diagnostics"],
+                        "file": str(self.run_dir / item["diagnostics_file"]),
+                    }
                 if not item["passed"]:
                     for field in (
                         "returncode",

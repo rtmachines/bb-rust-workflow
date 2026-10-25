@@ -21,7 +21,7 @@ from bb_workflow.config import (
 from bb_workflow.engine import Workflow
 from bb_workflow.process import run_process
 from bb_workflow.requirements import Criterion, Requirements
-from bb_workflow.verification import verify_repository
+from bb_workflow.verification import execute_checks, plan_verification, verify_repository
 from bb_workflow.workspace import manifest, snapshot_id
 
 
@@ -330,6 +330,80 @@ class RustChecksTests(unittest.TestCase):
         self.assertEqual(state["candidate_id"], snapshot_id(manifest(flow.work)))
         self.assertEqual(self.calls[1]["snapshot"], self.calls[2]["snapshot"])
         self.assertEqual(self.calls[1]["snapshot"], manifest(flow.work))
+
+    def test_diagnostics_offline_test_failure_compile_failure_and_explicit_pass(self):
+        # A single crate gives Cargo's human Running header a unique suite identity.
+        crate = self.repo / "selected"
+        source = crate / "src/lib.rs"
+        source.write_text("#[test]\nfn regression() { assert_eq!(1, 2); }\n")
+        lock = run_process(["cargo", "generate-lockfile", "--offline"], cwd=self.repo, timeout=30)
+        self.assertEqual(lock.returncode, 0, lock.stderr)
+        config = replace(
+            self.config, checks=[["cargo", "test", "--lib", "--offline", "-p", "selected"]]
+        )
+        plan = plan_verification(config)
+        artifacts = self.repo / ".bb-workflow/diagnostics-test"
+
+        def checks(label, baseline=None):
+            return execute_checks(
+                plan.checks,
+                cwd=self.repo,
+                artifact_root=artifacts,
+                command_root=artifacts / label,
+                config=config,
+                timeout=lambda: 60,
+                baseline_records=baseline,
+                process_fn=run_process,
+            )
+
+        baseline = checks("baseline")
+        self.assertFalse(baseline[0]["passed"])
+        source.write_text('#[test]\nfn regression() { let _: u32 = "bad"; }\n')
+        broken = checks("compile-failure", baseline)
+        self.assertFalse(broken[0]["passed"])
+        self.assertEqual(broken[0]["diagnostics"]["counts"]["resolved"], 0)
+        self.assertEqual(broken[0]["diagnostics"]["counts"]["unobserved_previous"], 1)
+        source.write_text("#[test]\nfn regression() { assert_eq!(1, 1); }\n")
+        passing = checks("passing", baseline)
+        self.assertTrue(passing[0]["passed"])
+        self.assertEqual(passing[0]["diagnostics"]["counts"]["resolved"], 1)
+        self.assertEqual(baseline[0]["diagnostics"]["counts"]["unclassified"], 1)
+
+    def test_real_json_compiler_diagnostic_matches_distinct_roots_and_moved_lines(self):
+        artifacts = self.repo / ".bb-workflow/diagnostics-json"
+        config = replace(
+            self.config, checks=[["cargo", "check", "--offline", "--message-format=json"]]
+        )
+        plan = plan_verification(config)
+        with tempfile.TemporaryDirectory() as temporary:
+            roots = [Path(temporary) / "baseline", Path(temporary) / "candidate"]
+            previous = None
+            for index, root in enumerate(roots):
+                (root / "src").mkdir(parents=True)
+                (root / "Cargo.toml").write_text(
+                    '[package]\nname="demo"\nversion="0.1.0"\nedition="2021"\n'
+                )
+                (root / "src/lib.rs").write_text(
+                    "\n" * index + "pub fn demo() { let unused = 1; }\n"
+                )
+                lock = run_process(
+                    ["cargo", "generate-lockfile", "--offline"], cwd=root, timeout=30
+                )
+                self.assertEqual(lock.returncode, 0, lock.stderr)
+                result = execute_checks(
+                    plan.checks,
+                    cwd=root,
+                    artifact_root=artifacts,
+                    command_root=artifacts / str(index),
+                    config=config,
+                    timeout=lambda: 60,
+                    baseline_records=previous,
+                    process_fn=run_process,
+                )
+                self.assertTrue(result[0]["passed"])
+                if previous is not None:
+                    self.assertEqual(result[0]["diagnostics"]["counts"]["persistent"], 1)
+                previous = result
 
 
 if __name__ == "__main__":

@@ -104,6 +104,11 @@ class EngineTests(unittest.TestCase):
         return BackendResult(payload, 0.1, {"input_tokens": 10}, kwargs["selection"].model)
 
     def process(self, argv, **kwargs):
+        if argv[-1] == "--version" and Path(argv[0]).name in {"cargo", "rustc", "rustdoc"}:
+            tool = (
+                "clippy" if "clippy" in argv else "rustfmt" if "fmt" in argv else Path(argv[0]).name
+            )
+            return ProcessResult(0, tool + " 1.90.0 (fixture)\n", "", 0)
         self.events.append("check")
         self.check_calls.append({"argv": argv, **kwargs})
         if self.check_script:
@@ -1015,6 +1020,80 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(
             self.events, ["check", "implementation", "check", "reviewer_a", "reviewer_b", "triage"]
         )
+
+
+class DiagnosticsEngineTests(unittest.TestCase):
+    setUp = EngineTests.setUp
+    invoke = EngineTests.invoke
+    process = EngineTests.process
+    workflow = EngineTests.workflow
+    run_workflow = EngineTests.run_workflow
+
+    def diagnostic(self):
+        return (
+            "warning[unused_variables]: unused variable: `x`\n --> src/lib.rs:4:5\n4 | let x = 1;\n"
+        )
+
+    def test_phase_summary_reaches_independent_review_prompts_without_audit_mutation(self):
+        self.config = replace(self.config, checks=[["cargo", "check", "--offline"]])
+        self.check_script = [
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", "", 0),
+        ]
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["diagnostics"]["candidate-0"]["counts"]["resolved"], 1)
+        baseline_file = flow.run_dir / state["baseline_checks"][0]["diagnostics_file"]
+        baseline = json.loads(baseline_file.read_text())
+        self.assertEqual(baseline["comparison"]["counts"]["unclassified"], 1)
+        self.assertNotIn("classification", baseline["findings"][0])
+        for call in self.calls:
+            evidence = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])[
+                "evidence"
+            ]
+            self.assertIn("diagnostics", evidence)
+            if call["role"].startswith("reviewer"):
+                self.assertEqual(evidence["diagnostics"]["counts"]["resolved"], 1)
+                self.assertNotIn("reviews", evidence)
+            else:
+                self.assertEqual(evidence["diagnostics"]["counts"]["unclassified"], 1)
+        self.assertTrue((flow.run_dir / state["diagnostics"]["candidate-0"]["file"]).exists())
+
+    def test_partial_phase_keeps_skipped_baseline_findings_unobserved(self):
+        self.config = replace(self.config, checks=[["cargo", "check"], ["cargo", "test", "--lib"]])
+        self.check_script = [
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", self.diagnostic(), 0),
+            ProcessResult(0, "", "", 0, output_limit_exceeded=True),
+        ]
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "failed")
+        summary = state["diagnostics"]["candidate-0"]
+        self.assertEqual(summary["counts"]["resolved"], 0)
+        self.assertEqual(summary["counts"]["unobserved_previous"], 2)
+        aggregate = json.loads((flow.run_dir / summary["file"]).read_text())
+        self.assertEqual(
+            {item["check_id"] for item in aggregate["unobserved_previous"]}, {"0", "1"}
+        )
+        self.assertEqual([call["role"] for call in self.calls], ["implementation"])
+
+    def test_persistent_red_baseline_still_blocks_reviews_and_reaches_fixer(self):
+        self.config = replace(self.config, checks=[["cargo", "check"]], max_cycles=1)
+        self.check_script = [
+            ProcessResult(1, "", self.diagnostic(), 0),
+            ProcessResult(1, "", self.diagnostic(), 0),
+            ProcessResult(1, "", self.diagnostic(), 0),
+        ]
+        _, state = self.run_workflow()
+        self.assertEqual(state["status"], "limit_exhausted")
+        self.assertEqual(state["diagnostics"]["candidate-0"]["counts"]["persistent"], 1)
+        fixer = next(call for call in self.calls if call["role"] == "fixer")
+        evidence = json.loads(fixer["prompt"].split("Task and evidence (JSON):\n", 1)[1])[
+            "evidence"
+        ]
+        self.assertEqual(evidence["diagnostics"]["counts"]["persistent"], 1)
+        self.assertFalse(any(call["role"].startswith("reviewer") for call in self.calls))
+        self.assertFalse(any(item["passed"] for item in state["checks"]))
 
 
 if __name__ == "__main__":

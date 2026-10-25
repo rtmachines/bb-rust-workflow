@@ -90,6 +90,11 @@ class AcceptanceTests(unittest.TestCase):
         return BackendResult(response, None, {}, call["selection"].model)
 
     def process(self, argv, **kwargs):
+        if argv[-1] == "--version" and Path(argv[0]).name in {"cargo", "rustc", "rustdoc"}:
+            tool = (
+                "clippy" if "clippy" in argv else "rustfmt" if "fmt" in argv else Path(argv[0]).name
+            )
+            return ProcessResult(0, tool + " 1.90.0 (fixture)\n", "", 0)
         self.events.append("check")
         if self.process_script:
             action = self.process_script.pop(0)
@@ -327,6 +332,15 @@ class AcceptanceTests(unittest.TestCase):
             [r["mechanical"][0]["verdict"] for r in flow.state["acceptance"]["rounds"]],
             ["unmet", "unmet"],
         )
+        fixer = next(call for call in self.calls if call["role"] == "fixer")
+        evidence = json.loads(fixer["prompt"].split("Task and evidence (JSON):\n", 1)[1])[
+            "evidence"
+        ]
+        self.assertEqual(evidence["mechanical_criteria"][0]["verdict"], "unmet")
+        self.assertEqual(
+            evidence["diagnostics"]["counts"], flow.state["diagnostics"]["candidate-0"]["counts"]
+        )
+        self.assertTrue(Path(evidence["diagnostics"]["file"]).is_file())
 
     def test_unknown_harness_proof_blocks_without_fixer_or_review(self):
         self.config.checks = [["cargo", "test"]]
@@ -507,3 +521,29 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(
             self.events, ["check", "implementation", "check", "reviewer_a", "reviewer_b", "triage"]
         )
+
+    def test_diagnostics_and_acceptance_share_current_independent_review_evidence(self):
+        self.config.checks = [["cargo", "check", "--offline"]]
+        warning = (
+            "warning[unused_variables]: unused variable: `x`\n --> lib.rs:1:5\n1 | let x = 1;\n"
+        )
+        self.process_script = [ProcessResult(0, "", warning, 0), ProcessResult(0, "", "", 0)]
+        flow = self.run_flow()
+        self.assertEqual(flow.state["status"], "succeeded", flow.state["reason"])
+        summary = flow.state["diagnostics"]["candidate-0"]
+        self.assertEqual(summary["counts"]["resolved"], 1)
+        self.assertEqual(
+            flow.state["acceptance"]["rounds"][0]["mechanical"][0]["verdict"], "satisfied"
+        )
+        payloads = [
+            json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+            for call in self.calls
+            if call["role"].startswith("reviewer")
+        ]
+        self.assertEqual(payloads[0]["acceptance"], payloads[1]["acceptance"])
+        self.assertEqual(payloads[0]["evidence"], payloads[1]["evidence"])
+        self.assertEqual(
+            payloads[0]["acceptance"]["binding"]["candidate_id"], flow.state["candidate_id"]
+        )
+        self.assertEqual(payloads[0]["evidence"]["diagnostics"]["counts"]["resolved"], 1)
+        self.assertTrue(Path(payloads[0]["evidence"]["diagnostics"]["file"]).is_file())

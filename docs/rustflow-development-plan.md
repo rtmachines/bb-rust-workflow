@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etapy 1–2 oraz etap 4 zaimplementowane i zweryfikowane; etap 4 na osobnej gałęzi; etapy 3 i 5 poza zakresem tej zmiany
+Status: etapy 1–4 zaimplementowane i zweryfikowane; integracja etapów 3 i 4 w tej gałęzi; etap 5 do realizacji
 
 ## Cel i zachowane gwarancje
 
@@ -62,11 +62,15 @@ Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` 
 
 **Odbiór etapu:** szybki profil nie może nadać wynikowi statusu uprawniającego do `apply`. Gate odrzuca zawężanie pakietu lub filtra testów. W `run` pełny gate nadal poprzedza recenzje każdego kandydata.
 
-**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd implementacji oraz końcowy przegląd całej gałęzi zatwierdziły zmiany bez krytycznych, ważnych ani drobnych usterek do poprawienia. Kontrole uruchomiono na Linux; testy Windows pominięto, a dostawców modeli zastąpiły atrapy. Transformacje własnych komend Cargo celowo obsługują zachowawczy podzbiór argumentów. Obsługa częściowych wyników po przerwaniu procesu pozostała bez zmian. Etapy 3–5 pozostają do realizacji.
+**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd implementacji oraz końcowy przegląd całej gałęzi zatwierdziły zmiany bez krytycznych, ważnych ani drobnych usterek do poprawienia. Kontrole uruchomiono na Linux; testy Windows pominięto, a dostawców modeli zastąpiły atrapy. Transformacje własnych komend Cargo celowo obsługują zachowawczy podzbiór argumentów. Obsługa częściowych wyników po przerwaniu procesu pozostała bez zmian. Etapy 3 i 4 opisano poniżej; etap 5 pozostaje do realizacji.
 
 ## 3. Klasyfikacja diagnostyki względem baseline
 
-Dodajemy `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie.
+**Status: implementacja, weryfikacja i niezależne przeglądy zakończone 2026-10-25.**
+
+Wdrożono `diagnostics.py`, który analizuje komunikaty Cargo/rustc/Clippy i tworzy skrót dla agenta. Pełne stdout/stderr pozostają w audycie. Każda kontrola i faza mają pełne `diagnostics.json`, a stan i prompty otrzymują ograniczony skrót oraz odsyłacze. Kandydaci porównują się z niezmiennym oryginalnym baseline; kończenie po błędzie uwzględnia także kontrole niewykonane.
+
+Metadane przechwytują rzeczywiste wersje narzędzi, wybór toolchain, manifesty/lockfile, konfigurację Cargo/Clippy projektu, przodków, `CARGO_HOME`, `CLIPPY_CONF_DIR` oraz hashowane istotne środowisko. Próby wersji mają wspólny budżet i limity wykonawcy, pełne artefakty i kontrolę źródeł; cache obowiązuje tylko w obrębie fazy. Nieznane próby, niejednoznaczne nadpisania, własne wykluczenia źródeł oraz nieprzechwycone manifesty, zależności i nierozstrzygnięte globy pozostawiają metadane niepewne. Każde polecenie Cargo test wymaga znanej wersji rustdoc do porównania diagnostyki, także gdy wybrany zakres nie uruchamia doctestów; brak tej informacji nie zmienia wyniku wykonania kontroli. Zmiana zewnętrznej konfiguracji podczas próby lub kontroli również unieważnia porównanie. Nierozpoznane polecenia pomijają zgadywane próby i odczyt konfiguracji. Samodzielny `verify` nie wybiera baseline i oznacza znalezione problemy jako `unclassified`.
 
 Rozdzielamy **wynik wykonania polecenia** od **wyniku parsowania diagnostyki**. Pusta lista znalezionych błędów nie oznacza zaliczonej kontroli.
 
@@ -84,10 +88,11 @@ Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego fo
 
 **Odbiór etapu:** błąd kompilacji uniemożliwiający wykonanie testów nie oznacza naprawienia wcześniejszych błędów testowych. Timeout, ucięte wyjście i zmieniony zakres również nie dają `resolved`. Czerwony baseline nadal nie zwalnia z zielonego gate.
 
+**Weryfikacja etapu 3:** końcowy pełny przebieg obejmuje 305 testów: 303 zaliczone, 2 natywne testy Windows pominięte na Linux (46,258 s). Moduł diagnostyki ma 43 testy, wykonawca weryfikacji 38, silnik 55, a zestaw Cargo 7 rzeczywistych testów offline. Regresje obejmują błąd testu bazowego → błąd kompilacji kandydata → jawne przejście tego samego testu, diagnostykę JSON w różnych katalogach i po przesunięciu linii, niepełne komunikaty, skrajnie długie liczby, zmiany narzędzi i konfiguracji oraz nieprzechwycone zależności. Ruff, formatowanie 34 plików, lokalny reviewdog z surowym Ruff i kontrola diffu zakończyły się pomyślnie. Przeglądy modułu, integracji i całej gałęzi wykryły przypadki brzegowe; po poprawkach ponowny przegląd potwierdził zamknięcie wszystkich ustaleń bez nowych istotnych regresji. Dostawców modeli w testach zastąpiły atrapy; nie uruchamiano płatnych sesji dostawców workflow. Zmiana bazuje na ukończonym etapie 2, commit `30612b4`. Etap 4 opisano poniżej; etap 5 pozostaje do realizacji.
+
 ## 4. Jawne kryteria odbioru powiązane z dowodami
 
-**Status: implementacja, weryfikacja i niezależne przeglądy etapu 4 zakończone 2026-10-25. Etap 3 nie jest zależnością.**
-
+**Status: implementacja, weryfikacja i niezależne przeglądy etapu 4 zakończone 2026-10-25. Etap 3 jest również obecny po integracji z main.**
 
 Dodajemy plik wymagań przekazywany do `run`, np.:
 
@@ -151,6 +156,14 @@ i kontrola diffu są poprawne. Niezależne przeglądy obu części i całej gał
 wszystkie zgłoszone usterki poprawiono i zatwierdzono w ponownych przeglądach. Regresje obejmują
 różne sposoby wywołania Cargo oraz odrzucenie zmiany kandydata podczas triage przed Fixerem.
 Nie uruchamiano płatnych sesji dostawców.
+
+**Kontrole po integracji etapów 3 i 4 z aktualnym `main` (2026-10-25):** pełny zestaw na
+Python 3.11 wykonał 386 testów: 384 zaliczone, 2 natywne testy junctions Windows pominięte na
+Linux (69,944 s). Celowane zestawy obejmują 26 testów odbioru, 57 silnika i 8 rzeczywistych
+regresji Cargo offline. Dodana regresja potwierdza wspólny aktualny kontekst diagnostyki i kryteriów
+w obu niezależnych review; naprawy mechaniczne zachowują także skrót diagnostyki i pełne odsyłacze.
+Demo offline przeszło pełny gate, a Ruff przez lokalny reviewdog, formatowanie 37 plików i kontrola
+diffu są poprawne. Etap 5 pozostaje poza zakresem.
 
 ## 5. Raportowanie, integracja z apply i odbiór całości
 

@@ -96,4 +96,3 @@ Mechanical requires check_id; semantic forbids check_id/test_name. test_name is 
 - [x] Add real small offline Cargo regression proving zero filtered cases cannot satisfy criterion and named passing test can. Use fixture providers, no paid CLI sessions.
 - [x] Update examples/README/migration/architecture and stage 4 completion notes accurately; basic state/report mode disclosure required, richer final reporting/apply binding stays stage 5.
 - [x] Run relevant tests then full suite, Ruff through local reviewdog and format check, self-review and commit. Report counts, skips, known limits and exact final interfaces.
-

@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Config, ConfigError, VerificationVariant
+from .diagnostics import (
+    DiagnosticContext,
+    compare_diagnostics,
+    parse_diagnostics,
+    summarize_diagnostics,
+)
 from .process import ProcessResult, run_process
+from .verification_metadata import MetadataCapture, MetadataError
 from .workspace import (
     WorkspaceError,
     manifest,
@@ -170,6 +177,8 @@ def execute_checks(
     expected: dict[str, str] | None = None,
     preparing: bool = False,
     process_fn: Callable = run_process,
+    baseline_records: list[dict] | None = None,
+    scope: dict | None = None,
 ) -> list[dict]:
     """Execute a precomputed plan, retaining full logs and one frozen source manifest.
 
@@ -180,25 +189,43 @@ def execute_checks(
     frozen = expected if expected is not None else manifest(cwd, config.exclude)
     results = []
     command_root = command_root or artifact_root / "checks"
+    capture = MetadataCapture(
+        cwd=cwd,
+        artifact_root=artifact_root,
+        command_root=command_root,
+        config=config,
+        timeout=timeout,
+        process_fn=process_fn,
+        frozen=frozen,
+    )
+    previous = {(item.get("id"), item.get("variant")): item for item in baseline_records or []}
     for index, check in enumerate(checks):
         before = manifest(cwd, config.exclude)
         if not preparing and before != frozen:
             raise VerificationStop("failed", "Candidate changed between validation commands")
-        duration_limit = timeout()
+        timeout()
         directory = command_root / str(index)
         directory.mkdir(parents=True)
         argv = list(check.argv)
         write_json(directory / "command.json", argv)
         started = time.monotonic()
         fatal: BaseException | None = None
+        metadata = {"tool_versions": {}, "digest": None}
+        environment = snapshot_environment()
         try:
+            if not preparing:
+                metadata = capture.capture(check.argv, environment, directory)
             result = process_fn(
                 argv,
                 cwd=cwd,
-                timeout=duration_limit,
-                env=snapshot_environment(),
+                timeout=timeout(),
+                env=environment,
                 max_output_bytes=config.max_output_bytes,
             )
+        except MetadataError as exc:
+            fatal = VerificationStop("failed", str(exc))
+        except VerificationStop as exc:
+            fatal = exc
         except FileNotFoundError:
             fatal = VerificationStop("blocked", f"Validation executable unavailable: {argv[0]}")
         except OSError as exc:
@@ -263,6 +290,28 @@ def execute_checks(
             item["error"] = "Command timed out"
         elif result.returncode:
             item["error"] = f"Command exited with status {result.returncode}"
+        if not preparing:
+            if "reasons" in metadata:
+                capture.recheck(metadata, environment, directory)
+            context = DiagnosticContext(
+                check.profile,
+                check.variant,
+                check.argv,
+                scope if scope is not None else {"package": None, "test_filter": None},
+                metadata["tool_versions"],
+                metadata["digest"],
+            )
+            diagnostics = parse_diagnostics(
+                result.stdout, result.stderr, project_root=cwd, context=context, execution=item
+            )
+            baseline = load_diagnostics(previous.get((check.id, check.variant)), artifact_root)
+            diagnostics["comparison"] = compare_diagnostics(diagnostics, baseline)
+            write_json(directory / "diagnostics.json", diagnostics)
+            item.update(
+                diagnostics_file=str((directory / "diagnostics.json").relative_to(artifact_root)),
+                metadata_file=str((directory / "metadata.json").relative_to(artifact_root)),
+                diagnostics=summarize_diagnostics(diagnostics),
+            )
         results.append(item)
         if record is not None:
             record(item)
@@ -272,6 +321,67 @@ def execute_checks(
         raise VerificationStop("failed", "Candidate changed after verification")
     timeout()
     return results
+
+
+def load_diagnostics(item: dict | None, artifact_root: Path) -> dict | None:
+    """Load retained parser evidence; older audit records have no comparable evidence."""
+    if not item or not item.get("diagnostics_file"):
+        return None
+    try:
+        value = json.loads((artifact_root / item["diagnostics_file"]).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def aggregate_diagnostics(
+    results: list[dict],
+    baseline_records: list[dict],
+    *,
+    checks: tuple[PlannedCheck, ...],
+    artifact_root: Path,
+    project_root: Path,
+) -> dict:
+    """Retain every check's comparison, including baseline checks never reached."""
+    kinds = ("new", "persistent", "resolved", "unclassified", "unobserved_previous")
+    aggregate = {
+        "schema_version": 1,
+        "comparable": True,
+        "reasons": [],
+        **{kind: [] for kind in kinds},
+    }
+    current = {(item.get("id"), item.get("variant")): item for item in results}
+    previous = {(item.get("id"), item.get("variant")): item for item in baseline_records}
+    planned = {(check.id, check.variant): check for check in checks}
+    for key in sorted(current.keys() | previous.keys(), key=repr):
+        item = current.get(key)
+        report = load_diagnostics(item, artifact_root)
+        if report is not None:
+            comparison = report["comparison"]
+        else:
+            check = planned.get(key)
+            old = load_diagnostics(previous.get(key), artifact_root)
+            context = DiagnosticContext(
+                check.profile if check else "unknown",
+                key[1] or "unknown",
+                check.argv if check else (),
+                {"package": None, "test_filter": None},
+                {},
+                None,
+            )
+            empty = parse_diagnostics(
+                "", "", project_root=project_root, context=context, execution={}
+            )
+            comparison = compare_diagnostics(empty, old)
+        aggregate["comparable"] &= comparison["comparable"]
+        aggregate["reasons"].extend(comparison["reasons"])
+        for kind in kinds:
+            aggregate[kind].extend(
+                dict(finding, check_id=key[0], variant=key[1]) for finding in comparison[kind]
+            )
+    aggregate["reasons"] = sorted(set(aggregate["reasons"]))
+    aggregate["counts"] = {kind: len(aggregate[kind]) for kind in kinds}
+    return aggregate
 
 
 def verify_repository(
@@ -333,6 +443,7 @@ def verify_repository(
                 record=save_record,
                 expected=frozen,
                 process_fn=process_fn,
+                scope={"package": package, "test_filter": test_filter},
             )
             passed = all(item["passed"] for item in report["results"])
             report.update(
@@ -359,6 +470,18 @@ def verify_repository(
                     timeout()
                 except VerificationStop as exc:
                     report.update(status=exc.status, reason=str(exc))
+            aggregate = aggregate_diagnostics(
+                report["results"],
+                [],
+                checks=plan.checks,
+                artifact_root=directory,
+                project_root=repo,
+            )
+            write_json(directory / "diagnostics.json", aggregate)
+            report["diagnostics"] = {
+                **summarize_diagnostics({"comparison": aggregate}),
+                "file": "diagnostics.json",
+            }
             report["elapsed_seconds"] = round(time.monotonic() - started, 3)
             report["finished_at"] = datetime.now(timezone.utc).isoformat()
             write_json(directory / "report.json", report)
