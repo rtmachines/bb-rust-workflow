@@ -15,12 +15,12 @@ from .config import Config, Selection, route
 from .process import run_process
 from .protocol import RESPONSE_SCHEMA, merge_findings, resolve_triage, validate_response
 from .usage import normalize_usage, summarize_usage
+from .verification import PlannedCheck, VerificationStop, execute_checks, plan_verification
 from .workspace import (
     copy_snapshot,
     initialize_git_snapshot,
     manifest,
     project_lock,
-    snapshot_environment,
     snapshot_id,
     write_json,
 )
@@ -240,75 +240,36 @@ class Workflow:
     def _checks(
         self, label: str, *, preparing: bool = False, expected: dict[str, str] | None = None
     ) -> list[dict]:
-        commands = self.config.prepare if preparing else self.config.checks
-        if not commands:
+        if preparing:
+            checks = tuple(
+                PlannedCheck(str(index), "preparation", "default", tuple(argv))
+                for index, argv in enumerate(self.config.prepare)
+            )
+        else:
+            checks = plan_verification(self.config, "gate").checks
+        if not checks:
             return []
         self._save(f"checks:{label}")
-        results = []
-        frozen = expected if expected is not None else manifest(self.work, self.config.exclude)
-        for index, argv in enumerate(commands):
-            before = manifest(self.work, self.config.exclude)
-            if not preparing and before != frozen:
-                raise WorkflowStop("failed", "Candidate changed between validation commands")
-            directory = self.run_dir / "checks" / label / str(index)
-            directory.mkdir(parents=True)
-            write_json(directory / "command.json", argv)
-            try:
-                result = self.process(
-                    argv,
-                    cwd=self.work,
-                    timeout=self._timeout(),
-                    env=snapshot_environment(),
-                    max_output_bytes=self.config.max_output_bytes,
-                )
-            except FileNotFoundError as exc:
-                raise WorkflowStop(
-                    "blocked", f"Validation executable unavailable: {argv[0]}"
-                ) from exc
-            (directory / "stdout.txt").write_text(result.stdout, encoding="utf-8")
-            (directory / "stderr.txt").write_text(result.stderr, encoding="utf-8")
-            after = manifest(self.work, self.config.exclude)
-            unchanged = before == after
-            record = {
-                "kind": "preparation" if preparing else "validation",
-                "snapshot_id": snapshot_id(before),
-                "result_snapshot_id": snapshot_id(after),
-                "source_unchanged": unchanged,
-                "command": argv,
-                "returncode": result.returncode,
-                "timed_out": result.timed_out,
-                "output_limit_exceeded": result.output_limit_exceeded,
-                "duration": result.duration,
-                "passed": result.returncode == 0
-                and not result.timed_out
-                and not result.output_limit_exceeded
-                and (preparing or unchanged),
-                "stdout_tail": result.stdout[
-                    -max(12000, self.config.context.failed_check_tail_chars) :
-                ],
-                "stderr_tail": result.stderr[
-                    -max(12000, self.config.context.failed_check_tail_chars) :
-                ],
-                "stdout_chars": len(result.stdout),
-                "stderr_chars": len(result.stderr),
-                "artifacts": str(directory.relative_to(self.run_dir)),
-            }
-            results.append(record)
-            self.state["checks"].append({"phase": label, **record})
+
+        def record(item: dict) -> None:
+            self.state["checks"].append({"phase": label, **item})
             self._save()
-            if result.output_limit_exceeded:
-                raise WorkflowStop(
-                    "failed",
-                    f"Command output limit exceeded ({self.config.max_output_bytes} bytes): "
-                    + " ".join(argv),
-                )
-            if not preparing and not unchanged:
-                raise WorkflowStop(
-                    "failed",
-                    "Validation command changed source files; results invalidated. "
-                    "Move generators/formatters to prepare: " + " ".join(argv),
-                )
-        return results
+
+        try:
+            return execute_checks(
+                checks,
+                cwd=self.work,
+                artifact_root=self.run_dir,
+                command_root=self.run_dir / "checks" / label,
+                config=self.config,
+                timeout=self._timeout,
+                record=record,
+                expected=expected,
+                preparing=preparing,
+                process_fn=self.process,
+            )
+        except VerificationStop as exc:
+            raise WorkflowStop(exc.status, str(exc)) from exc
 
     def _selection(self, role: str) -> Selection:
         """Resolve and check external MCP assets before dispatching a role."""

@@ -11,7 +11,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bb_workflow.backends import BackendError, BackendResult
-from bb_workflow.config import ContextConfig, Selection, load_config, route
+from bb_workflow.config import (
+    ContextConfig,
+    Selection,
+    VerificationConfig,
+    VerificationProfile,
+    VerificationVariant,
+    load_config,
+    route,
+)
 from bb_workflow.engine import Workflow
 from bb_workflow.process import ProcessResult, run_process
 from bb_workflow.protocol import RESPONSE_SCHEMA
@@ -124,6 +132,59 @@ class EngineTests(unittest.TestCase):
         self.assertFalse((self.repo / ".bb-workflow/lock").exists())
         self.assertEqual((self.repo / "src/lib.rs").read_text(), self.original)
         return flow, state
+
+    def test_every_gate_variant_precedes_independent_reviews(self):
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(features=("extra",))
+        self.config = replace(
+            self.config, checks=[["cargo", "check", "--workspace"]], verification=verification
+        )
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded", state["reason"])
+        self.assertEqual(
+            self.events,
+            ["check", "check", "implementation", "check", "check", "reviewer_a", "reviewer_b"],
+        )
+        candidate = [c for c in state["checks"] if c["phase"] == "candidate-0"]
+        self.assertEqual([c["variant"] for c in candidate], ["default", "feature"])
+        self.assertEqual(
+            candidate[1]["command"], ["cargo", "check", "--workspace", "--features", "extra"]
+        )
+        self.assertEqual({c["snapshot_id"] for c in candidate}, {state["candidate_id"]})
+        self.assertNotEqual(self.calls[1]["cwd"], self.calls[2]["cwd"])
+        self.assertTrue((flow.run_dir / candidate[1]["artifacts"] / "stdout.txt").exists())
+
+    def test_variant_failure_runs_fixer_and_repeats_full_gate_before_reviews(self):
+        verification = VerificationConfig()
+        verification.profiles["gate"] = VerificationProfile(variants=("default", "feature"))
+        verification.variants["feature"] = VerificationVariant(all_features=True)
+        self.config = replace(
+            self.config, checks=[["cargo", "test", "--workspace"]], verification=verification
+        )
+        self.check_script = [ProcessResult(0, "", "", 0)] * 3 + [
+            ProcessResult(1, "", "feature failed", 0)
+        ]
+        _, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded", state["reason"])
+        self.assertEqual(
+            self.events,
+            [
+                "check",
+                "check",
+                "implementation",
+                "check",
+                "check",
+                "fixer",
+                "check",
+                "check",
+                "reviewer_a",
+                "reviewer_b",
+            ],
+        )
+        failed = [c for c in state["checks"] if not c["passed"]]
+        self.assertEqual([(c["phase"], c["variant"]) for c in failed], [("candidate-0", "feature")])
+        self.assertEqual(len([c for c in state["checks"] if c["phase"] == "candidate-1"]), 2)
 
     def test_success_uses_identical_separate_review_snapshots_and_no_cross_review_prompt(self):
         self.scripts["reviewer_a"] = [response(summary="REVIEW_A_SECRET")]

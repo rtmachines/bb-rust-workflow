@@ -25,6 +25,28 @@ class ConfigTests(unittest.TestCase):
         self.path.write_text(text, encoding="utf-8")
         return load_config(self.path)
 
+    def test_strict_verification_config(self):
+        invalid = [
+            "[verification]\nunknown = true",
+            '[verification.profiles.nope]\nvariants = ["default"]',
+            '[verification.profiles.gate]\nchecks = [["cargo", "check"]]',
+            "[verification.profiles.fast]\nchecks = []",
+            "[verification.profiles.fast]\nvariants = []",
+            '[verification.profiles.fast]\nvariants = ["missing"]',
+            '[verification.profiles.fast]\nvariants = ["default", "default"]',
+            '[verification.variants.x]\nfeatures = [""]',
+            '[verification.variants.x]\nfeatures = ["a"]\nall_features = true',
+            '[verification.variants.x]\nall_features = "true"',
+            "[verification.variants.x]\nno_default_features = 1",
+            '[verification.variants.x]\ntarget = " "',
+            '[verification.variants.x]\ntoolchain = ""',
+            "[verification.variants.x]\nunknown = true",
+            "verification = []",
+        ]
+        for text in invalid:
+            with self.subTest(text=text), self.assertRaises(ConfigError):
+                self.write(default_text() + "\n" + text)
+
     def test_default_template_loads_all_profiles(self):
         config = load_config()
         self.assertEqual(config.max_cycles, 3)

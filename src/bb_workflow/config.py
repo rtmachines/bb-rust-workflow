@@ -46,6 +46,38 @@ class ContextConfig:
     skill_mode: str = "reference"
 
 
+@dataclass(frozen=True)
+class VerificationVariant:
+    features: tuple[str, ...] = ()
+    all_features: bool = False
+    no_default_features: bool = False
+    target: str | None = None
+    toolchain: str | None = None
+
+
+@dataclass(frozen=True)
+class VerificationProfile:
+    checks: tuple[tuple[str, ...], ...] | None = None
+    variants: tuple[str, ...] = ("default",)
+
+
+def _verification_profiles() -> dict[str, VerificationProfile]:
+    return {
+        "fast": VerificationProfile((DEFAULT_CHECKS[0], DEFAULT_CHECKS[1])),
+        "focused": VerificationProfile((DEFAULT_CHECKS[1], DEFAULT_CHECKS[2])),
+        "lint": VerificationProfile((DEFAULT_CHECKS[4],)),
+        "gate": VerificationProfile(),
+    }
+
+
+@dataclass
+class VerificationConfig:
+    profiles: dict[str, VerificationProfile] = field(default_factory=_verification_profiles)
+    variants: dict[str, VerificationVariant] = field(
+        default_factory=lambda: {"default": VerificationVariant()}
+    )
+
+
 @dataclass
 class Config:
     max_cycles: int = 3
@@ -67,6 +99,7 @@ class Config:
     roles: dict[str, Selection] = field(default_factory=dict)
     context: ContextConfig = field(default_factory=ContextConfig)
     config_version: int = CURRENT_CONFIG_VERSION
+    verification: VerificationConfig = field(default_factory=VerificationConfig)
 
 
 ROLE_NAMES = ("implementation", "reviewer_a", "reviewer_b", "triage", "fixer")
@@ -96,6 +129,7 @@ _TOP_KEYS = {
     "model_catalog",
     "profiles",
     "roles",
+    "verification",
 }
 
 
@@ -238,6 +272,7 @@ def load_config(path: Path | None = None) -> Config:
         profiles=profiles,
         roles=overrides,
         context=context,
+        verification=_verification(raw.get("verification", {})),
     )
 
 
@@ -327,3 +362,72 @@ def _number(value: Any, where: str, minimum: float) -> float:
     ):
         raise ConfigError(f"{where} must be a finite positive number")
     return float(value)
+
+
+def _verification(value: Any) -> VerificationConfig:
+    if not isinstance(value, dict):
+        raise ConfigError("verification must be a table")
+    _keys(value, {"profiles", "variants"}, "verification")
+    result = VerificationConfig()
+    variants = value.get("variants", {})
+    if not isinstance(variants, dict):
+        raise ConfigError("verification.variants must be a table")
+    for name, options in variants.items():
+        where = f"verification.variants.{name}"
+        _nonempty_str(name, where)
+        if not isinstance(options, dict):
+            raise ConfigError(f"{where} must be a table")
+        _keys(
+            options,
+            {"features", "all_features", "no_default_features", "target", "toolchain"},
+            where,
+        )
+        features = _strings(options.get("features", []), f"{where}.features")
+        for feature in features:
+            _nonempty_str(feature, f"{where}.features")
+        for flag in ("all_features", "no_default_features"):
+            if flag in options and type(options[flag]) is not bool:
+                raise ConfigError(f"{where}.{flag} must be a boolean")
+        if features and options.get("all_features", False):
+            raise ConfigError(f"{where}: features conflict with all_features")
+        result.variants[name] = VerificationVariant(
+            features=features,
+            all_features=options.get("all_features", False),
+            no_default_features=options.get("no_default_features", False),
+            target=_nonempty_str(options["target"], f"{where}.target")
+            if "target" in options
+            else None,
+            toolchain=_nonempty_str(options["toolchain"], f"{where}.toolchain")
+            if "toolchain" in options
+            else None,
+        )
+    profiles = value.get("profiles", {})
+    if not isinstance(profiles, dict):
+        raise ConfigError("verification.profiles must be a table")
+    _keys(profiles, set(result.profiles), "verification.profiles")
+    for name, options in profiles.items():
+        where = f"verification.profiles.{name}"
+        if not isinstance(options, dict):
+            raise ConfigError(f"{where} must be a table")
+        _keys(options, {"variants"} if name == "gate" else {"checks", "variants"}, where)
+        names = _strings(options.get("variants", ["default"]), f"{where}.variants")
+        if (
+            not names
+            or len(set(names)) != len(names)
+            or any(n not in result.variants for n in names)
+        ):
+            raise ConfigError(
+                f"{where}.variants must be non-empty, unique and reference defined variants"
+            )
+        checks = result.profiles[name].checks
+        if "checks" in options:
+            raw = options["checks"]
+            if (
+                not isinstance(raw, list)
+                or not raw
+                or any(not isinstance(c, list) or not c for c in raw)
+            ):
+                raise ConfigError(f"{where}.checks must be a non-empty array of command arrays")
+            checks = tuple(_strings(c, f"{where}.checks command") for c in raw)
+        result.profiles[name] = VerificationProfile(checks, names)
+    return result

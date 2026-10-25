@@ -21,6 +21,7 @@ from .config import (
 )
 from .engine import Workflow
 from .process import run_process
+from .verification import plan_verification, verify_repository
 from .workspace import WorkspaceError, apply_run, snapshot_environment
 
 
@@ -40,6 +41,12 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--complexity", choices=("auto", "low", "medium", "high"), default="auto"
             )
+    verify = commands.add_parser("verify", help="Run checks in the project without providers")
+    verify.add_argument("profile", choices=("fast", "focused", "lint", "gate"))
+    verify.add_argument("--repo", type=Path, default=Path.cwd())
+    verify.add_argument("--config", type=Path)
+    verify.add_argument("--package")
+    verify.add_argument("--test-filter")
     for name in ("status", "apply"):
         command = commands.add_parser(name)
         command.add_argument("run_dir", type=Path)
@@ -174,6 +181,33 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "applied", "changed_paths": changed}, indent=2))
             return 0
         config = _config(args)
+        if args.command == "verify":
+            directory, report = verify_repository(
+                args.repo,
+                config,
+                args.profile,
+                package=args.package,
+                test_filter=args.test_filter,
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": report["status"],
+                        "reason": report["reason"],
+                        "run_dir": str(directory),
+                        "report": str(directory / "report.md"),
+                        "apply_eligible": False,
+                    },
+                    indent=2,
+                )
+            )
+            return (
+                0
+                if report["status"] == "passed"
+                else 130
+                if report["status"] == "interrupted"
+                else 1
+            )
         if args.command == "doctor":
             payload, ok = _doctor(config, args.repo)
             print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -189,6 +223,10 @@ def main(argv: list[str] | None = None) -> int:
                         "roles": {k: asdict(v) for k, v in roles.items()},
                         "checks": config.checks,
                         "checks_scope": _checks_scope(config),
+                        "verification": {
+                            **asdict(config.verification),
+                            "gate_plan": asdict(plan_verification(config, "gate")),
+                        },
                         "prepare": config.prepare,
                         "max_cycles": config.max_cycles,
                         "max_agent_calls": config.max_agent_calls,
