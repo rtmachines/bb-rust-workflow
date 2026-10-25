@@ -555,6 +555,10 @@ def apply_run(run_dir: Path) -> list[str]:
         raise WorkspaceError("run exclude must be an array of non-empty strings")
     exclude = tuple(excludes)
     with project_lock(repo):
+        # Lazy import avoids requirements -> verification -> workspace import cycle.
+        from .acceptance import validate_acceptance
+
+        validate_acceptance(run_dir, state)
         baseline = _read_manifest(run_dir / "baseline_manifest.json", exclude)
         candidate = _read_manifest(run_dir / "candidate_manifest.json", exclude)
         if snapshot_id(baseline) != state.get("baseline_id") or snapshot_id(candidate) != state.get(

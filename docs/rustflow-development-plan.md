@@ -1,7 +1,7 @@
 # Plan rozwoju bb-rust-workflow — mechanizmy inspirowane Rustflow
 
 Data: 2026-10-25
-Status: etapy 1–4 zaimplementowane i zweryfikowane; integracja etapów 3 i 4 w tej gałęzi; etap 5 do realizacji
+Status: etapy 1–5 zaimplementowane; lokalna weryfikacja i niezależne przeglądy zakończone 2026-10-25
 
 ## Cel i zachowane gwarancje
 
@@ -62,7 +62,7 @@ Domyślne profile obejmują: `fast` — formatowanie i `cargo check`; `focused` 
 
 **Odbiór etapu:** szybki profil nie może nadać wynikowi statusu uprawniającego do `apply`. Gate odrzuca zawężanie pakietu lub filtra testów. W `run` pełny gate nadal poprzedza recenzje każdego kandydata.
 
-**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd implementacji oraz końcowy przegląd całej gałęzi zatwierdziły zmiany bez krytycznych, ważnych ani drobnych usterek do poprawienia. Kontrole uruchomiono na Linux; testy Windows pominięto, a dostawców modeli zastąpiły atrapy. Transformacje własnych komend Cargo celowo obsługują zachowawczy podzbiór argumentów. Obsługa częściowych wyników po przerwaniu procesu pozostała bez zmian. Etapy 3 i 4 opisano poniżej; etap 5 pozostaje do realizacji.
+**Weryfikacja etapu:** pełny zestaw obejmuje 238 testów: 236 zaliczonych i 2 pominięte testy natywnych junctions Windows na Linux. Pięć testów w `tests/test_rust_checks.py` wykonuje rzeczywiste kontrole Cargo offline, w tym dwa przypadki dodane w etapie 2. Ruff, lokalny reviewdog i kontrola formatowania zakończyły się pomyślnie. Niezależny przegląd implementacji oraz końcowy przegląd całej gałęzi zatwierdziły zmiany bez krytycznych, ważnych ani drobnych usterek do poprawienia. Kontrole uruchomiono na Linux; testy Windows pominięto, a dostawców modeli zastąpiły atrapy. Transformacje własnych komend Cargo celowo obsługują zachowawczy podzbiór argumentów. Obsługa częściowych wyników po przerwaniu procesu pozostała bez zmian. Etapy 3–5 opisano poniżej.
 
 ## 3. Klasyfikacja diagnostyki względem baseline
 
@@ -88,7 +88,7 @@ Wyjście testów obsługujemy ostrożnie: Cargo JSON nie zapewnia jednolitego fo
 
 **Odbiór etapu:** błąd kompilacji uniemożliwiający wykonanie testów nie oznacza naprawienia wcześniejszych błędów testowych. Timeout, ucięte wyjście i zmieniony zakres również nie dają `resolved`. Czerwony baseline nadal nie zwalnia z zielonego gate.
 
-**Weryfikacja etapu 3:** końcowy pełny przebieg obejmuje 305 testów: 303 zaliczone, 2 natywne testy Windows pominięte na Linux (46,258 s). Moduł diagnostyki ma 43 testy, wykonawca weryfikacji 38, silnik 55, a zestaw Cargo 7 rzeczywistych testów offline. Regresje obejmują błąd testu bazowego → błąd kompilacji kandydata → jawne przejście tego samego testu, diagnostykę JSON w różnych katalogach i po przesunięciu linii, niepełne komunikaty, skrajnie długie liczby, zmiany narzędzi i konfiguracji oraz nieprzechwycone zależności. Ruff, formatowanie 34 plików, lokalny reviewdog z surowym Ruff i kontrola diffu zakończyły się pomyślnie. Przeglądy modułu, integracji i całej gałęzi wykryły przypadki brzegowe; po poprawkach ponowny przegląd potwierdził zamknięcie wszystkich ustaleń bez nowych istotnych regresji. Dostawców modeli w testach zastąpiły atrapy; nie uruchamiano płatnych sesji dostawców workflow. Zmiana bazuje na ukończonym etapie 2, commit `30612b4`. Etap 4 opisano poniżej; etap 5 pozostaje do realizacji.
+**Weryfikacja etapu 3:** końcowy pełny przebieg obejmuje 305 testów: 303 zaliczone, 2 natywne testy Windows pominięte na Linux (46,258 s). Moduł diagnostyki ma 43 testy, wykonawca weryfikacji 38, silnik 55, a zestaw Cargo 7 rzeczywistych testów offline. Regresje obejmują błąd testu bazowego → błąd kompilacji kandydata → jawne przejście tego samego testu, diagnostykę JSON w różnych katalogach i po przesunięciu linii, niepełne komunikaty, skrajnie długie liczby, zmiany narzędzi i konfiguracji oraz nieprzechwycone zależności. Ruff, formatowanie 34 plików, lokalny reviewdog z surowym Ruff i kontrola diffu zakończyły się pomyślnie. Przeglądy modułu, integracji i całej gałęzi wykryły przypadki brzegowe; po poprawkach ponowny przegląd potwierdził zamknięcie wszystkich ustaleń bez nowych istotnych regresji. Dostawców modeli w testach zastąpiły atrapy; nie uruchamiano płatnych sesji dostawców workflow. Zmiana bazuje na ukończonym etapie 2, commit `30612b4`. Etapy 4 i 5 opisano poniżej.
 
 ## 4. Jawne kryteria odbioru powiązane z dowodami
 
@@ -141,7 +141,7 @@ uruchamia triage, także bez ustaleń kodowych. Brak oceny/ID/powiązania odrzuc
 nowy kandydat przechodzi cały gate i oba niezależne review od początku.
 
 Podstawowy stan i raport ujawniają tryb oraz hashe; szczegóły rund są w `acceptance.rounds`.
-Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` pozostają etapem 5.
+Rozszerzony końcowy raport oraz sprawdzenie powiązania przez `apply` dodaje etap 5 opisany poniżej.
 Przykład: [`task-requirements.toml`](../examples/task-requirements.toml); demo offline używa
 rzeczywistych kontroli Cargo i jawnie oznaczonych atrap ocen semantycznych.
 
@@ -167,6 +167,9 @@ diffu są poprawne. Etap 5 pozostaje poza zakresem.
 
 ## 5. Raportowanie, integracja z apply i odbiór całości
 
+**Status: implementacja, lokalna weryfikacja i niezależne przeglądy zakończone 2026-10-25.
+Wyniki oraz granice sprawdzenia platform są zapisane w [raporcie walidacji](validation.md).**
+
 Raport końcowy pokazuje osobno zakres gate, wykonane warianty, zmiany diagnostyki, dowody dla kryteriów oraz decyzje recenzentów i triage.
 
 `apply` zachowuje obecną kontrolę całego oryginału, kandydata, backup i obsługę błędów. Dla nowych przebiegów dodatkowo sprawdza powiązanie końcowego raportu odbioru z kandydatem. Nie uruchamia ponownie modeli. Stare przebiegi pozostają obsługiwane według dotychczasowego kontraktu; niekompletny nowy przebieg nie może automatycznie przejść do trybu zgodności.
@@ -180,6 +183,31 @@ Końcowa weryfikacja obejmuje:
 - Ruff, lokalny reviewdog oraz testy platform, dla których deklarujemy wsparcie.
 
 Sesje modeli pozostają zastąpione atrapami w testach automatycznych.
+
+**Zrealizowane:** `report.md` oddziela finalne dowody od historycznych i częściowych; końcowy
+`acceptance.json` wersji 1 wiąże kandydata, wymagania, pełny plan, kontrole i kryteria z recenzjami
+oraz triage. Nowy stan wersji 2 ma `report_contract = 1` i metadane `acceptance_report`.
+`apply` lokalnie odtwarza i porównuje kontrakt przed backupem; dotyczy to także nowych przebiegów
+legacy. Historyczny stan bez wersji lub v1, bez oznak nowego kontraktu, zachowuje dawne zasady.
+Usunięcie pojedynczego znacznika z nowego przebiegu nie obchodzi walidacji przy zachowanym
+nowym pochodzeniu dowodów. Lokalne skróty nie chronią przed wspólnym przepisaniem całego audytu.
+
+Nowa regresja przechodzi rzeczywisty workspace offline od implementacji przez pełny gate
+z doctestami i wariantami default/feature do raportu oraz jawnego apply. Sprawdza przeniesienie
+zmienionego źródła i przygotowanego `Cargo.lock`, odmowę przy brakującym raporcie przed backupem
+i brak nowych wywołań dostawców przy apply. Zachowano odrzucenie zerowego filtra mimo kodu zero,
+dodając brak końcowego raportu i odmowę apply. Istniejące testy pokrywają awarie, przerwania,
+limity, zmianę źródeł, niezależność recenzji oraz migracje konfiguracji i odpowiedzi.
+CI instaluje rustfmt/Clippy oraz obowiązkowo sprawdza narzędzia przed unittest na skonfigurowanej
+macierzy Ubuntu/Windows × Python 3.11/3.13. Nie jest to dowód uruchomienia zdalnego CI ani
+natywnego Windows/macOS w lokalnej sesji Linux.
+
+**Weryfikacja końcowa:** Python 3.11.17, 3.13.17 i 3.14.8 na Linux: po 407 testów,
+405 zaliczonych i 2 pominięte natywne testy Windows; w tym 9 rzeczywistych testów Cargo offline.
+Ruff, formatowanie oraz lokalny reviewdog przeszły. Niezależne przeglądy obu zadań i całej gałęzi
+zakończono; poprawiono wykrywanie zachowanych śladów nowego kontraktu przy próbie downgrade
+oraz widoczność decyzji zablokowanego triage. Regresje i ponowne przeglądy potwierdziły poprawki.
+Sesje dostawców workflow zastępowały atrapy.
 
 ## Kolejność realizacji
 

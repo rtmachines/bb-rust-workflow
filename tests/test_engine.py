@@ -139,6 +139,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual((self.repo / "src/lib.rs").read_text(), self.original)
         return flow, state
 
+    def test_new_legacy_run_requires_final_artifact_and_rejects_metadata_downgrades(self):
+        flow, state = self.run_workflow()
+        path = flow.run_dir / "acceptance.json"
+        self.assertTrue(path.is_file(), "New legacy runs require the final report contract")
+        report = json.loads(path.read_text())
+        self.assertEqual(report["mode"], "legacy")
+        self.assertIsNone(report["binding"]["requirements_id"])
+        self.assertIsNone(report["criteria"])
+        for version in (None, 1, 3, True, "2"):
+            downgraded = {**state, "version": version}
+            with self.subTest(version=version):
+                (flow.run_dir / "state.json").write_text(json.dumps(downgraded))
+                with self.assertRaises(WorkspaceError):
+                    apply_run(flow.run_dir)
+        (flow.run_dir / "state.json").write_text(json.dumps(state))
+        path.unlink()
+        with self.assertRaises(WorkspaceError):
+            apply_run(flow.run_dir)
+        self.assertFalse((flow.run_dir / "apply-backup").exists())
+
     def test_old_config_without_requirements_retains_v1_schema_and_explicit_legacy_mode(self):
         for version in (1, 2):
             with self.subTest(version=version):

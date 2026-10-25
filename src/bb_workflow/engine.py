@@ -11,11 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .acceptance import REPORT_CONTRACT, build_acceptance, canonical_digest, validate_acceptance
 from .backends import BackendError, invoke
 from .config import Config, Selection, route
 from .diagnostics import summarize_diagnostics
 from .process import run_process
 from .protocol import merge_findings, resolve_triage, response_schema, validate_response
+from .reporting import render_report
 from .requirements import (
     Requirements,
     bind_requirements,
@@ -74,7 +76,8 @@ class Workflow:
         self.run_dir = self.repo / ".bb-workflow" / "runs" / uuid.uuid4().hex
         self.work = self.run_dir / "workspace"
         self.state = {
-            "version": 1,
+            "version": 2,
+            "report_contract": REPORT_CONTRACT,
             "status": "running",
             "phase": "preparing",
             "repo": str(self.repo),
@@ -146,8 +149,19 @@ class Workflow:
                     if record["status"] in {"running", "returned"}:
                         record.update(status=self.state["status"], error=self.state["reason"])
                 self.state["finished_at"] = datetime.now(timezone.utc).isoformat()
+                # Keep durable state non-successful until both report artifacts exist.
+                try:
+                    self._report()
+                except KeyboardInterrupt:
+                    self.state.update(
+                        status="interrupted", reason="Interrupted while writing report"
+                    )
+                except Exception as exc:
+                    self.state.update(
+                        status="failed",
+                        reason=f"Report persistence failed: {type(exc).__name__}: {exc}",
+                    )
                 self._save("finished")
-                self._report()
         return self.run_dir
 
     def _execute(self) -> None:
@@ -262,7 +276,12 @@ class Workflow:
             if manifest(self.work, self.config.exclude) != candidate:
                 raise WorkflowStop("failed", "Candidate changed during review")
             findings = merge_findings(reviews)
-            record = {"snapshot_id": candidate_id, "reviews": reviews, "findings": findings}
+            record = {
+                "cycle": self.state["cycles"],
+                "snapshot_id": candidate_id,
+                "reviews": reviews,
+                "findings": findings,
+            }
             self.state["reviews"].append(record)
             confirmed, unresolved = [], []
             semantic, disputed = self._semantic(reviews, candidate_id)
@@ -315,6 +334,16 @@ class Workflow:
                 raise WorkflowStop("failed", "Candidate changed after verification")
             self._timeout()
             write_json(self.run_dir / "candidate_manifest.json", candidate)
+            self.state.update(candidate_id=candidate_id)
+            approval = build_acceptance(self.run_dir, self.state)
+            write_json(self.run_dir / "acceptance.json", approval)
+            self.state["acceptance_report"] = {
+                "version": REPORT_CONTRACT,
+                "file": "acceptance.json",
+                "digest": canonical_digest(approval),
+                "binding": approval["binding"],
+            }
+            validate_acceptance(self.run_dir, self.state)
             self.state.update(
                 status="succeeded",
                 reason=(
@@ -486,6 +515,7 @@ class Workflow:
             (artifact / "prompt.txt").write_text(prompt, encoding="utf-8")
             record = {
                 "role": role,
+                "cycle": self.state["cycles"],
                 "requested_model": selection.model,
                 "selection": asdict(selection),
                 "attempt": attempt + 1,
@@ -550,7 +580,10 @@ class Workflow:
             )
             if binding is not None:
                 record["criterion_evidence"] = deepcopy(response["criterion_evidence"])
-            record.update(status="completed", summary=response["summary"])
+            write_json(artifact / "validated_response.json", response)
+            record.update(
+                status="completed", summary=response["summary"], response=deepcopy(response)
+            )
             self._save()
             if response["status"] == "blocked":
                 raise WorkflowStop("blocked", f"{role}: {response['summary']}")
@@ -686,75 +719,11 @@ class Workflow:
         return "".join(sections)
 
     def _report(self) -> None:
-        cost = f"{self.state['known_cost_usd']:.4f} USD reported"
-        if self.state["unknown_cost_calls"]:
-            cost += f"; {self.state['unknown_cost_calls']} call(s) without cost data; total unknown"
-        lines = [
-            "# Workflow report",
-            "",
-            f"Status: **{self.state['status']}**",
-            "",
-            self.state["reason"],
-            "",
-            f"Complexity: {self.level}",
-            f"Acceptance mode: {self.state['acceptance']['mode']}",
-            f"Legacy compatibility: {self.state['acceptance']['compatibility_mode']}",
-            f"Requirements: {self.state['acceptance']['requirements_id']}",
-            f"Verification plan: {self.state['acceptance']['verification_plan_id']}",
-            f"Fixer invocations: {self.state['cycles']}/{self.config.max_cycles}",
-            f"Agent calls: {self.state['agent_calls']}/{self.config.max_agent_calls}",
-            f"Cost: {cost}",
-            "",
-            "Original project files were not automatically updated.",
-            "",
-        ]
-        lines.extend(["## Tokens and prompt size", ""])
-        lines.append(
-            "Prompt characters/UTF-8 bytes measure submitted text only, not provider tokens "
-            "or the CLI's instructions, tools and later reads."
+        self.run_dir.joinpath("report.md").write_text(
+            render_report(
+                self.state,
+                asdict(self.gate_plan),
+                asdict(self.bound.requirements) if self.bound else None,
+            ),
+            encoding="utf-8",
         )
-        for backend, usage in self.state["token_usage"]["by_backend"].items():
-            counts = usage["known_totals"]
-            measured = ", ".join(
-                f"{name}={value if value is not None else 'unknown'}"
-                for name, value in counts.items()
-            )
-            lines.append(
-                f"- {backend}: measured subtotals {measured}; "
-                f"{usage['complete_calls']}/{usage['calls']} calls with known total, "
-                f"{usage['partial_calls']} partial, {usage['unknown_calls']} unknown. "
-                "Cache counters are part of input, not additional tokens."
-            )
-        lines.extend(["", "## Checks", ""])
-        for item in self.state["checks"]:
-            lines.append(
-                f"- {item['phase']}: {'PASS' if item['passed'] else 'FAIL'} — "
-                + " ".join(item["command"])
-            )
-        if self.state["reviews"]:
-            latest = self.state["reviews"][-1]
-            remaining = [*latest.get("confirmed", []), *latest.get("unresolved", [])]
-            lines.extend(["", "## Latest review findings", ""])
-            if not remaining:
-                lines.append("No confirmed or unresolved findings in the last completed review.")
-            for item in remaining:
-                lines.append(
-                    f"- {item['severity']}: {item['path']}:{item['line']} — {item['title']}"
-                )
-        lines.extend(["", "## Agent summaries", ""])
-        for item in self.state["agents"]:
-            lines.append(
-                f"- {item['role']} ({item['selection']['model']}): "
-                + item.get("summary", item.get("error", item["status"]))
-                + f" — prompt {item['prompt_chars']} chars / {item['prompt_bytes']} bytes"
-            )
-        lines.extend(
-            [
-                "",
-                "Full evidence, routing, findings, triage and raw log paths: state.json.",
-                "",
-                "A succeeded result means configured checks and reviews passed. "
-                "It is not a proof that all requirements or defects were covered.",
-            ]
-        )
-        self.run_dir.joinpath("report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

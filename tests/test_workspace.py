@@ -70,6 +70,98 @@ class WorkspaceTests(unittest.TestCase):
             },
         )
 
+    def test_unknown_or_contradictory_report_contract_rejects_before_backup(self):
+        self.make_run()
+        path = self.run / "state.json"
+        original = json.loads(path.read_text())
+        for changes in (
+            {"version": 7},
+            {"version": True},
+            {"version": "1"},
+            {"version": None},
+            {"version": 2},
+            {"report_contract": 1},
+            {"version": 1, "acceptance_report": None},
+        ):
+            with self.subTest(changes=changes):
+                write_json(path, {**original, **changes})
+                with self.assertRaises(WorkspaceError):
+                    apply_run(self.run)
+                self.assertFalse((self.run / "apply-backup").exists())
+                self.assertEqual((self.repo / "old.txt").read_text(), "remove me")
+        write_json(path, original)
+        write_json(self.run / "acceptance.json", {})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+
+    def test_surviving_agent_cycle_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "agents": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_agent_response_without_response_files_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1, "agents": [{"response": {}}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_review_cycle_rejects_historical_fallback(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "reviews": [{"cycle": 0}]})
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_surviving_response_file_without_agent_state_rejects_historical_fallback(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "validated_response.json").write_text("{}")
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_historical_agent_artifacts_keep_original_apply_contract(self):
+        self.make_run()
+        artifact = self.run / "agents" / "001-implementation"
+        artifact.mkdir(parents=True)
+        (artifact / "response.json").write_text("{}")
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(
+            path,
+            {
+                **state,
+                "agents": [{"role": "implementation", "artifacts": "agents/001-implementation"}],
+            },
+        )
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
+
+    def test_historical_fallback_does_not_follow_agent_directory_symlinks(self):
+        self.make_run()
+        external = Path(self.temporary.name) / "outside-audit"
+        external.mkdir()
+        self.create_symlink(self.run / "agents", external, target_is_directory=True)
+        with self.assertRaises(WorkspaceError):
+            apply_run(self.run)
+        self.assertFalse((self.run / "apply-backup").exists())
+
+    def test_explicit_historical_version1_still_applies_without_new_indicators(self):
+        self.make_run()
+        path = self.run / "state.json"
+        state = json.loads(path.read_text())
+        write_json(path, {**state, "version": 1})
+        self.assertEqual(apply_run(self.run), ["new/file.txt", "old.txt"])
+
     def test_copy_manifest_preserves_initial_dirty_contents_and_permissions(self):
         (self.repo / "dirty.txt").chmod(0o755)
         destination = Path(self.temporary.name) / "snapshot"
