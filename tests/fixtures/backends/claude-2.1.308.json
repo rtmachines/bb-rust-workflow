@@ -1,0 +1,64 @@
+{
+  "provider": "claude",
+  "cli_version": "2.1.308",
+  "fixture_kind": "normalized contract examples, not live model output",
+  "requested_model": "claude-sonnet-5-5",
+  "cases": [
+    {
+      "name": "success",
+      "response": {
+        "type": "result",
+        "subtype": "success",
+        "is_error": false,
+        "structured_output": {
+          "findings": []
+        },
+        "total_cost_usd": 0.03,
+        "usage": {
+          "input_tokens": 20
+        },
+        "modelUsage": {
+          "claude-sonnet-5-5": {
+            "inputTokens": 20
+          }
+        }
+      }
+    },
+    {
+      "name": "fatal",
+      "response": {
+        "type": "result",
+        "subtype": "error_max_turns",
+        "is_error": true
+      },
+      "error": "reported an error"
+    },
+    {
+      "name": "drift",
+      "response": {
+        "type": "result",
+        "subtype": "success",
+        "structured_output": {},
+        "modelUsage": {
+          "claude-haiku-5-5": {}
+        }
+      },
+      "error": "model drift",
+      "observed_model": "claude-haiku-5-5"
+    },
+    {
+      "name": "malformed",
+      "stdout": "not-json",
+      "error": "Invalid JSON"
+    },
+    {
+      "name": "missing_structured_output",
+      "response": {
+        "type": "result",
+        "subtype": "success",
+        "result": "{}"
+      },
+      "error": "structured_output"
+    }
+  ]
+}

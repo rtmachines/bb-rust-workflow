@@ -1,0 +1,99 @@
+# Claude model IDs checked against official Claude Code documentation on 2026-10-25.
+# Auto complexity is a recommendation heuristic, not a guarantee; choose explicitly when needed.
+config_version = 2
+blocking_severities = ["critical", "high", "medium"]
+prepare = [["cargo", "check", "--workspace", "--all-targets"]] # Resolve Cargo.lock and generated files before freezing sources.
+checks = [["cargo", "fmt", "--all", "--", "--check"], ["cargo", "check", "--workspace", "--all-targets", "--locked"], ["cargo", "test", "--workspace", "--all-targets", "--locked"], ["cargo", "test", "--workspace", "--doc", "--locked"], ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"]]
+exclude = [] # Root cache defaults; !/build re-includes /build. Metadata stays excluded.
+
+[context]
+max_diff_chars = 16000 # Inline excerpt; inspect changed_paths and baseline for omitted content.
+failed_check_tail_chars = 2000 # Per stream; full logs remain available at the supplied paths.
+skill_mode = "reference" # Read selected skills from disk; "inline" embeds their full text.
+
+[limits]
+max_cycles = 3
+max_agent_calls = 20
+timeout_seconds = 900
+max_seconds = 3600
+max_retries = 0 # Read-only provider retries only.
+max_output_bytes = 16777216 # Combined stdout/stderr bytes per process (16 MiB).
+
+[executables]
+claude = "claude"
+codex = "codex"
+
+[profiles.low.implementation]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.reviewer_a]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.reviewer_b]
+backend = "codex"
+model = "gpt-6-luna"
+effort = "low"
+
+[profiles.low.triage]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.fixer]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.medium.implementation]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.reviewer_a]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.reviewer_b]
+backend = "codex"
+model = "gpt-6.1-sol"
+effort = "medium"
+
+[profiles.medium.triage]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.fixer]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.high.implementation]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.reviewer_a]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.reviewer_b]
+backend = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+
+[profiles.high.triage]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.fixer]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"

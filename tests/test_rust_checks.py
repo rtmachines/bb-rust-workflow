@@ -1,0 +1,199 @@
+"""Acceptance tests for the default gate against real, dependency-free Cargo workspaces."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+from bb_workflow.backends import BackendResult
+from bb_workflow.config import load_config
+from bb_workflow.engine import Workflow
+from bb_workflow.process import run_process
+from bb_workflow.workspace import manifest, snapshot_id
+
+
+class RustChecksTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        required = ("git", "cargo", "rustc", "rustdoc", "rustfmt", "cargo-clippy")
+        missing = [name for name in required if shutil.which(name) is None]
+        if missing:
+            raise unittest.SkipTest("Rust gate tools unavailable: " + ", ".join(missing))
+        for command in (["cargo", "fmt", "--version"], ["cargo", "clippy", "--version"]):
+            result = run_process(command, cwd=Path.cwd(), timeout=20)
+            if result.returncode:
+                output = result.stdout + result.stderr
+                if any(
+                    marker in output.lower()
+                    for marker in ("not installed", "no such command", "no default is configured")
+                ):
+                    raise unittest.SkipTest(f"Rust gate tool unavailable: {output.strip()}")
+                raise RuntimeError(f"Rust gate tool probe failed: {output.strip()}")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / "workspace"
+        self.repo.mkdir()
+        (self.repo / "Cargo.toml").write_text(
+            '[workspace]\nmembers = ["selected", "extra"]\n'
+            'default-members = ["selected"]\nresolver = "2"\n',
+            encoding="utf-8",
+        )
+        for name in ("selected", "extra"):
+            directory = self.repo / name
+            (directory / "src").mkdir(parents=True)
+            (directory / "Cargo.toml").write_text(
+                f'[package]\nname = "{name}"\nversion = "0.1.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            (directory / "src/lib.rs").write_text(
+                f"/// ```\n/// assert_eq!({name}::value(), 1);\n/// ```\n"
+                "pub fn value() -> u32 {\n    1\n}\n",
+                encoding="utf-8",
+            )
+        # These fixtures need no registry access, even on a machine with an empty Cargo cache.
+        environment = patch.dict(
+            os.environ, {"CARGO_NET_OFFLINE": "true", "CARGO_TERM_COLOR": "never"}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.config = replace(load_config(), max_cycles=0, timeout_seconds=60, max_seconds=240)
+        self.original = manifest(self.repo, self.config.exclude)
+        self.calls = []
+        self.implement = lambda directory: None
+
+    def invoke(self, **kwargs):
+        self.calls.append(
+            {"role": kwargs["role"], "cwd": kwargs["cwd"], "snapshot": manifest(kwargs["cwd"])}
+        )
+        if kwargs["role"] == "implementation":
+            self.implement(kwargs["cwd"])
+        return BackendResult(
+            {"status": "completed", "summary": "Fixture complete", "findings": [], "decisions": []},
+            0.0,
+            {},
+            kwargs["selection"].model,
+        )
+
+    def run_workflow(self):
+        flow = Workflow(
+            self.repo,
+            "Validate the tiny Cargo workspace",
+            self.config,
+            invoke_fn=self.invoke,
+            process_fn=run_process,
+            progress=lambda message: None,
+        )
+        directory = flow.run()
+        state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        self.assertEqual(state, json.loads(json.dumps(flow.state)))
+        self.assertEqual(manifest(self.repo, self.config.exclude), self.original)
+        self.assertFalse((self.repo / "Cargo.lock").exists())
+        self.assertFalse((self.repo / ".bb-workflow/lock").exists())
+        return flow, state
+
+    def test_error_outside_default_members_blocks_success(self):
+        # Isolate validation coverage; the healthy control exercises the default prepare.
+        self.config = replace(self.config, prepare=[["cargo", "generate-lockfile"]])
+
+        def break_extra(directory):
+            (directory / "extra/src/lib.rs").write_text(
+                'pub fn value() -> u32 {\n    "wrong type"\n}\n', encoding="utf-8"
+            )
+
+        self.implement = break_extra
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "limit_exhausted", state["reason"])
+        self.assertTrue(all(check["passed"] for check in state["baseline_checks"]))
+        preparation = [check for check in state["checks"] if check["kind"] == "preparation"]
+        self.assertTrue(preparation)
+        self.assertTrue(all(check["passed"] for check in preparation))
+        failed = [check for check in state["checks"] if not check["passed"]]
+        self.assertTrue(failed)
+        self.assertTrue(all(check["phase"] == "candidate-0" for check in failed))
+        self.assertTrue(all("--workspace" in check["command"] for check in failed))
+        self.assertTrue(
+            any(
+                check["command"] == ["cargo", "check", "--workspace", "--all-targets", "--locked"]
+                for check in failed
+            )
+        )
+        self.assertIn("extra/src/lib.rs", failed[0]["stderr_tail"].replace("\\", "/"))
+        self.assertEqual([call["role"] for call in self.calls], ["implementation"])
+        self.assertFalse((flow.run_dir / "candidate_manifest.json").exists())
+        # Prove that Cargo's narrower default-member selection misses this exact defect.
+        narrow = run_process(
+            ["cargo", "check", "--all-targets", "--locked"], cwd=flow.work, timeout=60
+        )
+        self.assertEqual(narrow.returncode, 0, narrow.stderr)
+
+    def test_failing_doctest_blocks_success_when_all_targets_pass(self):
+        def break_doctest(directory):
+            library = directory / "selected/src/lib.rs"
+            library.write_text(
+                library.read_text(encoding="utf-8").replace("::value(), 1)", "::value(), 2)"),
+                encoding="utf-8",
+            )
+
+        self.implement = break_doctest
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "limit_exhausted", state["reason"])
+        self.assertTrue(all(check["passed"] for check in state["baseline_checks"]))
+        candidate = [check for check in state["checks"] if check["phase"] == "candidate-0"]
+        all_targets = [
+            check
+            for check in candidate
+            if check["command"][1] == "test" and "--all-targets" in check["command"]
+        ]
+        self.assertEqual(len(all_targets), 1)
+        self.assertTrue(all_targets[0]["passed"], all_targets[0]["stderr_tail"])
+        failed = [check for check in candidate if not check["passed"]]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(
+            failed[0]["command"], ["cargo", "test", "--workspace", "--doc", "--locked"]
+        )
+        self.assertNotEqual(failed[0]["returncode"], 0)
+        self.assertIn("assertion", failed[0]["stdout_tail"])
+        self.assertTrue(all(check["source_unchanged"] for check in candidate))
+        self.assertEqual([call["role"] for call in self.calls], ["implementation"])
+        self.assertFalse((flow.run_dir / "candidate_manifest.json").exists())
+
+    def test_valid_workspace_prepares_lockfile_then_passes_full_frozen_gate(self):
+        flow, state = self.run_workflow()
+        self.assertEqual(state["status"], "succeeded", state["reason"])
+        self.assertEqual(
+            [call["role"] for call in self.calls], ["implementation", "reviewer_a", "reviewer_b"]
+        )
+        self.assertTrue((flow.work / "Cargo.lock").is_file())
+        preparation = state["baseline_preparation"]
+        self.assertTrue(preparation)
+        self.assertTrue(all(check["passed"] for check in preparation))
+        self.assertFalse(preparation[0]["source_unchanged"])
+        self.assertEqual(
+            [check["phase"] for check in state["checks"]],
+            ["baseline-prepare"] * len(self.config.prepare)
+            + ["baseline"] * len(self.config.checks)
+            + ["candidate-0-prepare"] * len(self.config.prepare)
+            + ["candidate-0"] * len(self.config.checks),
+        )
+        candidate = [check for check in state["checks"] if check["phase"] == "candidate-0"]
+        self.assertEqual([check["command"] for check in candidate], self.config.checks)
+        for check in candidate:
+            self.assertTrue(check["passed"], check["stderr_tail"])
+            self.assertTrue(check["source_unchanged"])
+            self.assertEqual(check["snapshot_id"], state["candidate_id"])
+            self.assertEqual(check["result_snapshot_id"], state["candidate_id"])
+        self.assertEqual(state["candidate_id"], snapshot_id(manifest(flow.work)))
+        self.assertEqual(self.calls[1]["snapshot"], self.calls[2]["snapshot"])
+        self.assertEqual(self.calls[1]["snapshot"], manifest(flow.work))
+
+
+if __name__ == "__main__":
+    unittest.main()

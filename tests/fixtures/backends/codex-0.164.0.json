@@ -1,0 +1,171 @@
+{
+  "provider": "codex",
+  "cli_version": "0.164.0",
+  "fixture_kind": "normalized contract examples, not live model output",
+  "source": "https://github.com/openai/codex/blob/rust-v0.164.0/codex-rs/exec/src/event_processor_with_jsonl_output.rs",
+  "requested_model": "gpt-6.1-sol",
+  "cases": [
+    {
+      "name": "success",
+      "events": [
+        {
+          "type": "thread.started",
+          "thread_id": "fixture-thread"
+        },
+        {
+          "type": "turn.started"
+        },
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_0",
+            "type": "agent_message",
+            "text": "{\"findings\":[]}"
+          }
+        },
+        {
+          "type": "turn.completed",
+          "usage": {
+            "input_tokens": 10,
+            "cached_input_tokens": 0,
+            "output_tokens": 4
+          }
+        }
+      ],
+      "payload": {
+        "findings": []
+      }
+    },
+    {
+      "name": "warning",
+      "events": [
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_0",
+            "type": "error",
+            "message": "Deprecated feature configured; use the replacement setting"
+          }
+        },
+        {
+          "type": "turn.completed",
+          "usage": {}
+        }
+      ],
+      "payload": {}
+    },
+    {
+      "name": "reroute",
+      "events": [
+        {
+          "type": "turn.started"
+        },
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_0",
+            "type": "error",
+            "message": "model rerouted: gpt-6.1-sol -> gpt-6-luna (HighRisk)"
+          }
+        },
+        {
+          "type": "turn.completed",
+          "usage": {}
+        }
+      ],
+      "payload": {},
+      "error": "model drift",
+      "observed_model": "gpt-6-luna"
+    },
+    {
+      "name": "reroute_after_success",
+      "events": [
+        {
+          "type": "turn.completed",
+          "usage": {}
+        },
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_1",
+            "type": "error",
+            "message": "model rerouted: gpt-6.1-sol -> gpt-6-luna (HighRisk)"
+          }
+        }
+      ],
+      "payload": {},
+      "error": "model drift",
+      "observed_model": "gpt-6-luna"
+    },
+    {
+      "name": "unrecognized_reroute",
+      "events": [
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_0",
+            "type": "error",
+            "message": "model rerouted: details unavailable"
+          }
+        },
+        {
+          "type": "turn.completed"
+        }
+      ],
+      "payload": {},
+      "error": "model drift"
+    },
+    {
+      "name": "fatal",
+      "events": [
+        {
+          "type": "error",
+          "message": "Quota exceeded"
+        },
+        {
+          "type": "turn.failed",
+          "error": {
+            "message": "Quota exceeded"
+          }
+        }
+      ],
+      "error": "reported an error"
+    },
+    {
+      "name": "interrupted",
+      "events": [
+        {
+          "type": "turn.started"
+        }
+      ],
+      "error": "did not emit turn.completed"
+    },
+    {
+      "name": "malformed",
+      "stdout": "{\"type\":\"turn.completed\"}\nnot-json",
+      "payload": {},
+      "error": "Invalid JSON"
+    },
+    {
+      "name": "malformed_final",
+      "events": [
+        {
+          "type": "turn.completed",
+          "usage": {}
+        }
+      ],
+      "final_text": "[]",
+      "error": "JSON object"
+    },
+    {
+      "name": "missing_final",
+      "events": [
+        {
+          "type": "turn.completed",
+          "usage": {}
+        }
+      ],
+      "error": "readable final structured response"
+    }
+  ]
+}

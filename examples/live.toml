@@ -1,0 +1,94 @@
+# Bounded live smoke configuration; invokes real providers.
+# Claude model IDs checked against official Claude Code documentation on 2026-10-25.
+# Auto complexity is a recommendation heuristic, not a guarantee; choose explicitly when needed.
+blocking_severities = ["critical", "high", "medium"]
+prepare = [["cargo", "check", "--all-targets"]]
+checks = [["cargo", "fmt", "--check"], ["cargo", "check", "--all-targets", "--locked"], ["cargo", "test", "--all-targets", "--locked"], ["cargo", "clippy", "--all-targets", "--locked", "--", "-D", "warnings"]]
+exclude = [] # Root cache defaults; !/build re-includes /build. Metadata stays excluded.
+
+[limits]
+max_cycles = 1
+max_agent_calls = 5
+timeout_seconds = 120
+max_seconds = 480
+max_retries = 0 # Read-only provider retries only.
+max_output_bytes = 16777216
+
+[executables]
+claude = "claude"
+codex = "codex"
+
+[profiles.low.implementation]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.reviewer_a]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.reviewer_b]
+backend = "codex"
+model = "gpt-6-luna"
+effort = "low"
+
+[profiles.low.triage]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.low.fixer]
+backend = "claude"
+model = "claude-haiku-5-5"
+effort = "low"
+
+[profiles.medium.implementation]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.reviewer_a]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.reviewer_b]
+backend = "codex"
+model = "gpt-6.1-sol"
+effort = "medium"
+
+[profiles.medium.triage]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.medium.fixer]
+backend = "claude"
+model = "claude-sonnet-5-5"
+effort = "medium"
+
+[profiles.high.implementation]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.reviewer_a]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.reviewer_b]
+backend = "codex"
+model = "gpt-6.1-sol"
+effort = "high"
+
+[profiles.high.triage]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
+
+[profiles.high.fixer]
+backend = "claude"
+model = "claude-opus-5-5"
+effort = "high"
