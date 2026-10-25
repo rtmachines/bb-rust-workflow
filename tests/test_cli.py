@@ -223,8 +223,11 @@ class CliTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "posix", "POSIX termination")
     def test_sigterm_long_run_preserves_logs_terminates_child_and_releases_lock(self):
-        for events in (False, True):
-            with self.subTest(events=events), tempfile.TemporaryDirectory() as temporary:
+        for events, machine in ((False, False), (True, False), (True, True)):
+            with (
+                self.subTest(events=events, machine=machine),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 root = Path(temporary)
                 repo = root / "repo"
                 repo.mkdir()
@@ -249,6 +252,8 @@ class CliTests(unittest.TestCase):
                 argv = [sys.executable, "-m", "bb_workflow.cli", "run", "task", "--repo", str(repo)]
                 if events:
                     argv.append("--events-jsonl")
+                if machine:
+                    argv.append("--json")
                 with subprocess.Popen(
                     argv,
                     stdout=subprocess.PIPE,
@@ -287,7 +292,13 @@ class CliTests(unittest.TestCase):
                             child.kill()
                             child.communicate()
                 self.assertEqual(child.returncode, 130, stderr)
-                self.assertEqual(json.loads(stdout)["status"], "interrupted")
+                payload = json.loads(stdout)
+                if machine:
+                    self.assertFalse(payload["ok"])
+                    self.assertEqual(payload["error"]["code"], "interrupted")
+                    self.assertEqual(payload["exit_code"], 130)
+                    payload = payload["data"]
+                self.assertEqual(payload["status"], "interrupted")
                 state = json.loads((directory / "state.json").read_text())
                 self.assertEqual(state["status"], "interrupted")
                 self.assertTrue(state["checks"][-1]["interrupted"])
@@ -445,3 +456,300 @@ class CliTests(unittest.TestCase):
                 report, ok = _doctor(config, repo)
             self.assertTrue(ok, report)
             self.assertEqual(report["backends"]["codex"]["version"], "codex-cli 0.164.0")
+
+
+class JsonContractTests(unittest.TestCase):
+    """Command boundaries must stay parseable without changing legacy payloads."""
+
+    def invoke(self, argv):
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = main(argv)
+        return code, output.getvalue(), errors.getvalue()
+
+    def envelope(self, argv, command, code=0, error=None):
+        actual, output, stderr = self.invoke(argv)
+        self.assertEqual(actual, code, stderr)
+        payload = json.loads(output)
+        self.assertEqual(
+            set(payload), {"schema_version", "command", "ok", "exit_code", "data", "error"}
+        )
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["command"], command)
+        self.assertEqual(payload["exit_code"], code)
+        self.assertEqual(payload["ok"], code == 0)
+        if error is None:
+            self.assertIsNone(payload["error"])
+        else:
+            problem = payload["error"]
+            self.assertEqual(
+                set(problem), {"code", "message", "retryable", "next_action", "artifacts"}
+            )
+            self.assertEqual(problem["code"], error)
+            self.assertFalse(problem["retryable"])
+            self.assertTrue(problem["message"])
+            self.assertTrue(problem["next_action"])
+            self.assertTrue(all(Path(p).is_file() for p in problem["artifacts"]))
+        return payload, stderr
+
+    def test_plan_mode_placement_preserves_payload_and_requirements_needed_success(self):
+        with tempfile.TemporaryDirectory() as temp:
+            argv = ["plan", "task", "--repo", temp]
+            code, output, _ = self.invoke(argv)
+            self.assertEqual(code, 0)
+            legacy = json.loads(output)
+            for machine in (["--json", *argv], [*argv, "--json"]):
+                payload, _ = self.envelope(machine, "plan")
+                self.assertEqual(payload["data"], legacy)
+                self.assertTrue(payload["data"]["requirements_needed"])
+
+    def test_literal_json_task_does_not_enable_mode(self):
+        code, output, _ = self.invoke(["plan", "--", "--json"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("schema_version", json.loads(output))
+        payload, _ = self.envelope(["--json", "plan", "--", "--json"], "plan")
+        self.assertTrue(payload["data"]["requirements_needed"])
+
+    def test_help_and_parse_errors_are_single_envelopes_with_actual_command(self):
+        for argv, command in (
+            (["--json", "--help"], None),
+            (["plan", "--json", "--help"], "plan"),
+        ):
+            payload, stderr = self.envelope(argv, command)
+            self.assertIn("usage:", payload["data"]["help"])
+            self.assertEqual(stderr, "")
+        for argv, command in (
+            (["--json"], None),
+            (["--json", "nonsense"], None),
+            (["plan", "--json"], "plan"),
+            (["plan", "task", "--json", "--bad"], "plan"),
+            (["--json", "plan", "--config", "run"], "plan"),
+        ):
+            payload, stderr = self.envelope(argv, command, 2, "invalid_arguments")
+            self.assertIsNone(payload["data"])
+            self.assertEqual(stderr, "")
+        for argv, expected in ((["--help"], 0), (["plan"], 2)):
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main(argv)
+            self.assertEqual(raised.exception.code, expected)
+
+    def test_init_reports_path_and_existing_file_is_io_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "workflow.toml"
+            payload, _ = self.envelope(["init", "--json", "--config", str(path)], "init")
+            self.assertEqual(payload["data"], {"config": str(path.resolve())})
+            self.assertTrue(path.is_file())
+            original = path.read_bytes()
+            self.envelope(["--json", "init", "--config", str(path)], "init", 2, "io_error")
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_config_requirements_and_missing_state_have_distinct_codes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing = str(root / "missing.toml")
+            self.envelope(
+                ["plan", "task", "--json", "--config", missing], "plan", 2, "invalid_config"
+            )
+            self.envelope(
+                ["plan", "task", "--json", "--requirements", missing],
+                "plan",
+                2,
+                "invalid_requirements",
+            )
+            self.envelope(["status", temp, "--json"], "status", 2, "io_error")
+
+    def test_status_failed_read_is_success_and_preserves_legacy_payload(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            state = {"status": "failed", "reason": "provider went away", "unknown_cost_calls": 1}
+            (root / "state.json").write_text(json.dumps(state))
+            payload, _ = self.envelope(["status", temp, "--json"], "status")
+            self.assertEqual(payload["data"], state)
+            _, output, _ = self.invoke(["status", temp, "--summary"])
+            summary, _ = self.envelope(["--json", "status", temp, "--summary"], "status")
+            self.assertEqual(summary["data"], json.loads(output))
+
+    def test_malformed_state_fails_without_traceback_in_both_modes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for content in ("{", "[]", "null", '{"acceptance": []}', '{"status": []}'):
+                (Path(temp) / "state.json").write_text(content)
+                for summary in ([], ["--summary"]):
+                    self.envelope(
+                        ["status", temp, "--json", *summary], "status", 2, "invalid_state"
+                    )
+                    code, output, errors = self.invoke(["status", temp, *summary])
+                    self.assertEqual(code, 2)
+                    self.assertEqual(output, "")
+                    self.assertIn("Error:", errors)
+
+    def test_missing_run_requirements_retains_blocked_exit_and_progress_stderr(self):
+        with tempfile.TemporaryDirectory() as temp:
+            payload, stderr = self.envelope(
+                ["run", "task", "--repo", temp, "--json", "--events-jsonl"],
+                "run",
+                1,
+                "requirements_required",
+            )
+            self.assertEqual(payload["data"]["status"], "blocked")
+            directory = Path(payload["data"]["run_dir"])
+            state = json.loads((directory / "state.json").read_text())
+            self.assertEqual(state["error_code"], "requirements_required")
+            events = [json.loads(line) for line in stderr.splitlines()]
+            self.assertEqual([events[0]["event"], events[-1]["event"]], ["start", "finish"])
+            self.assertIn(str(directory / "state.json"), payload["error"]["artifacts"])
+
+    def test_project_lock_code_does_not_delete_lock(self):
+        from bb_workflow.workspace import project_lock
+
+        with tempfile.TemporaryDirectory() as temp:
+            with project_lock(Path(temp)):
+                self.envelope(["run", "task", "--repo", temp, "--json"], "run", 2, "project_locked")
+                self.assertTrue((Path(temp) / ".bb-workflow/lock").is_file())
+
+    def test_verify_envelope_preserves_payload_and_failure_exit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "workflow.toml"
+            for command, code, error in (("pass", 0, None), ("raise SystemExit(1)", 1, "failed")):
+                path.write_text(
+                    default_text()
+                    + "\n[verification.profiles.fast]\nchecks = "
+                    + json.dumps([[sys.executable, "-c", command]])
+                )
+                payload, _ = self.envelope(
+                    ["verify", "fast", "--repo", temp, "--json"], "verify", code, error
+                )
+                self.assertFalse(payload["data"]["apply_eligible"])
+                self.assertEqual(
+                    set(payload["data"]),
+                    {"status", "reason", "run_dir", "report", "apply_eligible"},
+                )
+
+    def test_doctor_payload_and_metadata_failure(self):
+        for supported, code, error in ((True, 0, None), (False, 1, "doctor_failed")):
+            with (
+                patch("bb_workflow.cli.probe", return_value={"supported": supported}),
+                patch("bb_workflow.cli.run_process", return_value=ProcessResult(0, "v1", "", 0)),
+            ):
+                _, output, _ = self.invoke(["doctor"])
+                payload, _ = self.envelope(["--json", "doctor"], "doctor", code, error)
+            self.assertEqual(payload["data"], json.loads(output))
+
+    def test_real_run_results_keep_payload_and_preserve_failure_evidence(self):
+        from bb_workflow.backends import BackendError, BackendResult
+        from bb_workflow.engine import Workflow
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            config = default_text().replace("config_version = 3", "config_version = 2")
+            start = config.index("checks = ")
+            end = config.index("\nexclude = ", start)
+            config = (
+                config[:start]
+                + "checks = "
+                + json.dumps([[sys.executable, "-c", "pass"]])
+                + config[end:]
+            )
+            start_prepare = config.index("prepare = ")
+            end_prepare = config.index("\n", start_prepare)
+            config = config[:start_prepare] + "prepare = []" + config[end_prepare:]
+            (root / "workflow.toml").write_text(config)
+            (root / "source.txt").write_text("original")
+            for failure, code, error in (
+                (None, 0, None),
+                (BackendError("different provider message", retryable=True), 1, "provider_error"),
+                (KeyboardInterrupt(), 130, "interrupted"),
+            ):
+
+                def fixture(**kwargs):
+                    if failure is not None:
+                        raise failure
+                    if kwargs["role"] == "implementation":
+                        (kwargs["cwd"] / "source.txt").write_text("candidate")
+                    return BackendResult(
+                        {
+                            "status": "completed",
+                            "summary": "fixture",
+                            "findings": [],
+                            "decisions": [],
+                        },
+                        None,
+                        {},
+                        kwargs["selection"].model,
+                    )
+
+                def make(*args, **kwargs):
+                    return Workflow(*args, invoke_fn=fixture, **kwargs)
+
+                with patch("bb_workflow.cli.Workflow", side_effect=make):
+                    payload, stderr = self.envelope(
+                        ["run", "task", "--repo", temp, "--json"], "run", code, error
+                    )
+                self.assertEqual(set(payload["data"]), {"status", "reason", "run_dir", "report"})
+                self.assertIn("Run directory:", stderr)
+                state = json.loads((Path(payload["data"]["run_dir"]) / "state.json").read_text())
+                self.assertGreater(state["unknown_cost_calls"], 0)
+                self.assertEqual(
+                    state["status"],
+                    "succeeded" if failure is None else "interrupted" if code == 130 else "failed",
+                )
+
+    def test_failed_report_is_not_linked_when_it_does_not_exist(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch(
+                "bb_workflow.engine.Workflow._report", side_effect=OSError("report write failed")
+            ):
+                payload, _ = self.envelope(
+                    ["run", "task", "--repo", temp, "--json"], "run", 1, "io_error"
+                )
+            self.assertEqual(
+                payload["error"]["artifacts"],
+                [str(Path(payload["data"]["run_dir"]) / "state.json")],
+            )
+
+    def test_verify_source_mutation_has_semantic_conflict_code(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            command = [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; Path('source.txt').write_text('changed')",
+            ]
+            (root / "workflow.toml").write_text(
+                default_text() + "\n[verification.profiles.fast]\nchecks = " + json.dumps([command])
+            )
+            payload, _ = self.envelope(
+                ["verify", "fast", "--repo", temp, "--json"], "verify", 1, "source_conflict"
+            )
+            self.assertFalse(
+                json.loads((Path(payload["data"]["run_dir"]) / "report.json").read_text())[
+                    "source_unchanged"
+                ]
+            )
+
+    def test_interrupt_after_dispatch_still_returns_machine_result(self):
+        from bb_workflow.cli_output import emit_result
+
+        calls = 0
+
+        def interrupted_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise KeyboardInterrupt()
+            return emit_result(*args, **kwargs)
+
+        with patch("bb_workflow.cli.emit_result", side_effect=interrupted_once):
+            self.envelope(["--json", "plan", "task"], "plan", 130, "interrupted")
+
+    def test_outer_interrupt_and_unclassified_exception_are_machine_errors(self):
+        for exception, code, error in (
+            (KeyboardInterrupt(), 130, "interrupted"),
+            (RuntimeError("unclassified failure"), 2, "internal_error"),
+            (ValueError("unclassified value"), 2, "internal_error"),
+        ):
+            with patch("bb_workflow.cli._config", side_effect=exception):
+                self.envelope(["--json", "run", "task"], "run", code, error)

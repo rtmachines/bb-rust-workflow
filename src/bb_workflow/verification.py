@@ -160,9 +160,10 @@ def plan_verification(
 class VerificationStop(RuntimeError):
     """Fatal execution failure with a status shared by both callers."""
 
-    def __init__(self, status: str, reason: str):
+    def __init__(self, status: str, reason: str, *, code: str | None = None):
         super().__init__(reason)
         self.status = status
+        self.code = code or status
 
 
 def execute_checks(
@@ -203,7 +204,9 @@ def execute_checks(
     for index, check in enumerate(checks):
         before = manifest(cwd, config.exclude)
         if not preparing and before != frozen:
-            raise VerificationStop("failed", "Candidate changed between validation commands")
+            raise VerificationStop(
+                "failed", "Candidate changed between validation commands", code="candidate_conflict"
+            )
         timeout()
         directory = command_root / str(index)
         directory.mkdir(parents=True)
@@ -268,6 +271,7 @@ def execute_checks(
                     "failed",
                     "Validation command changed source files; results invalidated. "
                     "Move generators/formatters to prepare: " + " ".join(argv),
+                    code="candidate_conflict",
                 )
         tail_chars = max(12000, config.context.failed_check_tail_chars)
         item = {
@@ -331,7 +335,9 @@ def execute_checks(
         if fatal is not None:
             raise fatal
     if not preparing and manifest(cwd, config.exclude) != frozen:
-        raise VerificationStop("failed", "Candidate changed after verification")
+        raise VerificationStop(
+            "failed", "Candidate changed after verification", code="candidate_conflict"
+        )
     timeout()
     return results
 
@@ -464,9 +470,15 @@ def verify_repository(
                 reason="Checks passed" if passed else "Verification commands failed",
             )
         except VerificationStop as exc:
-            report.update(status=exc.status, reason=str(exc))
+            report.update(
+                status=exc.status,
+                reason=str(exc),
+                error_code="source_conflict" if exc.code == "candidate_conflict" else exc.code,
+            )
         except KeyboardInterrupt:
-            report.update(status="interrupted", reason="Interrupted by user")
+            report.update(
+                status="interrupted", reason="Interrupted by user", error_code="interrupted"
+            )
         except (OSError, WorkspaceError) as exc:
             report.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
         finally:
@@ -480,12 +492,22 @@ def verify_repository(
                 except (OSError, WorkspaceError) as exc:
                     report.update(source_unchanged=False, source_error=str(exc))
             if not report["source_unchanged"] and report["status"] == "passed":
-                report.update(status="failed", reason="Source changed after verification")
+                report.update(
+                    status="failed",
+                    reason="Source changed after verification",
+                    error_code="source_conflict",
+                )
             if report["status"] == "passed":
                 try:
                     timeout()
                 except VerificationStop as exc:
-                    report.update(status=exc.status, reason=str(exc))
+                    report.update(
+                        status=exc.status,
+                        reason=str(exc),
+                        error_code="source_conflict"
+                        if exc.code == "candidate_conflict"
+                        else exc.code,
+                    )
             aggregate = aggregate_diagnostics(
                 report["results"],
                 [],

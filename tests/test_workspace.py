@@ -37,6 +37,37 @@ class WorkspaceTests(unittest.TestCase):
         (self.repo / "dirty.txt").write_text("user's existing uncommitted edit")
         (self.repo / "old.txt").write_text("remove me")
 
+    def test_apply_machine_contract_success_and_conflicts(self):
+        from bb_workflow.cli import main
+
+        self.make_run()
+        (self.repo / "dirty.txt").write_text("concurrent source edit")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["apply", str(self.run), "--json"]), 2)
+        problem = json.loads(output.getvalue())["error"]
+        self.assertEqual(problem["code"], "source_conflict")
+        self.assertFalse(problem["retryable"])
+        (self.repo / "dirty.txt").write_text("user's existing uncommitted edit")
+        (self.workspace / "old.txt").write_text("concurrent candidate edit")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["--json", "apply", str(self.run)]), 2)
+        problem = json.loads(output.getvalue())["error"]
+        self.assertEqual(problem["code"], "candidate_conflict")
+        self.assertTrue(all(Path(item).is_file() for item in problem["artifacts"]))
+        (self.workspace / "old.txt").unlink()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["apply", str(self.run), "--json"]), 0)
+        envelope = json.loads(output.getvalue())
+        self.assertTrue(envelope["ok"])
+        self.assertIsNone(envelope["error"])
+        self.assertEqual(
+            envelope["data"], {"status": "applied", "changed_paths": ["new/file.txt", "old.txt"]}
+        )
+        self.assertEqual((self.repo / "new/file.txt").read_text(), "added")
+
     def create_symlink(self, link, target, *, target_is_directory=False):
         try:
             link.symlink_to(target, target_is_directory=target_is_directory)
@@ -517,8 +548,9 @@ class WorkspaceTests(unittest.TestCase):
         with patch("bb_workflow.workspace.shutil.copy2", side_effect=mutate_candidate):
             with self.assertRaisesRegex(
                 WorkspaceError, "source changed while preparing replacement"
-            ):
+            ) as caught:
                 apply_run(self.run)
+        self.assertEqual(caught.exception.code, "candidate_conflict")
         self.assertEqual(manifest(self.repo), before)
         report = json.loads((self.run / "apply.json").read_text())
         self.assertIsNone(report["rollback_error"])

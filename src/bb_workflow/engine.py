@@ -35,6 +35,7 @@ from .verification import (
     plan_verification,
 )
 from .workspace import (
+    WorkspaceError,
     copy_snapshot,
     initialize_git_snapshot,
     manifest,
@@ -45,9 +46,10 @@ from .workspace import (
 
 
 class WorkflowStop(RuntimeError):
-    def __init__(self, status: str, reason: str):
+    def __init__(self, status: str, reason: str, *, code: str | None = None):
         super().__init__(reason)
         self.status = status
+        self.code = code or status
 
 
 class Workflow:
@@ -171,11 +173,23 @@ class Workflow:
                     self._tracker = tracker
                     self._execute()
             except WorkflowStop as exc:
-                self.state.update(status=exc.status, reason=str(exc))
+                self.state.update(status=exc.status, reason=str(exc), error_code=exc.code)
             except KeyboardInterrupt:
-                self.state.update(status="interrupted", reason="Interrupted by user")
+                self.state.update(
+                    status="interrupted", reason="Interrupted by user", error_code="interrupted"
+                )
             except Exception as exc:
-                self.state.update(status="failed", reason=f"{type(exc).__name__}: {exc}")
+                self.state.update(
+                    status="failed",
+                    reason=f"{type(exc).__name__}: {exc}",
+                    error_code="provider_error"
+                    if isinstance(exc, BackendError)
+                    else exc.code
+                    if isinstance(exc, WorkspaceError)
+                    else "io_error"
+                    if isinstance(exc, OSError)
+                    else "failed",
+                )
             finally:
                 try:
                     self._tracker = None
@@ -183,7 +197,9 @@ class Workflow:
                 except KeyboardInterrupt:
                     self._tracker = None
                     self.state.update(
-                        status="interrupted", reason="Interrupted during finalization"
+                        status="interrupted",
+                        reason="Interrupted during finalization",
+                        error_code="interrupted",
                     )
                     # CLI ignores further SIGTERM while reconciling terminal artifacts.
                     self._finish()
@@ -201,6 +217,7 @@ class Workflow:
             self.state.update(
                 status="failed",
                 reason=f"Report persistence failed: {type(exc).__name__}: {exc}",
+                error_code="io_error" if isinstance(exc, OSError) else "failed",
             )
         self._save("finished")
         self._emit("finish", status=self.state["status"])
@@ -212,7 +229,9 @@ class Workflow:
             self.config.config_version >= 3 or self.config.rust_review.enabled
         ):
             raise WorkflowStop(
-                "blocked", "Configuration or Rust review requires nonempty requirements"
+                "blocked",
+                "Configuration or Rust review requires nonempty requirements",
+                code="requirements_required",
             )
         if self.requirements is not None:
             self.requirements = prepare_rust_review(
@@ -319,11 +338,17 @@ class Workflow:
                 directory = self.run_dir / f"round-{self.state['cycles']}-{role}"
                 frozen = copy_snapshot(self.work, directory, self.config.exclude)
                 if frozen != candidate:
-                    raise WorkflowStop("failed", "Candidate changed while preparing reviews")
+                    raise WorkflowStop(
+                        "failed",
+                        "Candidate changed while preparing reviews",
+                        code="candidate_conflict",
+                    )
                 initialize_git_snapshot(directory, timeout=self._timeout())
                 reviews.append(self._agent(role, directory, shared, frozen))
             if manifest(self.work, self.config.exclude) != candidate:
-                raise WorkflowStop("failed", "Candidate changed during review")
+                raise WorkflowStop(
+                    "failed", "Candidate changed during review", code="candidate_conflict"
+                )
             findings = merge_findings(reviews)
             record = {
                 "cycle": self.state["cycles"],
@@ -341,7 +366,11 @@ class Workflow:
                 directory = self.run_dir / f"round-{self.state['cycles']}-triage"
                 frozen = copy_snapshot(self.work, directory, self.config.exclude)
                 if frozen != candidate:
-                    raise WorkflowStop("failed", "Candidate changed while preparing triage")
+                    raise WorkflowStop(
+                        "failed",
+                        "Candidate changed while preparing triage",
+                        code="candidate_conflict",
+                    )
                 initialize_git_snapshot(directory, timeout=self._timeout())
                 triage_context = {**shared, "findings": findings}
                 if self.bound is not None:
@@ -358,7 +387,9 @@ class Workflow:
                     )
                 triage = self._agent("triage", directory, triage_context, frozen)
                 if manifest(self.work, self.config.exclude) != candidate:
-                    raise WorkflowStop("failed", "Candidate changed during triage")
+                    raise WorkflowStop(
+                        "failed", "Candidate changed during triage", code="candidate_conflict"
+                    )
                 confirmed, unresolved = resolve_triage(findings, triage)
                 record["triage"] = triage
                 if round_record is not None:
@@ -384,7 +415,9 @@ class Workflow:
                 self._fix({"confirmed_findings": blocking, "unmet_criteria": unmet})
                 continue
             if manifest(self.work, self.config.exclude) != candidate:
-                raise WorkflowStop("failed", "Candidate changed after verification")
+                raise WorkflowStop(
+                    "failed", "Candidate changed after verification", code="candidate_conflict"
+                )
             self._timeout()
             write_json(self.run_dir / "candidate_manifest.json", candidate)
             self.state.update(candidate_id=candidate_id)
@@ -507,7 +540,7 @@ class Workflow:
                 else [],
             )
         except VerificationStop as exc:
-            raise WorkflowStop(exc.status, str(exc)) from exc
+            raise WorkflowStop(exc.status, str(exc), code=exc.code) from exc
         finally:
             if not preparing:
                 aggregate = aggregate_diagnostics(
@@ -612,7 +645,9 @@ class Workflow:
                     raise
                 if frozen is not None and manifest(directory, self.config.exclude) != frozen:
                     raise WorkflowStop(
-                        "failed", f"Read-only agent {role} changed its snapshot"
+                        "failed",
+                        f"Read-only agent {role} changed its snapshot",
+                        code="candidate_conflict",
                     ) from exc
                 if not exc.retryable or attempt + 1 == attempts:
                     raise
@@ -626,7 +661,11 @@ class Workflow:
             )
             self._save()
             if frozen is not None and manifest(directory, self.config.exclude) != frozen:
-                raise WorkflowStop("failed", f"Read-only agent {role} changed its snapshot")
+                raise WorkflowStop(
+                    "failed",
+                    f"Read-only agent {role} changed its snapshot",
+                    code="candidate_conflict",
+                )
             response = validate_response(
                 result.payload,
                 role,

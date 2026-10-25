@@ -86,6 +86,26 @@ class EngineTests(unittest.TestCase):
         self.check_script = []
         self.fixer_count = 0
 
+    def test_semantic_failure_codes_are_saved_without_matching_reason_text(self):
+        from bb_workflow.engine import WorkflowStop
+
+        for exception, expected in (
+            (BackendError("arbitrary wording", retryable=True), "provider_error"),
+            (WorkspaceError("arbitrary workspace wording"), "workspace_error"),
+            (OSError("arbitrary filesystem wording"), "io_error"),
+            (
+                WorkflowStop("blocked", "arbitrary reason", code="requirements_required"),
+                "requirements_required",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                flow = self.workflow()
+                with patch.object(flow, "_execute", side_effect=exception):
+                    directory = flow.run()
+                state = json.loads((directory / "state.json").read_text())
+                self.assertEqual(state["error_code"], expected)
+                self.assertNotEqual(state["status"], "succeeded")
+
     def invoke(self, **kwargs):
         self.events.append(kwargs["role"])
         self.calls.append({**kwargs, "snapshot": manifest(kwargs["cwd"])})
@@ -650,6 +670,7 @@ class EngineTests(unittest.TestCase):
         flow.run()
         self.assertEqual(flow.state["status"], "failed")
         self.assertIn("results invalidated", flow.state["reason"])
+        self.assertEqual(flow.state["error_code"], "candidate_conflict")
         self.assertEqual([call["role"] for call in self.calls], ["implementation"])
         self.assertFalse((flow.run_dir / "candidate_manifest.json").exists())
         last = flow.state["checks"][-1]

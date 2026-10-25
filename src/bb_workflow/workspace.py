@@ -25,6 +25,10 @@ from .process import run_process
 class WorkspaceError(RuntimeError):
     """A workspace cannot be safely captured or applied."""
 
+    def __init__(self, *args, code: str = "workspace_error"):
+        super().__init__(*args)
+        self.code = code
+
 
 MANDATORY_EXCLUDES = (
     ".git",
@@ -394,7 +398,8 @@ def project_lock(repo: Path) -> Iterator[None]:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError as exc:
         raise WorkspaceError(
-            f"project is locked: {lock}. If no workflow is running, inspect this lock and remove it manually to recover."
+            f"project is locked: {lock}. If no workflow is running, inspect this lock and remove it manually to recover.",
+            code="project_locked",
         ) from exc
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -409,7 +414,7 @@ def _read_json(path: Path) -> object:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (ValueError, UnicodeError) as exc:
-        raise WorkspaceError(f"invalid JSON metadata: {path}") from exc
+        raise WorkspaceError(f"invalid JSON metadata: {path}", code="invalid_state") from exc
 
 
 def _read_manifest(path: Path, exclude: tuple[str, ...]) -> dict[str, str]:
@@ -460,6 +465,7 @@ def _replace_file(
     completed: Callable[[tuple[int, int]], None] | None = None,
     *,
     expected_digest: str | None = None,
+    conflict_code: str = "workspace_error",
 ) -> None:
     """Replace a regular file without writing through pre-existing hardlinks."""
     _regular(source)
@@ -469,7 +475,9 @@ def _replace_file(
         shutil.copy2(source, temporary, follow_symlinks=False)
         info = _regular(Path(temporary))
         if expected_digest is not None and _file_hash(Path(temporary)) != expected_digest:
-            raise WorkspaceError(f"source changed while preparing replacement: {source}")
+            raise WorkspaceError(
+                f"source changed while preparing replacement: {source}", code=conflict_code
+            )
         os.replace(temporary, target)
         if completed is not None:
             completed((info.st_dev, info.st_ino))
@@ -550,7 +558,7 @@ def apply_run(run_dir: Path) -> list[str]:
         raise WorkspaceError("run directory must use its canonical path without symlinks")
     state = _read_json(run_dir / "state.json")
     if not isinstance(state, dict) or state.get("status") != "succeeded":
-        raise WorkspaceError("only a succeeded run can be applied")
+        raise WorkspaceError("only a succeeded run can be applied", code="invalid_state")
     repo_value, excludes = state.get("repo"), state.get("exclude")
     if not isinstance(repo_value, str) or not Path(repo_value).is_absolute():
         raise WorkspaceError("run repo must be an absolute path")
@@ -577,10 +585,14 @@ def apply_run(run_dir: Path) -> list[str]:
             raise WorkspaceError("run manifest metadata changed; refusing to apply")
         workspace = run_dir / "workspace"
         if manifest(workspace, exclude) != candidate:
-            raise WorkspaceError("candidate workspace changed after validation; refusing to apply")
+            raise WorkspaceError(
+                "candidate workspace changed after validation; refusing to apply",
+                code="candidate_conflict",
+            )
         if manifest(repo, exclude) != baseline:
             raise WorkspaceError(
-                "original repository changed since capture; refusing to overwrite existing edits"
+                "original repository changed since capture; refusing to overwrite existing edits",
+                code="source_conflict",
             )
         changes = changed_paths(baseline, candidate)
         _preflight(repo, changes)
@@ -596,10 +608,16 @@ def apply_run(run_dir: Path) -> list[str]:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(repo / relative, target, follow_symlinks=False)
                 if _file_hash(target) != baseline[relative]:
-                    raise WorkspaceError(f"source changed while backing up: {relative}")
+                    raise WorkspaceError(
+                        f"source changed while backing up: {relative}", code="source_conflict"
+                    )
         # Check again after the potentially long backup operation, before mutation.
-        if manifest(repo, exclude) != baseline or manifest(workspace, exclude) != candidate:
-            raise WorkspaceError("repository or candidate changed while preparing apply")
+        if manifest(repo, exclude) != baseline:
+            raise WorkspaceError("repository changed while preparing apply", code="source_conflict")
+        if manifest(workspace, exclude) != candidate:
+            raise WorkspaceError(
+                "candidate changed while preparing apply", code="candidate_conflict"
+            )
         completed: dict[str, _AppliedChange] = {}
         created: list[Path] = []
         try:
@@ -607,7 +625,9 @@ def apply_run(run_dir: Path) -> list[str]:
                 target = repo / relative
                 _preflight(repo, [relative])
                 if not _matches_applied(target, _AppliedChange(baseline.get(relative))):
-                    raise WorkspaceError(f"repository changed before applying: {relative}")
+                    raise WorkspaceError(
+                        f"repository changed before applying: {relative}", code="source_conflict"
+                    )
                 if relative in candidate:
                     missing = []
                     parent = target.parent
@@ -626,6 +646,7 @@ def apply_run(run_dir: Path) -> list[str]:
                         target,
                         record_replacement,
                         expected_digest=candidate[relative],
+                        conflict_code="candidate_conflict",
                     )
                 else:
                     target.unlink()
@@ -655,7 +676,8 @@ def apply_run(run_dir: Path) -> list[str]:
                 pass
             if rollback_error is not None:
                 raise WorkspaceError(
-                    f"apply failed and rollback was incomplete; recover from {backup}: {rollback_error}"
+                    f"apply failed and rollback was incomplete; recover from {backup}: {rollback_error}",
+                    code="apply_recovery_required",
                 ) from exc
             raise
         return changes
