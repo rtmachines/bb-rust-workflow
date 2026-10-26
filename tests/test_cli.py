@@ -528,7 +528,7 @@ class CliTests(unittest.TestCase):
             directory = Path(temporary)
             progress = {
                 "version": 1,
-                "run_dir": str(directory),
+                "run_dir": str(directory.resolve()),
                 "pid": 123,
                 "phase": "implementation",
                 "active_operation": {"role": "implementation"},
@@ -551,6 +551,26 @@ class CliTests(unittest.TestCase):
                 with contextlib.redirect_stdout(output):
                     self.assertEqual(main(["status", str(directory), "--summary"]), 0)
                 self.assertEqual(json.loads(output.getvalue()).get("progress"), expected)
+
+    def test_status_summary_reads_live_progress_through_noncanonical_run_path(self):
+        from bb_workflow.lifecycle import ProgressTracker
+
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary).resolve()
+            (directory / "child").mkdir()
+            alias = directory / "child" / ".."
+            (directory / "state.json").write_text('{"status":"running"}')
+            with ProgressTracker(alias) as tracker:
+                tracker.update("implementation", {"role": "implementation"})
+                for path in (alias, directory):
+                    with self.subTest(path=str(path)):
+                        output = io.StringIO()
+                        with contextlib.redirect_stdout(output):
+                            self.assertEqual(main(["status", str(path), "--summary"]), 0)
+                        summary = json.loads(output.getvalue())
+                        self.assertEqual(summary["run_dir"], str(directory))
+                        self.assertEqual(summary["progress"]["run_dir"], str(directory))
+                        self.assertEqual(summary["progress"]["phase"], "implementation")
 
     def test_outer_interrupt_returns_130_and_restores_sigterm_handler(self):
         import signal
@@ -1025,7 +1045,7 @@ class JsonContractTests(unittest.TestCase):
             ),
         ):
             with self.subTest(error=error), tempfile.TemporaryDirectory() as temp:
-                root = Path(temp)
+                root = Path(temp).resolve()
                 source = root / "source.txt"
                 source.write_text("source")
                 original = workspace._file_hash
@@ -1148,7 +1168,7 @@ class JsonContractTests(unittest.TestCase):
             ):
                 payload, _ = self.envelope(["status", temp, "--json"], "status", 2, "invalid_state")
             self.assertEqual(payload["error"]["message"], "original problem")
-            self.assertEqual(payload["error"]["artifacts"], [str(root / "report.json")])
+            self.assertEqual(payload["error"]["artifacts"], [str((root / "report.json").resolve())])
 
     @unittest.skipUnless(os.name == "posix" and os.geteuid() != 0, "POSIX file permissions")
     def test_unreadable_run_directory_returns_original_io_error_envelope(self):

@@ -33,7 +33,7 @@ class ProgressTests(unittest.TestCase):
                 self.assertGreater(second["elapsed_seconds"], first["elapsed_seconds"])
                 self.assertEqual(second["active_operation"], {"role": "implementation"})
                 self.assertEqual(second["version"], 1)
-                self.assertEqual(second["run_dir"], str(directory))
+                self.assertEqual(second["run_dir"], str(directory.resolve()))
                 self.assertEqual(second["pid"], os.getpid())
                 self.assertEqual(second["heartbeat_interval_seconds"], 0.02)
             self.assertEqual(state.read_text(), '{"status":"running","agent_calls":0}')
