@@ -5,15 +5,13 @@ description: Use when operating an installed bb-workflow CLI from Codex or Claud
 
 # bb-workflow operator
 
-For the calling operator, outside backend implementation/reviewer roles. The CLI
-owns stages and two independent reviews; `run` leaves original source unchanged.
-Keep this skill out of backend role `skills` to avoid nested orchestration.
+For the calling operator; keep out of backend role `skills`. The CLI owns stages
+and two independent reviews; `run` leaves original source unchanged.
 
 ## First run
 
-If the installed version is unknown, check `bb-workflow --version` once. Consult
-`<command> --help` only when an option or behavior is unclear; the sequence below
-supplies the documented syntax. From any caller directory, substitute the project path:
+If version is unknown, check `bb-workflow --version` once. Use `<command> --help`
+for unclear behavior. Substitute the project path:
 
 ```sh
 bb-workflow --json init --config /path/to/project/workflow.toml
@@ -32,16 +30,19 @@ kind = "semantic"
 verification = "Inspect changed source, callers and regression tests"
 ```
 
-Make the description concrete for the task. Mechanical criteria additionally use
-`kind = "mechanical"`, `check_id = "0"` (a string indexing a check in the resolved
-gate), and optionally `test_name` for an exact test. Semantic criteria forbid those
-two fields. Use `plan` to validate binding before spending provider budget:
+Make the description concrete for the task. Mechanical criteria use
+`kind = "mechanical"`, `check_id = "0"` (gate check index), and optionally
+`test_name` for an exact test. Semantic criteria forbid those two fields. Use `plan` to validate binding before spending provider budget:
 
 ```sh
 bb-workflow --json doctor --repo /path/to/project
-bb-workflow --json plan "Requested change" --repo /path/to/project --requirements task.toml --complexity low
-bb-workflow --json run "Requested change" --repo /path/to/project --requirements task.toml --complexity low --events-jsonl
+bb-workflow --json plan --task-file task.txt --repo /path/to/project --requirements task.toml --complexity low
+bb-workflow --json run --task-file - --repo /path/to/project --requirements task.toml --complexity low --events-jsonl < task.txt
 ```
+
+Exactly one positional task or `--task-file` is required. File paths are caller-relative.
+Only `-` reads stdin until EOF; `./-` names a file. Supply nonblank UTF-8; whitespace
+and line endings stay intact. Task text is separate from `--requirements` criteria.
 
 Choose complexity deliberately: `auto|low|medium|high`; `auto` is a keyword heuristic. Inspect routing,
 full checks, limits and `requirements_needed`; keep plan/run inputs consistent.
@@ -55,7 +56,7 @@ model changes.
 | Need | Action |
 | --- | --- |
 | Compact progress/result | `bb-workflow --json status /path/to/run --summary` |
-| More evidence | Full `status`, then `report.md`, `state.json`, `acceptance.json`, relevant `checks/` or `agents/` logs |
+| More evidence | `status`, `report.md`, `state.json`, `acceptance.json`, relevant `checks/` or `agents/` logs |
 | Check project directly | `bb-workflow --json verify fast --repo /path/to/project`; never grants apply eligibility |
 | Authorized application | `bb-workflow --json apply /path/to/run` after succeeded result and separate apply authorization |
 

@@ -162,7 +162,14 @@ def _parser(machine: bool = False) -> argparse.ArgumentParser:
                 type=Path,
                 help="Criteria TOML path relative to caller; required by run with config v3",
             )
-            command.add_argument("task", help="Task text (quote spaces in your shell)")
+            task_source = command.add_mutually_exclusive_group(required=True)
+            task_source.add_argument(
+                "task", nargs="?", help="Task text (quote spaces in your shell)"
+            )
+            task_source.add_argument(
+                "--task-file",
+                help="UTF-8 task file relative to caller, or - to read stdin until EOF; replaces task text",
+            )
             command.add_argument(
                 "--complexity",
                 choices=("auto", "low", "medium", "high"),
@@ -300,7 +307,26 @@ def _doctor(config, repo: Path) -> tuple[dict, bool]:
     return payload, ok
 
 
+def _resolve_task(args: argparse.Namespace) -> str:
+    if args.task_file is None:
+        return args.task
+    try:
+        if args.task_file == "-":
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            content = stream.read()
+        else:
+            content = Path(args.task_file).read_bytes()
+        task = content.decode("utf-8") if isinstance(content, bytes) else content
+    except UnicodeError as exc:
+        raise _InvalidArguments("Task input must be valid UTF-8") from exc
+    if not task.strip():
+        raise _InvalidArguments("Task input must not be empty or whitespace-only")
+    return task
+
+
 def _dispatch(args: argparse.Namespace) -> CommandResult:
+    if args.command in ("plan", "run"):
+        args.task = _resolve_task(args)
     if args.command == "init":
         with args.config.open("x", encoding="utf-8") as stream:
             stream.write(default_text())

@@ -101,9 +101,12 @@ class CliTests(unittest.TestCase):
             source = repo / "lib.rs"
             source.write_text("pub fn value() -> u32 { 0 }\n", encoding="utf-8")
             calls, outputs = [], []
+            task = "unsafe Ω\r\n'quoted' $(touch forbidden) `cmd` ; --json\n" * 6000
+            self.assertGreaterEqual(len(task.encode("utf-8")), 256 * 1024)
 
             def provider(**call):
                 payload = json.loads(call["prompt"].split("Task and evidence (JSON):\n", 1)[1])
+                self.assertEqual(payload["task"], task)
                 binding = payload["acceptance"]["binding"]
                 calls.append((call["role"], call["cwd"], binding))
                 response = {
@@ -169,22 +172,25 @@ class CliTests(unittest.TestCase):
                     'kind = "semantic"\nverification = "Inspect source and API"\n',
                     encoding="utf-8",
                 )
+                Path("docs.txt").write_bytes(task.encode("utf-8"))
                 arguments = [
-                    "Implement value",
+                    "--task-file",
+                    "docs.txt",
                     "--repo",
                     str(repo),
                     "--requirements",
                     "task.toml",
-                    "--complexity",
-                    "low",
                 ]
                 plan = command(["plan", *arguments])["data"]
                 self.assertFalse(plan["requirements_needed"])
-                self.assertEqual(plan["complexity"], "low")
+                self.assertEqual(plan["complexity"], "high")
                 self.assertEqual(calls, [])
                 result = command(["run", *arguments, "--events-jsonl"])["data"]
                 self.assertEqual(result["status"], "succeeded")
                 directory = Path(result["run_dir"])
+                saved = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+                self.assertEqual(saved["task"], task)
+                self.assertEqual(saved["complexity"], "high")
                 summary = command(["status", str(directory), "--summary"])["data"]
                 self.assertEqual(summary["status"], "succeeded")
                 self.assertEqual(summary["acceptance"]["requirements_id"], plan["requirements_id"])
@@ -654,6 +660,212 @@ class CliTests(unittest.TestCase):
                 report, ok = _doctor(config, repo)
             self.assertTrue(ok, report)
             self.assertEqual(report["backends"]["codex"]["version"], "codex-cli 0.164.0")
+
+
+class TaskInputTests(unittest.TestCase):
+    def invoke(self, argv):
+        output, errors = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = main(argv)
+        return code, json.loads(output.getvalue()), errors.getvalue()
+
+    def test_file_and_stdin_reach_routing_and_workflow_unchanged(self):
+        task = "  unsafe Ω\r\n'quoted' $(touch forbidden) `cmd` ; --json\n\n"
+        for command in ("plan", "run"):
+            for source in ("file", "binary", "text"):
+                with (
+                    self.subTest(command=command, source=source),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
+                    base = Path(temp)
+                    repo = base / "repo"
+                    repo.mkdir()
+                    (base / "docs.txt").write_bytes(task.encode("utf-8"))
+                    stream = (
+                        io.TextIOWrapper(io.BytesIO(task.encode("utf-8")), encoding="ascii")
+                        if source == "binary"
+                        else io.StringIO(task)
+                    )
+                    with (
+                        contextlib.chdir(base),
+                        patch("sys.stdin", stream),
+                        patch("bb_workflow.cli.Workflow") as workflow,
+                    ):
+                        workflow.return_value.state = {"status": "succeeded", "reason": "fixture"}
+                        workflow.return_value.run.return_value = repo / "saved"
+                        code, result, _ = self.invoke(
+                            [
+                                command,
+                                "--task-file",
+                                "docs.txt" if source == "file" else "-",
+                                "--repo",
+                                str(repo),
+                                "--json",
+                            ]
+                        )
+                        self.assertEqual(code, 0, result)
+                        if command == "plan":
+                            self.assertEqual(result["data"]["complexity"], "high")
+                        else:
+                            self.assertEqual(workflow.call_args.args[1], task)
+                        self.assertFalse(stream.closed)
+                    self.assertFalse((base / "forbidden").exists())
+
+    def test_selection_errors_and_help_do_not_read_stdin(self):
+        for command in ("plan", "run"):
+            for machine in (False, True):
+                for selection, expected in (
+                    ([], 2),
+                    (["task", "--task-file", "-"], 2),
+                    (["--task-file", "-", "--help"], 0),
+                ):
+                    with self.subTest(command=command, machine=machine, selection=selection):
+                        with (
+                            patch("sys.stdin") as stream,
+                            patch("bb_workflow.cli.Workflow") as workflow,
+                            contextlib.redirect_stdout(io.StringIO()),
+                            contextlib.redirect_stderr(io.StringIO()),
+                        ):
+                            stream.buffer.read.side_effect = AssertionError("stdin consumed")
+                            argv = [command, *selection, *(["--json"] if machine else [])]
+                            if machine:
+                                self.assertEqual(main(argv), expected)
+                            else:
+                                with self.assertRaises(SystemExit) as raised:
+                                    main(argv)
+                                self.assertEqual(raised.exception.code, expected)
+                            stream.buffer.read.assert_not_called()
+                            workflow.assert_not_called()
+
+    def test_bad_contents_and_read_failures_have_no_workflow_side_effects(self):
+        for command in ("plan", "run"):
+            for content in (b"", b" \r\n\t", b"\xff"):
+                for source in ("file", "stdin"):
+                    with (
+                        self.subTest(command=command, content=content, source=source),
+                        tempfile.TemporaryDirectory() as temp,
+                    ):
+                        repo = Path(temp)
+                        path = repo / "task.txt"
+                        path.write_bytes(content)
+                        with (
+                            patch(
+                                "sys.stdin", io.TextIOWrapper(io.BytesIO(content), encoding="ascii")
+                            ),
+                            patch("bb_workflow.cli.Workflow") as workflow,
+                        ):
+                            code, result, _ = self.invoke(
+                                [
+                                    command,
+                                    "--task-file",
+                                    str(path) if source == "file" else "-",
+                                    "--repo",
+                                    temp,
+                                    "--json",
+                                ]
+                            )
+                        self.assertEqual(code, 2)
+                        self.assertEqual(result["error"]["code"], "invalid_arguments")
+                        workflow.assert_not_called()
+                        self.assertFalse((repo / ".bb-workflow").exists())
+            for failure, expected, code in (
+                (OSError("unreadable"), "io_error", 2),
+                (KeyboardInterrupt(), "interrupted", 130),
+            ):
+                for source in ("file", "stdin"):
+                    with (
+                        self.subTest(command=command, failure=failure, source=source),
+                        tempfile.TemporaryDirectory() as temp,
+                    ):
+                        with (
+                            patch("bb_workflow.cli.Workflow") as workflow,
+                            patch("sys.stdin") as stream,
+                            patch.object(Path, "read_bytes", side_effect=failure),
+                        ):
+                            stream.buffer.read.side_effect = failure
+                            actual, result, _ = self.invoke(
+                                [
+                                    "--json",
+                                    command,
+                                    "--task-file",
+                                    "task.txt" if source == "file" else "-",
+                                    "--repo",
+                                    temp,
+                                ]
+                            )
+                        self.assertEqual(actual, code)
+                        self.assertEqual(result["error"]["code"], expected)
+                        workflow.assert_not_called()
+                        self.assertFalse((Path(temp) / ".bb-workflow").exists())
+            with tempfile.TemporaryDirectory() as temp:
+                code, result, _ = self.invoke(
+                    [command, "--task-file", str(Path(temp) / "missing"), "--json"]
+                )
+                self.assertEqual(code, 2)
+                self.assertEqual(result["error"]["code"], "io_error")
+
+    def test_legacy_input_errors_keep_stderr_and_exit_codes(self):
+        for command in ("plan", "run"):
+            for failure, code in (
+                (None, 2),
+                (OSError("read failed"), 2),
+                (KeyboardInterrupt(), 130),
+            ):
+                with (
+                    self.subTest(command=command, failure=failure),
+                    tempfile.TemporaryDirectory() as temp,
+                ):
+                    output, errors = io.StringIO(), io.StringIO()
+                    with (
+                        patch("sys.stdin", io.StringIO(" ")) as stream,
+                        patch("bb_workflow.cli.Workflow") as workflow,
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        if failure is not None:
+                            stream.read = lambda: (_ for _ in ()).throw(failure)
+                        self.assertEqual(main([command, "--task-file", "-", "--repo", temp]), code)
+                    self.assertEqual(output.getvalue(), "")
+                    self.assertTrue(errors.getvalue())
+                    workflow.assert_not_called()
+                    self.assertFalse((Path(temp) / ".bb-workflow").exists())
+
+    def test_dash_file_json_placement_and_legacy_positionals(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.chdir(temp):
+            Path("-").write_bytes(b"unsafe\r\n")
+            for argv in (
+                ["--json", "plan", "--task-file", "./-"],
+                ["plan", "--task-file", "./-", "--json"],
+            ):
+                code, result, _ = self.invoke(argv)
+                self.assertEqual(code, 0)
+                self.assertEqual(result["data"]["complexity"], "high")
+            code, result, _ = self.invoke(["plan", "--", "--json"])
+            self.assertEqual(code, 0)
+            self.assertNotIn("schema_version", result)
+            code, _, _ = self.invoke(["plan", "", "--json"])
+            self.assertEqual(code, 0)
+            code, result, _ = self.invoke(["run", "", "--json"])
+            self.assertEqual(code, 2)
+            self.assertEqual(result["error"]["code"], "invalid_arguments")
+
+    def test_redirected_subprocess_stdin_uses_utf8_bytes(self):
+        task = "unsafe Ω\r\n'quoted' $(false) --json\n" * 9000
+        environment = {
+            **os.environ,
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+            "PYTHONIOENCODING": "ascii",
+        }
+        result = subprocess.run(
+            [sys.executable, "-m", "bb_workflow", "--json", "plan", "--task-file", "-"],
+            input=task.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["data"]["complexity"], "high")
 
 
 class JsonContractTests(unittest.TestCase):

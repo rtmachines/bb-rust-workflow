@@ -72,6 +72,20 @@ not a risk assessment. A plan needing requirements still exits zero.
 Explicit `--config`, `--requirements` and `run_dir` paths are relative to the
 caller directory, not to `--repo`. Absolute paths are convenient outside the project.
 
+For long or multiline tasks, replace the positional task with `--task-file`:
+
+```sh
+bb-workflow --json plan --task-file task.txt --repo . --requirements task.toml
+bb-workflow --json run --task-file - --repo . --requirements task.toml --events-jsonl < task.txt
+```
+
+Both commands require exactly one task source. File paths are relative to the
+caller; only exact `-` reads stdin until EOF (`./-` names a file). Inputs must be
+UTF-8 and contain more than whitespace; whitespace, Unicode and line endings are
+preserved without interpolation. `--task-file` supplies task text, while
+`--requirements` supplies acceptance criteria. Use identical task text,
+requirements and configuration for comparable plan/run routing and binding.
+
 ## Start, observe and inspect
 
 After the user authorizes provider work:

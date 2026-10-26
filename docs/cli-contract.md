@@ -13,6 +13,31 @@ Only an explicit `--json` before literal `--` selects this contract. For example
 With `bb-workflow --json plan -- --json`, the task is still literal text and the
 result uses the envelope. Quote task text containing spaces.
 
+## Task input
+
+`plan` and `run` require exactly one positional task or `--task-file PATH`.
+No other command accepts `--task-file`. Paths are relative to the caller, even
+with `--repo`. Only exact `-` reads stdin until EOF; `./-` names a literal file.
+
+```sh
+bb-workflow --json plan --task-file task.txt --requirements task.toml
+bb-workflow run --task-file - --requirements task.toml --json < task.txt
+```
+
+Files and binary stdin are decoded as UTF-8, independently of the stdin text
+wrapper's locale. Text-only embedded stdin is supported. Contents retain
+whitespace, CRLF/newlines, Unicode and trailing newlines without interpolation;
+`--json` inside the content is literal text. Caller stdin is not closed or
+reconfigured. Input is read once, before Workflow construction.
+
+Missing/conflicting task sources are parser errors and do not read input. New
+file/stdin inputs reject empty, whitespace-only or invalid UTF-8 text with
+`invalid_arguments` (exit 2). Filesystem/read errors use `io_error` (exit 2);
+interruption uses `interrupted` (exit 130). These failures create no workflow
+artifacts or provider calls. Help does not read input. Positional task behavior
+is preserved. `--task-file` supplies task text, not acceptance requirements;
+keep resolved task, requirements and config identical between plan and run.
+
 ## Envelope
 
 Stdout contains one JSON document, including on argument errors, help and handled
@@ -74,7 +99,7 @@ Do not classify failures by parsing `message`; its wording is not a contract.
 
 | Code | Typical origin | `next_action` |
 | --- | --- | --- |
-| `invalid_arguments` | Parser rejection or invalid run directory/task input | `correct_arguments` |
+| `invalid_arguments` | Parser rejection or invalid task input/run directory | `correct_arguments` |
 | `invalid_config` | Missing explicit configuration, malformed or unsupported configuration | `correct_configuration` |
 | `invalid_requirements` | Missing requirements file, malformed criteria or invalid binding | `correct_requirements` |
 | `requirements_required` | Run requires criteria that were not supplied | `provide_requirements` |

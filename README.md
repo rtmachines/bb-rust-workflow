@@ -53,6 +53,21 @@ bb-workflow plan "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requi
 bb-workflow run "Dodaj obsługę błędu odczytu konfiguracji" --repo . --requirements task.toml --complexity low
 ```
 
+Długie zadanie możesz podać z pliku lub stdin, zamiast argumentu pozycyjnego:
+
+```sh
+bb-workflow plan --task-file task.txt --repo . --requirements task.toml
+bb-workflow run --task-file - --repo . --requirements task.toml < task.txt
+```
+
+`plan` i `run` wymagają dokładnie jednego źródła: tekstu albo `--task-file`.
+Ścieżka jest względem katalogu wywołania, niezależnie od `--repo`.
+Tylko dokładne `-` oznacza stdin czytane do EOF; `./-` wskazuje plik o nazwie `-`.
+Wejście musi być niepustym tekstem UTF-8; same białe znaki są odrzucane.
+Treść, białe znaki i końce linii pozostają bez zmian. Plik zadania nie zastępuje
+kryteriów `--requirements`. Zachowaj te same wejścia zadania, kryteriów i konfiguracji
+między `plan` i `run`, aby porównać plan.
+
 Pełny przykład mechaniczny i semantyczny jest w
 [`examples/task-requirements.toml`](examples/task-requirements.toml).
 `bb-workflow plan "Zadanie" --requirements task.toml` sprawdza powiązanie z pełnym gate,
